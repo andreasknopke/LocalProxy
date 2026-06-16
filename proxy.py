@@ -574,6 +574,8 @@ async def _stream_events(
 ):
     model = body.get("model", MODEL_NAME)
     start_time = time.perf_counter()
+
+    # 1. Empfangen
     yield _format_openai_stream_chunk(
         model,
         _format_chat_progress_message(
@@ -583,10 +585,15 @@ async def _stream_events(
         ),
         include_role=True,
     )
-    yield _format_sse_event(
-        "received",
-        "Proxy-Anfrage empfangen und validiert. Starte lokale Qwen Sub-Agenten.",
-        {"model": model},
+
+    # 2. Lokale Agenten starten
+    yield _format_openai_stream_chunk(
+        model,
+        _format_chat_progress_message(
+            "local_agents_started",
+            "5 lokale Qwen Sub-Agenten werden parallel ausgeführt.",
+            {"agents": list(SUB_AGENTS.keys())},
+        ),
     )
 
     async with httpx.AsyncClient() as client:
@@ -594,27 +601,26 @@ async def _stream_events(
             call_sub_agent(client, body, name, instruction)
             for name, instruction in SUB_AGENTS.items()
         ]
-        yield _format_sse_event(
-            "local_agents_started",
-            "5 lokale Qwen Sub-Agenten werden parallel ausgeführt.",
-            {"agents": list(SUB_AGENTS.keys())},
-        )
         results = await asyncio.gather(*tasks)
 
+    # 3. Lokale Agenten fertig
     completed = sum(1 for result in results if result.get("status") == "ok")
-    yield _format_sse_event(
-        "local_agents_finished",
-        f"{completed}/{len(results)} lokale Qwen Sub-Agenten abgeschlossen.",
-        {
-            "agent_status": [
-                {
-                    "agent": result.get("agent_key"),
-                    "status": result.get("status"),
-                    "duration_seconds": result.get("duration_seconds"),
-                }
-                for result in results
-            ]
-        },
+    yield _format_openai_stream_chunk(
+        model,
+        _format_chat_progress_message(
+            "local_agents_finished",
+            f"{completed}/{len(results)} lokale Qwen Sub-Agenten abgeschlossen.",
+            {
+                "agent_status": [
+                    {
+                        "agent": result.get("agent_key"),
+                        "status": result.get("status"),
+                        "duration_seconds": result.get("duration_seconds"),
+                    }
+                    for result in results
+                ]
+            },
+        ),
     )
 
     combined_response_text = (
@@ -623,13 +629,17 @@ async def _stream_events(
         "\n---\n".join(result["content"] for result in results)
     )
 
-    yield _format_sse_event(
-        "cloud_review_prepared",
-        "Cloud Final Reviewer wird vorbereitet.",
-        {
-            "enabled": CLOUD_REVIEW_ENABLED,
-            "model": CLOUD_REVIEW_MODEL,
-        },
+    # 4. Cloud Review vorbereiten
+    yield _format_openai_stream_chunk(
+        model,
+        _format_chat_progress_message(
+            "cloud_review_prepared",
+            "Cloud Final Reviewer wird vorbereitet.",
+            {
+                "enabled": CLOUD_REVIEW_ENABLED,
+                "model": CLOUD_REVIEW_MODEL,
+            },
+        ),
     )
 
     async with httpx.AsyncClient() as cloud_client:
@@ -640,14 +650,18 @@ async def _stream_events(
             combined_response_text,
         )
 
-    yield _format_sse_event(
-        "cloud_review_finished",
-        "Cloud Final Reviewer abgeschlossen.",
-        {
-            "status": cloud_review_result.get("status"),
-            "rejected": cloud_review_result.get("rejected"),
-            "duration_seconds": cloud_review_result.get("duration_seconds"),
-        },
+    # 5. Cloud Review fertig
+    yield _format_openai_stream_chunk(
+        model,
+        _format_chat_progress_message(
+            "cloud_review_finished",
+            "Cloud Final Reviewer abgeschlossen.",
+            {
+                "status": cloud_review_result.get("status"),
+                "rejected": cloud_review_result.get("rejected"),
+                "duration_seconds": cloud_review_result.get("duration_seconds"),
+            },
+        ),
     )
 
     all_results = [*results, cloud_review_result]
@@ -668,14 +682,23 @@ async def _stream_events(
             "\n---\n".join(result["content"] for result in all_results)
         )
 
-    yield _format_sse_event(
-        "completed",
-        "Proxy-Antwort fertiggestellt.",
-        {
-            "duration_seconds": time.perf_counter() - start_time,
-            "rejected": cloud_review_result.get("rejected"),
-        },
+    # 6. Gesamte Antwort streamen
+    yield _format_openai_stream_chunk(model, combined_response_text)
+
+    # 7. Fertigstellung
+    yield _format_openai_stream_chunk(
+        model,
+        _format_chat_progress_message(
+            "completed",
+            "Proxy-Antwort fertiggestellt.",
+            {
+                "duration_seconds": time.perf_counter() - start_time,
+                "rejected": cloud_review_result.get("rejected"),
+            },
+        ),
     )
+
+    yield _format_openai_stream_chunk(model, "", finish_reason="stop")
 
 
 def _build_response_payload(
