@@ -6,15 +6,58 @@ Der Proxy nimmt Chat-Completion-Anfragen entgegen, verteilt jede Anfrage paralle
 
 ## Architektur
 
-Bei jeder Anfrage an `/v1/chat/completions` werden bis zu fünf parallele Sub-Agenten gestartet:
+Bei jeder Anfrage an `/v1/chat/completions` durchläuft der Proxy eine hochgradig optimierte, logische **4-Phasen-Pipeline**:
 
-1. **Architekt & Denker** – analysiert die Aufgabe, plant Architektur, Logik und Randfälle.
-2. **Open-Source-Scout & Dependency-Manager** – sucht nach etablierten Bibliotheken, Standards oder bestehenden Lösungen, damit nicht unnötig neu entwickelt wird.
-3. **Entwickler** – erstellt produktionsnahen Code unter Berücksichtigung der Scout-Ergebnisse.
-4. **Reviewer & Security** – prüft Bugs, Sicherheitsrisiken, Race Conditions, Memory Leaks und Edge Cases.
-5. **Performance & Refactoring** – optimiert Laufzeit, Speicherverbrauch und Struktur.
+```mermaid
+graph TD
+    Start[User Anfrage] --> Phase1[Phase 1: Analyse & Recherche]
+    
+    subgraph Phase 1
+        Phase1 --> Architect[architect: Architekt & Denker]
+        Phase1 --> OS_Scout[os_scout: Open-Source-Scout]
+    end
+    
+    Architect --> Phase2[Phase 2: Vorab-Review & Entscheidung]
+    OS_Scout --> Phase2
+    
+    subgraph Phase 2
+        Phase2 --> PreReviewer[reviewer: Reviewer & Gatekeeper]
+    end
+    
+    PreReviewer --> Phase3[Phase 3: Parallele Implementierung]
+    
+    subgraph Phase 3
+        Phase3 --> Coder1[coder_logic: Kernlogik & Algorithmen]
+        Phase3 --> Coder2[coder_api: API & Integration]
+    end
+    
+    Coder1 --> Phase4[Phase 4: Optimierung & Finalisierung]
+    Coder2 --> Phase4
+    
+    subgraph Phase 4
+        Phase4 --> Optimizer[optimizer: Performance & Refactoring]
+    end
+    
+    Optimizer --> End[Zusammengeführte Antwort]
+```
 
-Optional kann ein sechster **Cloud Final Reviewer** aktiviert werden. Dieser läuft nicht auf dem lokalen Qwen-Modell, sondern gegen ein konfigurierbares Cloud-Modell und bewertet die gesamte lokale Multi-Agent-Antwort wie ein Senior Developer. Bei kritischen Mängeln kann er die Gesamtumsetzung zurückweisen.
+### Die 4 Phasen im Detail:
+
+1. **Phase 1: Analyse & Recherche (Parallel)**
+   * **Architekt & Denker** – Analysiert die Aufgabe, plant die Architektur, Logik und Randfälle.
+   * **Open-Source-Scout & Dependency-Manager** – Sucht nach etablierten Bibliotheken (PyPI, npm, GitHub etc.), damit das Rad nicht neu erfunden wird.
+
+2. **Phase 2: Vorab-Review & Entscheidung (Sequenziell)**
+   * **Reviewer & Gatekeeper** – Bewertet die Vorschläge aus Phase 1, trifft eine klare Architekturentscheidung, wählt die Bibliotheken aus und definiert die Schnittstellen für die Entwickler.
+
+3. **Phase 3: Parallele Implementierung (Parallel)**
+   * **Entwickler (Kernlogik & Algorithmen)** – Implementiert die mathematische/algorithmische Logik und Datenverarbeitung basierend auf den Vorgaben des Gatekeepers.
+   * **Entwickler (API & Integration)** – Implementiert zeitgleich die API-Endpunkte, CLI-Schnittstellen, Konfigurationen und Boilerplate.
+
+4. **Phase 4: Optimierung & Finalisierung (Sequenziell)**
+   * **Performance & Refactoring** – Führt die Code-Entwürfe aus Phase 3 zusammen, optimiert die Laufzeit- und Speicherkomplexität und liefert die finale, produktionsreife Gesamtlösung.
+
+Optional kann ein fünfter **Cloud Final Reviewer** aktiviert werden. Dieser läuft nicht auf dem lokalen Qwen-Modell, sondern gegen ein konfigurierbares Cloud-Modell und bewertet die gesamte lokale Multi-Agent-Antwort wie ein Senior Developer. Bei kritischen Mängeln kann er die Gesamtumsetzung zurückweisen.
 
 Der ursprüngliche User-Prompt bleibt vorne erhalten. Nur die letzte User-Nachricht erhält einen agentenspezifischen Suffix. Dadurch kann vLLM Prefix Caching besser nutzen.
 
@@ -109,4 +152,51 @@ Antwort:
 ## Hinweis zur Performance
 
 Die Parallelität nutzt vLLM-Batching und Prefix Caching. Die lokalen Qwen-Agenten werden parallel ausgeführt. Der optionale Cloud Final Reviewer läuft danach sequenziell, damit er die komplette lokale Gesamtumsetzung bewerten und ggf. zurückweisen kann.
+
+## Optimierung mit TurboQuant (KV-Cache-Komprimierung)
+
+Da der Proxy 5 Sub-Agenten parallel ausführt, steigt die Last auf dem vLLM-Server erheblich (Batch-Größe = 5). Bei langen Kontexten führt dies schnell zu hohem VRAM-Bedarf für den KV-Cache oder zu Out-of-Memory (OOM) Fehlern. 
+
+Durch den Einsatz von [TurboQuant](https://github.com/0xSero/turboquant) (ICLR 2026) kann der KV-Cache (Keys auf 3-Bit, Values auf 2-Bit) fast ohne Qualitätsverlust komprimiert werden. Dies ermöglicht es, den Kontext des Modells optimal zu nutzen.
+
+### Einrichtung auf dem vLLM-Server
+
+Da der Proxy das Modell nicht selbst lädt, sondern HTTP-Anfragen an das vLLM-Backend weiterleitet, muss TurboQuant **auf dem vLLM-Server** installiert und aktiviert werden:
+
+1. **Installation auf dem vLLM-Server**:
+   ```bash
+   git clone https://github.com/0xSero/turboquant.git
+   cd turboquant
+   pip install -e .
+   ```
+
+2. **vLLM mit TurboQuant-Hooks starten**:
+   Erstelle ein Python-Startskript (z. B. `start_vllm.py`) auf dem vLLM-Server, um die Hooks vor dem Laden des Modells zu registrieren:
+   ```python
+   import sys
+   from turboquant.vllm_attn_backend import enable_no_alloc
+
+   # 1. TurboQuant patchen, BEVOR das vLLM-Modell geladen wird
+   enable_no_alloc(key_bits=3, value_bits=2, buffer_size=128)
+
+   # 2. vLLM OpenAI API-Server laden und starten
+   import vllm.entrypoints.openai.api_server as api_server
+
+   if __name__ == "__main__":
+       sys.argv = [
+           "api_server",
+           "--model", "Qwen/Qwen3-Next-80B-Chat-mxfp4",
+           "--port", "8000",
+           "--trust-remote-code",
+           # Hier ggf. weitere Parameter wie --tensor-parallel-size ergänzen
+       ]
+       api_server.main(sys.argv)
+   ```
+
+3. **Server ausführen**:
+   ```bash
+   python start_vllm.py
+   ```
+
+Der Proxy kommuniziert weiterhin transparent über die Standard-OpenAI-Schnittstelle mit vLLM auf Port 8000, profitiert jedoch von der massiven VRAM-Einsparung und der erhöhten Kontextkapazität.
 

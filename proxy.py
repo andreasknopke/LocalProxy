@@ -107,29 +107,40 @@ SUB_AGENTS: Dict[str, str] = {
         "Aufgabe oder Teile davon bereits robust und getestet lösen. Nenne konkrete Paketnamen "
         "und etablierte Best-Practice-Abstraktionen, statt alles selbst zu schreiben."
     ),
-    "coder": (
-        "\n\n[Agent 3: Entwickler]\n"
-        "Schreibe den produktionsreifen Code für die obige Anfrage. Nutze – falls vom Open-Source-Scout "
-        "sinnvoll vorgeschlagen – etablierte Bibliotheken. Achte auf Best Practices, Typsicherheit "
-        "und saubere Formatierung. Gib primär Codeblöcke mit minimalem Text aus."
-    ),
     "reviewer": (
-        "\n\n[Agent 4: Reviewer & Security]\n"
-        "Überprüfe die Anfrage auf potenzielle Bugs, Sicherheitsrisiken (Race Conditions, Memory Leaks) "
-        "und edge cases. Biete konkrete Optimierungen für Stabilität an."
+        "\n\n[Agent 3: Reviewer & Gatekeeper]\n"
+        "Analysiere die Vorschläge des Architekten und des Open-Source-Scouts. "
+        "Triff eine klare Entscheidung (Decision), welche Architektur und welche Bibliotheken genutzt werden sollen. "
+        "Definiere die genauen Schnittstellen und Datenstrukturen für die Entwickler. "
+        "Achte auf Sicherheitsrisiken (Race Conditions, Memory Leaks) und edge cases."
+    ),
+    "coder_logic": (
+        "\n\n[Agent 4a: Entwickler - Kernlogik & Algorithmen]\n"
+        "Schreibe die Kernlogik, Algorithmen und Datenverarbeitung für die obige Anfrage basierend auf den Entscheidungen des Reviewers. "
+        "Nutze die vorgeschlagenen Bibliotheken. Achte auf Typsicherheit, Fehlerbehandlung und saubere Algorithmen. "
+        "Gib primär Codeblöcke mit minimalem Text aus."
+    ),
+    "coder_api": (
+        "\n\n[Agent 4b: Entwickler - API & Integration]\n"
+        "Schreibe die API-Endpunkte, CLI-Schnittstellen, Konfigurationen und die Integration (Boilerplate) für die obige Anfrage. "
+        "Arbeite Hand in Hand mit der Kernlogik. Achte auf Best Practices der jeweiligen Frameworks (z.B. FastAPI, Express). "
+        "Gib primär Codeblöcke mit minimalem Text aus."
     ),
     "optimizer": (
         "\n\n[Agent 5: Performance & Refactoring]\n"
-        "Fokussiere dich auf die Performance des Codes. Wie kann die Laufzeit- und Speicherkomplexität "
-        "optimiert werden? Biete falls nötig eine refactorte, hocheffiziente Teillösung an."
+        "Nimm den Code von Entwickler 4a (Kernlogik) und Entwickler 4b (API & Integration). "
+        "Führe beide Teile zu einer hocheffizienten, produktionsreifen Gesamtlösung zusammen. "
+        "Fokussiere dich auf die Performance des Codes (Laufzeit- und Speicherkomplexität). "
+        "Biete eine refactorte, hocheffiziente Gesamtlösung an."
     ),
 }
 
 DISPLAY_NAMES = {
     "architect": "Architekt & Denker",
     "os_scout": "Open-Source-Scout & Dependency-Manager",
-    "coder": "Entwickler",
-    "reviewer": "Reviewer & Security",
+    "reviewer": "Reviewer & Gatekeeper",
+    "coder_logic": "Entwickler (Kernlogik & Algorithmen)",
+    "coder_api": "Entwickler (API & Integration)",
     "optimizer": "Performance & Refactoring",
 }
 
@@ -139,6 +150,7 @@ async def call_sub_agent(
     payload: Dict[str, Any],
     agent_key: str,
     agent_instruction: str,
+    phase1_context: str = "",
 ) -> Dict[str, Any]:
     """Sendet eine parallele Anfrage an vLLM und bewahrt den gemeinsamen Prompt-Präfix."""
     agent_payload = copy.deepcopy(payload)
@@ -147,12 +159,18 @@ async def call_sub_agent(
         last_message = agent_payload["messages"][-1]
         if isinstance(last_message, dict) and last_message.get("role") == "user":
             content = last_message.get("content", "")
+            
+            # Kontext aus Phase 1 einfügen, falls vorhanden
+            context_prefix = f"\n\n=== ERKENNTNISSE AUS PHASE 1 (PLANUNG & RECHERCHE) ===\n{phase1_context}\n======================================================\n\n" if phase1_context else ""
+            
             if isinstance(content, str):
-                last_message["content"] = f"{content}{agent_instruction}"
+                last_message["content"] = f"{content}{context_prefix}{agent_instruction}"
             else:
                 # OpenAI-kompatible multimodale Nachrichten können eine Liste sein.
                 # Für diesen Proxy wird der Agenten-Suffix als zusätzliche Text-Part ergänzt.
                 content_parts = list(content) if isinstance(content, list) else []
+                if context_prefix:
+                    content_parts.append({"type": "text", "text": context_prefix})
                 content_parts.append({"type": "text", "text": agent_instruction})
                 last_message["content"] = content_parts
 
@@ -458,24 +476,96 @@ async def _stream_chat_completion(
     progress_messages = [
         _format_chat_progress_message(
             "received",
-            "Proxy-Anfrage empfangen und validiert. Starte lokale Qwen Sub-Agenten.",
+            "Proxy-Anfrage empfangen und validiert. Starte Phase 1 (Architektur & Open-Source-Recherche).",
             {"model": body.get("model", MODEL_NAME)},
         )
     ]
 
     async with httpx.AsyncClient() as client:
-        tasks = [
-            call_sub_agent(client, body, name, instruction)
-            for name, instruction in SUB_AGENTS.items()
+        # Phase 1: Architektur & Open-Source-Scout parallel ausführen
+        phase1_keys = ["architect", "os_scout"]
+        phase1_tasks = [
+            call_sub_agent(client, body, name, SUB_AGENTS[name])
+            for name in phase1_keys
         ]
         progress_messages.append(
             _format_chat_progress_message(
-                "local_agents_started",
-                "5 lokale Qwen Sub-Agenten werden parallel ausgeführt.",
-                {"agents": list(SUB_AGENTS.keys())},
+                "phase1_started",
+                "Phase 1 gestartet: Architekt und Open-Source-Scout recherchieren parallel.",
+                {"agents": phase1_keys},
             )
         )
-        results = await asyncio.gather(*tasks)
+        phase1_results = await asyncio.gather(*phase1_tasks)
+        
+        # Ergebnisse aus Phase 1 sammeln und als Kontext aufbereiten
+        phase1_context_parts = []
+        for res in phase1_results:
+            if res.get("status") == "ok":
+                agent_name = DISPLAY_NAMES.get(res["agent_key"], res["agent_key"])
+                phase1_context_parts.append(f"### {agent_name} Empfehlungen:\n{res['content']}")
+        
+        phase1_context = "\n\n".join(phase1_context_parts)
+
+        # Phase 2: Reviewer & Gatekeeper (Entscheidung treffen)
+        progress_messages.append(
+            _format_chat_progress_message(
+                "phase2_started",
+                "Phase 2 gestartet: Reviewer & Gatekeeper bewertet die Recherche und trifft Architekturentscheidungen.",
+                {"agents": ["reviewer"]},
+            )
+        )
+        reviewer_result = await call_sub_agent(
+            client, body, "reviewer", SUB_AGENTS["reviewer"], phase1_context=phase1_context
+        )
+        
+        # Reviewer-Entscheidung zum Kontext hinzufügen
+        phase2_context = phase1_context
+        if reviewer_result.get("status") == "ok":
+            phase2_context += f"\n\n### Reviewer & Gatekeeper Entscheidungen:\n{reviewer_result['content']}"
+
+        # Phase 3: Parallele Implementierung (Kernlogik & API)
+        phase3_keys = ["coder_logic", "coder_api"]
+        progress_messages.append(
+            _format_chat_progress_message(
+                "phase3_started",
+                "Phase 3 gestartet: Zwei Entwickler implementieren parallel Kernlogik und API-Integration.",
+                {"agents": phase3_keys},
+            )
+        )
+        phase3_tasks = [
+            call_sub_agent(client, body, name, SUB_AGENTS[name], phase1_context=phase2_context)
+            for name in phase3_keys
+        ]
+        phase3_results = await asyncio.gather(*phase3_tasks)
+
+        # Coder-Ergebnisse sammeln
+        phase3_context = phase2_context
+        for res in phase3_results:
+            if res.get("status") == "ok":
+                agent_name = DISPLAY_NAMES.get(res["agent_key"], res["agent_key"])
+                phase3_context += f"\n\n### {agent_name} Code-Entwurf:\n{res['content']}"
+
+        # Phase 4: Performance & Refactoring (Zusammenführung & Optimierung)
+        progress_messages.append(
+            _format_chat_progress_message(
+                "phase4_started",
+                "Phase 4 gestartet: Performance & Refactoring führt Code zusammen und optimiert diesen.",
+                {"agents": ["optimizer"]},
+            )
+        )
+        optimizer_result = await call_sub_agent(
+            client, body, "optimizer", SUB_AGENTS["optimizer"], phase1_context=phase3_context
+        )
+
+    # Alle Ergebnisse in der ursprünglichen Reihenfolge zusammenführen
+    all_local_results = [
+        *phase1_results,
+        reviewer_result,
+        *phase3_results,
+        optimizer_result
+    ]
+    results_dict = {res["agent_key"]: res for res in all_local_results}
+    results = [results_dict[name] for name in SUB_AGENTS.keys() if name in results_dict]
 
     completed = sum(1 for result in results if result.get("status") == "ok")
     progress_messages.append(
@@ -580,28 +670,105 @@ async def _stream_events(
         model,
         _format_chat_progress_message(
             "received",
-            "Proxy-Anfrage empfangen und validiert. Starte lokale Qwen Sub-Agenten.",
+            "Proxy-Anfrage empfangen und validiert. Starte Phase 1 (Architektur & Open-Source-Recherche).",
             {"model": model},
         ),
         include_role=True,
     )
 
-    # 2. Lokale Agenten starten
+    # 2. Phase 1 starten
+    phase1_keys = ["architect", "os_scout"]
     yield _format_openai_stream_chunk(
         model,
         _format_chat_progress_message(
-            "local_agents_started",
-            "5 lokale Qwen Sub-Agenten werden parallel ausgeführt.",
-            {"agents": list(SUB_AGENTS.keys())},
+            "phase1_started",
+            "Phase 1 gestartet: Architekt und Open-Source-Scout recherchieren parallel.",
+            {"agents": phase1_keys},
         ),
     )
 
     async with httpx.AsyncClient() as client:
-        tasks = [
-            call_sub_agent(client, body, name, instruction)
-            for name, instruction in SUB_AGENTS.items()
+        phase1_tasks = [
+            call_sub_agent(client, body, name, SUB_AGENTS[name])
+            for name in phase1_keys
         ]
-        results = await asyncio.gather(*tasks)
+        phase1_results = await asyncio.gather(*phase1_tasks)
+
+        # Ergebnisse aus Phase 1 sammeln und als Kontext aufbereiten
+        phase1_context_parts = []
+        for res in phase1_results:
+            if res.get("status") == "ok":
+                agent_name = DISPLAY_NAMES.get(res["agent_key"], res["agent_key"])
+                phase1_context_parts.append(f"### {agent_name} Empfehlungen:\n{res['content']}")
+        
+        phase1_context = "\n\n".join(phase1_context_parts)
+
+        # 3. Phase 2 starten (Reviewer & Gatekeeper)
+        yield _format_openai_stream_chunk(
+            model,
+            _format_chat_progress_message(
+                "phase2_started",
+                "Phase 2 gestartet: Reviewer & Gatekeeper bewertet die Recherche und trifft Architekturentscheidungen.",
+                {"agents": ["reviewer"]},
+            ),
+        )
+
+        reviewer_result = await call_sub_agent(
+            client, body, "reviewer", SUB_AGENTS["reviewer"], phase1_context=phase1_context
+        )
+        
+        # Reviewer-Entscheidung zum Kontext hinzufügen
+        phase2_context = phase1_context
+        if reviewer_result.get("status") == "ok":
+            phase2_context += f"\n\n### Reviewer & Gatekeeper Entscheidungen:\n{reviewer_result['content']}"
+
+        # 4. Phase 3 starten (Parallele Implementierung)
+        phase3_keys = ["coder_logic", "coder_api"]
+        yield _format_openai_stream_chunk(
+            model,
+            _format_chat_progress_message(
+                "phase3_started",
+                "Phase 3 gestartet: Zwei Entwickler implementieren parallel Kernlogik und API-Integration.",
+                {"agents": phase3_keys},
+            ),
+        )
+
+        phase3_tasks = [
+            call_sub_agent(client, body, name, SUB_AGENTS[name], phase1_context=phase2_context)
+            for name in phase3_keys
+        ]
+        phase3_results = await asyncio.gather(*phase3_tasks)
+
+        # Coder-Ergebnisse sammeln
+        phase3_context = phase2_context
+        for res in phase3_results:
+            if res.get("status") == "ok":
+                agent_name = DISPLAY_NAMES.get(res["agent_key"], res["agent_key"])
+                phase3_context += f"\n\n### {agent_name} Code-Entwurf:\n{res['content']}"
+
+        # 5. Phase 4 starten (Performance & Refactoring)
+        yield _format_openai_stream_chunk(
+            model,
+            _format_chat_progress_message(
+                "phase4_started",
+                "Phase 4 gestartet: Performance & Refactoring führt Code zusammen und optimiert diesen.",
+                {"agents": ["optimizer"]},
+            ),
+        )
+
+        optimizer_result = await call_sub_agent(
+            client, body, "optimizer", SUB_AGENTS["optimizer"], phase1_context=phase3_context
+        )
+
+    # Alle Ergebnisse in der ursprünglichen Reihenfolge zusammenführen
+    all_local_results = [
+        *phase1_results,
+        reviewer_result,
+        *phase3_results,
+        optimizer_result
+    ]
+    results_dict = {res["agent_key"]: res for res in all_local_results}
+    results = [results_dict[name] for name in SUB_AGENTS.keys() if name in results_dict]
 
     # 3. Lokale Agenten fertig
     completed = sum(1 for result in results if result.get("status") == "ok")
