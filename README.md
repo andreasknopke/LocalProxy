@@ -1,65 +1,80 @@
-# LocalProxy
+# LocalProxy v2.0 — Hybrider Agentischer Routing-Proxy
 
-Ein OpenAI-kompatibler FastAPI-Proxy für lokale vLLM-/Qwen-Coder-Modelle auf dem DX Spark.
+Ein OpenAI-kompatibler FastAPI-Proxy für lokale vLLM-/Qwen-Coder-Modelle auf dem **DX Spark GB10 (128 GB VRAM)**.
 
-Der Proxy nimmt Chat-Completion-Anfragen entgegen, verteilt jede Anfrage parallel auf fünf spezialisierte Sub-Agenten und gibt die gesammelten Ergebnisse wieder als OpenAI-kompatible Chat-Completion-Antwort zurück. Dadurch können Workloads wie Planung, Open-Source-Recherche, Coding, Review und Performance-Optimierung parallel laufen und die parallele Batch-Verarbeitung von vLLM besser ausnutzen.
+Der Proxy entscheidet pro Request zwischen zwei Routen:
+
+| Route | Auslöser | Ablauf |
+| --- | --- | --- |
+| **Direkt lokal** | Kurze Prompts, Autocomplete, Inline-Fix, Rename, Format | Prompt → Qwen 80B → Antwort |
+| **Hybrid agentisch** | Refactor, Bug, Architektur, Tests, Security, komplexe Tasks | Hindsight Recall → Cloud-Planer (Caveman) → Worker (80B) → **Verify** |
 
 ## Architektur
 
-Bei jeder Anfrage an `/v1/chat/completions` durchläuft der Proxy eine hochgradig optimierte, logische **4-Phasen-Pipeline**:
-
-```mermaid
-graph TD
-    Start[User Anfrage] --> Phase1[Phase 1: Analyse & Recherche]
-    
-    subgraph Phase 1
-        Phase1 --> Architect[architect: Architekt & Denker]
-        Phase1 --> OS_Scout[os_scout: Open-Source-Scout]
-    end
-    
-    Architect --> Phase2[Phase 2: Vorab-Review & Entscheidung]
-    OS_Scout --> Phase2
-    
-    subgraph Phase 2
-        Phase2 --> PreReviewer[reviewer: Reviewer & Gatekeeper]
-    end
-    
-    PreReviewer --> Phase3[Phase 3: Parallele Implementierung]
-    
-    subgraph Phase 3
-        Phase3 --> Coder1[coder_logic: Kernlogik & Algorithmen]
-        Phase3 --> Coder2[coder_api: API & Integration]
-    end
-    
-    Coder1 --> Phase4[Phase 4: Optimierung & Finalisierung]
-    Coder2 --> Phase4
-    
-    subgraph Phase 4
-        Phase4 --> Optimizer[optimizer: Performance & Refactoring]
-    end
-    
-    Optimizer --> End[Zusammengeführte Antwort]
+```
++------------------------------------------------------------+
+|                       VS Code                              |
+|          (Extension: Continue / Cline / Roo-Code)          |
++------------------------------------------------------------+
+                             |
+                             v  (OpenAI REST API)
++------------------------------------------------------------+
+|                FastAPI Proxy Gateway v2.0                  |
+|  - Intent Classifier (deterministisch + Fast Model 27B)    |
+|  - LiteLLM Cloud-Router                                    |
+|  - MCP-Server (/mcp)                                       |
++------------------------------------------------------------+
+         |                                           |
+         v (Komplexe Tasks)                          v (Standard)
++------------------------------+       +-------------------------------+
+|   3-Phasen Agenten-Harnisch  |       |     Lokales vLLM Backend      |
+|  1. Hindsight Recall         |       |     - Qwen 3.6 - 27B (Fast)  |
+|  2. Cloud-Planer (Caveman)   |       |     - Qwen 3 Next-Coder 80B  |
+|  3. Worker 80B + Verify      |       +-------------------------------+
++------------------------------+
+         |                     |
+         v (Cloud-Planung)     v (Lokale Ausführung)
++-------------------+       +-----------------------------+
+|    Cloud-API      |       |       Spark GB10 (128GB)    |
+| (DeepSeek-R1 /    |       |  - Chunked Prefill          |
+|  Claude 3.7 /     |       |  - KV-Prompt Caching        |
+|  GPT-4.1)         |       |  - Tensor-Parallelismus     |
++-------------------+       +-----------------------------+
 ```
 
-### Die 4 Phasen im Detail:
+## Komponenten
 
-1. **Phase 1: Analyse & Recherche (Parallel)**
-   * **Architekt & Denker** – Analysiert die Aufgabe, plant die Architektur, Logik und Randfälle.
-   * **Open-Source-Scout & Dependency-Manager** – Sucht nach etablierten Bibliotheken (PyPI, npm, GitHub etc.), damit das Rad nicht neu erfunden wird.
+### 1. Intent-Klassifizierung
+- **Deterministisch:** Regex/Trigger-Wörter für klare Fälle
+- **Fast Model (27B):** Bei mehrdeutigen Prompts klassifiziert das schnelle 27B-Modell
 
-2. **Phase 2: Vorab-Review & Entscheidung (Sequenziell)**
-   * **Reviewer & Gatekeeper** – Bewertet die Vorschläge aus Phase 1, trifft eine klare Architekturentscheidung, wählt die Bibliotheken aus und definiert die Schnittstellen für die Entwickler.
+### 2. Hindsight Memory (Qdrant + JSONL-Fallback)
+Vier logische Netzwerke:
+- **World Facts:** API-Endpunkte, Build-/Test-Kontext, Repository-Fakten
+- **Agent Experiences:** Erfolgreiche & fehlgeschlagene Lösungsansätze
+- **Entity Summaries:** Module, Klassen, Funktionen, Komponenten
+- **Evolving Beliefs:** Aktuelle Refactoring- und Architektur-Entscheidungen
 
-3. **Phase 3: Parallele Implementierung (Parallel)**
-   * **Entwickler (Kernlogik & Algorithmen)** – Implementiert die mathematische/algorithmische Logik und Datenverarbeitung basierend auf den Vorgaben des Gatekeepers.
-   * **Entwickler (API & Integration)** – Implementiert zeitgleich die API-Endpunkte, CLI-Schnittstellen, Konfigurationen und Boilerplate.
+Primär wird **Qdrant** als Vektordatenbank genutzt. Falls nicht erreichbar, fallback auf JSONL-Dateien.
 
-4. **Phase 4: Optimierung & Finalisierung (Sequenziell)**
-   * **Performance & Refactoring** – Führt die Code-Entwürfe aus Phase 3 zusammen, optimiert die Laufzeit- und Speicherkomplexität und liefert die finale, produktionsreife Gesamtlösung.
+### 3. Caveman Ultra (Token-Kompression)
+Der Cloud-Planer antwortet im Caveman-Stil: nur Symbole, Pfeile, Keywords. 
+Senkt Token-Verbrauch um 60–75 %.
 
-Optional kann ein fünfter **Cloud Final Reviewer** aktiviert werden. Dieser läuft nicht auf dem lokalen Qwen-Modell, sondern gegen ein konfigurierbares Cloud-Modell und bewertet die gesamte lokale Multi-Agent-Antwort wie ein Senior Developer. Bei kritischen Mängeln kann er die Gesamtumsetzung zurückweisen.
+### 4. 3-Phasen-Agenten-Workflow
+1. **Phase 1 – Plan:** Hindsight Recall → Cloud-Planer erstellt Caveman-Plan
+2. **Phase 2 – Execute:** Qwen 80B Worker führt den Plan strikt aus
+3. **Phase 3 – Verify:** Linter/Tests + Self-Correction durch lokales Modell
 
-Der ursprüngliche User-Prompt bleibt vorne erhalten. Nur die letzte User-Nachricht erhält einen agentenspezifischen Suffix. Dadurch kann vLLM Prefix Caching besser nutzen.
+### 5. LiteLLM Cloud-Routing
+Unterstützt OpenAI, Anthropic, DeepSeek, OpenRouter und alle LiteLLM-kompatiblen Provider.
+
+### 6. MCP-Server (Model Context Protocol)
+原生 MCP-Integration für VS Code (Continue/Cline):
+- `localproxy_read_file` / `localproxy_write_file`
+- `localproxy_list_files` / `localproxy_search_code`
+- `localproxy_run_terminal`
+- `localproxy_hindsight_recall` / `localproxy_get_status`
 
 ## Installation
 
@@ -69,15 +84,24 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### Qdrant (optional, für Vektor-Memory)
+
+```bash
+docker run -p 6333:6333 qdrant/qdrant
+```
+
 ## Starten
+
+### Minimal (nur lokales vLLM)
 
 ```bash
 VLLM_API_URL=http://localhost:8000/v1/chat/completions \
 MODEL_NAME="Qwen/Qwen3-Next-80B-Chat-mxfp4" \
+PROXY_AUTH_ENABLED=false \
 python proxy.py
 ```
 
-Mit optionalem Cloud Final Reviewer:
+### Hybrid-Modus mit Cloud-Planung (OpenAI)
 
 ```bash
 VLLM_API_URL=http://localhost:8000/v1/chat/completions \
@@ -88,115 +112,144 @@ CLOUD_REVIEW_MODEL="gpt-4.1-mini" \
 python proxy.py
 ```
 
-Der Proxy läuft standardmäßig auf:
+### Hybrid-Modus mit LiteLLM (OpenRouter/DeepSeek/Claude)
 
-```text
-http://0.0.0.0:5001
+```bash
+VLLM_API_URL=http://localhost:8000/v1/chat/completions \
+MODEL_NAME="Qwen/Qwen3-Next-80B-Chat-mxfp4" \
+CLOUD_REVIEW_ENABLED=true \
+LITELLM_CLOUD_MODEL="openrouter/deepseek/deepseek-r1" \
+LITELLM_CLOUD_API_KEY="sk-or-..." \
+python proxy.py
 ```
+
+### Mit Qdrant Memory
+
+```bash
+QDRANT_URL=http://localhost:6333 \
+HINDSIGHT_USE_QDRANT=true \
+VLLM_API_URL=http://localhost:8000/v1/chat/completions \
+python proxy.py
+```
+
+Der Proxy läuft standardmäßig auf **Port 9001**:
+```text
+http://0.0.0.0:9001
+```
+
+MCP-Endpoint: `http://0.0.0.0:9001/mcp`
 
 ## Konfiguration
 
 | Variable | Standard | Beschreibung |
 | --- | --- | --- |
 | `VLLM_API_URL` | `http://localhost:8000/v1/chat/completions` | Ziel-API des lokalen vLLM-Servers |
-| `VLLM_MODELS_URL` | `http://localhost:8000/v1/models` | Optionaler Modelle-Endpoint |
-| `MODEL_NAME` | `Qwen/Qwen3-Next-80B-Chat-mxfp4` | Modellname für die Proxy-Antwort |
-| `PROXY_PORT` | `5001` | Port des Proxy-Servers |
-| `SUB_AGENT_MAX_TOKENS` | `2048` | Maximale Tokens pro Sub-Agent |
-| `SUB_AGENT_TIMEOUT_SECONDS` | `60` | Timeout pro Sub-Agent-Anfrage |
-| `SUB_AGENT_CONCURRENCY` | `5` | Konfigurierbarer Wert für die angestrebte Parallelität |
-| `CLOUD_REVIEW_ENABLED` | `false` | Aktiviert den Cloud Final Reviewer |
-| `CLOUD_REVIEW_API_URL` | `https://api.openai.com/v1/chat/completions` | OpenAI-kompatible Cloud-Review-API |
-| `CLOUD_REVIEW_API_KEY` | leer | API-Key für den Cloud Final Reviewer |
-| `CLOUD_REVIEW_MODEL` | `gpt-4.1-mini` | Cloud-Modell für den Final Review |
-| `CLOUD_REVIEW_MAX_TOKENS` | `2048` | Maximale Tokens für den Cloud Final Review |
-| `CLOUD_REVIEW_TIMEOUT_SECONDS` | `90` | Timeout für den Cloud Final Review |
+| `VLLM_MODELS_URL` | `http://localhost:8000/v1/models` | Modelle-Endpoint |
+| `MODEL_NAME` | `Qwen/Qwen3-Next-80B-Chat-mxfp4` | Hauptmodell (Worker) |
+| `FAST_MODEL_NAME` | `Qwen/Qwen3.6-27B-Chat-FP8` | Schnelles Modell (Klassifikation/Autocomplete) |
+| `PROXY_PORT` | `9001` | Proxy-Port |
+| `PROXY_AUTH_ENABLED` | `true` | API-Key-Authentifizierung |
+| `PROXY_API_KEY` | auto-generiert | API-Key (bei Auth) |
+| `CHATTY_MODE` | `true` | Status-Updates im Chat-Output |
+| `CLOUD_REVIEW_ENABLED` | `false` | Cloud-Planer aktivieren |
+| `CLOUD_REVIEW_API_URL` | `https://api.openai.com/v1/chat/completions` | Cloud-API-URL |
+| `CLOUD_REVIEW_API_KEY` | leer | Cloud-API-Key |
+| `CLOUD_REVIEW_MODEL` | `gpt-4.1-mini` | Cloud-Modell |
+| `CLOUD_REVIEW_MAX_TOKENS` | `2048` | Max. Tokens Cloud |
+| `CLOUD_REVIEW_TIMEOUT_SECONDS` | `90` | Timeout Cloud |
+| `LITELLM_CLOUD_MODEL` | leer | LiteLLM-Modell (z.B. `openrouter/deepseek/deepseek-r1`) |
+| `LITELLM_CLOUD_API_KEY` | leer | LiteLLM API-Key |
+| `CAVEMAN_ENABLED` | `true` | Caveman-Prompt-Injektion |
+| `CAVEMAN_MAX_TOKENS` | `1024` | Max. Tokens Caveman-Plan |
+| `HINDSIGHT_ENABLED` | `true` | Hindsight Memory |
+| `QDRANT_URL` | `http://localhost:6333` | Qdrant-URL |
+| `QDRANT_API_KEY` | leer | Qdrant-API-Key |
+| `HINDSIGHT_USE_QDRANT` | `false` (auto bei non-localhost QDRANT_URL) | Qdrant statt JSONL |
+| `HINDSIGHT_DIR` | `./.hindsight_memory` | JSONL-Speicherort |
+| `HINDSIGHT_EMBEDDING_DIM` | `768` | Embedding-Dimension |
+| `HINDSIGHT_MAX_MEMORY_TOKENS` | `4000` | Token-Budget Recall-Kontext |
+| `HINDSIGHT_MIN_SIMILARITY` | `0.18` | Min. Ähnlichkeit Recall |
+| `VERIFY_ENABLED` | `true` | Phase-3-Verifikation |
+| `VERIFY_LINT_COMMAND` | leer | Lint-Befehl (z.B. `ruff check`) |
+| `VERIFY_TEST_COMMAND` | leer | Test-Befehl (z.B. `pytest -x`) |
+| `VERIFY_TIMEOUT_SECONDS` | `45` | Timeout Verifikation |
+| `MCP_ENABLED` | `true` | MCP-Server aktiv |
+| `DIRECT_MAX_TOKENS` | `2048` | Tokens für direkte Requests |
+| `SUB_AGENT_MAX_TOKENS` | `4096` | Tokens für Agent-Worker |
+| `SUB_AGENT_TIMEOUT_SECONDS` | `60` | Timeout pro lokaler Anfrage |
 
-## OpenAI-kompatibler Testaufruf
+## Testaufrufe
 
+### Direkter Request (trivial)
 ```bash
-curl http://localhost:5001/v1/chat/completions \
+curl http://localhost:9001/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
   -d '{
     "model": "Qwen/Qwen3-Next-80B-Chat-mxfp4",
-    "messages": [
-      {
-        "role": "user",
-        "content": "Erstelle eine robuste Python-Funktion, die große CSV-Dateien speicherschonend verarbeitet."
-      }
-    ]
+    "messages": [{"role": "user", "content": "Fix typo in this inline function."}]
   }'
 ```
 
-## Nutzung mit VS Code / Copilot
-
-Konfiguriere VS Code bzw. deine verwendete Extension so, dass der OpenAI-Endpoint auf den lokalen Proxy zeigt:
-
-```text
-Base URL: http://localhost:5001/v1
-Model: Qwen/Qwen3-Next-80B-Chat-mxfp4
-```
-
-## Gesundheitscheck
-
+### Komplexer Request (triggert Agent-Workflow)
 ```bash
-curl http://localhost:5001/healthz
+curl http://localhost:9001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{
+    "model": "Qwen/Qwen3-Next-80B-Chat-mxfp4",
+    "messages": [{"role": "user", "content": "Refactor this class to reduce coupling and add tests."}]
+  }'
 ```
 
-Antwort:
+### MCP-Request (VS Code Tool-Zugriff)
+```bash
+curl http://localhost:9001/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+## Nutzung mit VS Code
+
+Konfiguriere **Continue**, **Cline** oder **Roo-Code**:
 
 ```json
-{"status":"ok","agents":5}
+{
+  "model": "Qwen/Qwen3-Next-80B-Chat-mxfp4",
+  "apiBase": "http://localhost:9001/v1",
+  "apiKey": "YOUR_PROXY_API_KEY"
+}
 ```
 
-## Hinweis zur Performance
+Für MCP-Toolzugriff in `.vscode/mcp.json`:
+```json
+{
+  "servers": {
+    "localproxy": {
+      "type": "http",
+      "url": "http://localhost:9001/mcp"
+    }
+  }
+}
+```
 
-Die Parallelität nutzt vLLM-Batching und Prefix Caching. Die lokalen Qwen-Agenten werden parallel ausgeführt. Der optionale Cloud Final Reviewer läuft danach sequenziell, damit er die komplette lokale Gesamtumsetzung bewerten und ggf. zurückweisen kann.
+## Web-Konfigurationsinterface 🌐
 
-## Optimierung mit TurboQuant (KV-Cache-Komprimierung)
+Der Proxy enthält ein eingebautes Web-Dashboard unter:
 
-Da der Proxy 5 Sub-Agenten parallel ausführt, steigt die Last auf dem vLLM-Server erheblich (Batch-Größe = 5). Bei langen Kontexten führt dies schnell zu hohem VRAM-Bedarf für den KV-Cache oder zu Out-of-Memory (OOM) Fehlern. 
+```text
+http://0.0.0.0:9001/webui/
+```
 
-Durch den Einsatz von [TurboQuant](https://github.com/0xSero/turboquant) (ICLR 2026) kann der KV-Cache (Keys auf 3-Bit, Values auf 2-Bit) fast ohne Qualitätsverlust komprimiert werden. Dies ermöglicht es, den Kontext des Modells optimal zu nutzen.
+Das Dashboard ermöglicht die grafische Konfiguration aller Proxy-Einstellungen:
 
-### Einrichtung auf dem vLLM-Server
+| Tab | Inhalt |
+| --- | --- |
+| 🤖 **Modelle** | vLLM URLs, Hauptmodell (80B), Fast-Modell (27B), Proxy-Port, API-Key, Auth/Chatty-Toggle |
+| ☁️ **Cloud-APIs** | Cloud-Planer aktivieren, API-URL/Key, Modell, Max Tokens, LiteLLM (OpenRouter/DeepSeek/Claude) |
+| 🎯 **Tokens & Timeouts** | Slider für alle Token-Budgets und Timeouts |
+| ⚙️ **Features** | Caveman, Hindsight, Verifikation, MCP — alle als Toggle |
+| 🧠 **Hindsight** | Qdrant/JSONL, Embedding-Dim, Recall-Parameter, Memory löschen |
+| ✅ **Verifikation** | Lint- und Test-Befehle für Phase 3 |
 
-Da der Proxy das Modell nicht selbst lädt, sondern HTTP-Anfragen an das vLLM-Backend weiterleitet, muss TurboQuant **auf dem vLLM-Server** installiert und aktiviert werden:
-
-1. **Installation auf dem vLLM-Server**:
-   ```bash
-   git clone https://github.com/0xSero/turboquant.git
-   cd turboquant
-   pip install -e .
-   ```
-
-2. **vLLM mit TurboQuant-Hooks starten**:
-   Erstelle ein Python-Startskript (z. B. `start_vllm.py`) auf dem vLLM-Server, um die Hooks vor dem Laden des Modells zu registrieren:
-   ```python
-   import sys
-   from turboquant.vllm_attn_backend import enable_no_alloc
-
-   # 1. TurboQuant patchen, BEVOR das vLLM-Modell geladen wird
-   enable_no_alloc(key_bits=3, value_bits=2, buffer_size=128)
-
-   # 2. vLLM OpenAI API-Server laden und starten
-   import vllm.entrypoints.openai.api_server as api_server
-
-   if __name__ == "__main__":
-       sys.argv = [
-           "api_server",
-           "--model", "Qwen/Qwen3-Next-80B-Chat-mxfp4",
-           "--port", "8000",
-           "--trust-remote-code",
-           # Hier ggf. weitere Parameter wie --tensor-parallel-size ergänzen
-       ]
-       api_server.main(sys.argv)
-   ```
-
-3. **Server ausführen**:
-   ```bash
-   python start_vllm.py
-   ```
-
-Der Proxy kommuniziert weiterhin transparent über die Standard-OpenAI-Schnittstelle mit vLLM auf Port 8000, profitiert jedoch von der massiven VRAM-Einsparung und der erhöhten Kontextkapazität.
-
+Die Konfiguration wird in `config.json` gespeichert und beim nächsten Neustart geladen (Env-Variablen haben Vorrang).

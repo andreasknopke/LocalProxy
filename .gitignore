@@ -1,0 +1,6 @@
+# LocalProxy — ignorierte Dateien
+config.json
+.hindsight_memory/
+*.pyc
+__pycache__/
+.venv/
