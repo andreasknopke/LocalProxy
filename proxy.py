@@ -3,7 +3,7 @@ LocalProxy — Hybrider Agentischer Routing-Proxy (OpenAI-kompatibel)
 
 Architektur (laut Gemini-Plan):
   VS Code (Continue/Cline/Roo) → FastAPI Gateway → Intent Classifier
-    ├─ Direkt: Lokales vLLM (Qwen 27B/80B)
+    ├─ Direkt: Lokal/Free (Worker & Fast)
     └─ Agentisch: Hindsight Recall → Cloud-Planer (Caveman) → Worker (80B) → Verify
 
 Komponenten:
@@ -40,6 +40,24 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qdrant_models
 
+# ── Logging ────────────────────────────────────────────────────────────────
+import datetime
+
+LOG_FILE = os.getenv("LOG_FILE", str(Path(__file__).parent / "proxy.log"))
+
+
+def _log(msg: str) -> None:
+    """Schreibt eine Log-Zeile mit Timestamp in Datei + stdout."""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass  # kein Log-File? egal
+
+
 # ── Webinterface ───────────────────────────────────────────────────────────
 try:
     from webui import mount_webui, _load_config as _webui_load_config
@@ -63,6 +81,7 @@ except Exception:
 
 VLLM_API_URL: str = os.getenv("VLLM_API_URL", "http://localhost:8000/v1/chat/completions")
 VLLM_MODELS_URL: str = os.getenv("VLLM_MODELS_URL", "http://localhost:8000/v1/models")
+VLLM_API_KEY: str = os.getenv("VLLM_API_KEY", "")
 MODEL_NAME: str = os.getenv("MODEL_NAME", "Qwen/Qwen3-Next-80B-Chat-mxfp4")
 FAST_MODEL_NAME: str = os.getenv("FAST_MODEL_NAME", "Qwen/Qwen3.6-27B-Chat-FP8")
 PROXY_PORT: int = int(os.getenv("PROXY_PORT", "9001"))
@@ -74,7 +93,7 @@ PROXY_AUTH_ENABLED: bool = os.getenv("PROXY_AUTH_ENABLED", "true").lower() in {"
 PROXY_API_KEY: str = os.getenv("PROXY_API_KEY", "")
 if PROXY_AUTH_ENABLED and not PROXY_API_KEY:
     PROXY_API_KEY = "localfox-" + secrets.token_hex(16)
-    print(f"⚡ Auto-generated PROXY_API_KEY: {PROXY_API_KEY}")
+    _log(f"⚡ Auto-generated PROXY_API_KEY: {PROXY_API_KEY}")
 
 # ── Chatty / Progress ──────────────────────────────────────────────────────
 CHATTY_MODE: bool = os.getenv("CHATTY_MODE", "true").lower() in {"1", "true", "yes", "y", "on"}
@@ -85,12 +104,15 @@ CLOUD_REVIEW_ENABLED: bool = os.getenv("CLOUD_REVIEW_ENABLED", "false").lower() 
 CLOUD_REVIEW_API_URL: str = os.getenv("CLOUD_REVIEW_API_URL", "https://api.openai.com/v1/chat/completions")
 CLOUD_REVIEW_API_KEY: str = os.getenv("CLOUD_REVIEW_API_KEY", "")
 CLOUD_REVIEW_MODEL: str = os.getenv("CLOUD_REVIEW_MODEL", "gpt-4.1-mini")
-CLOUD_REVIEW_MAX_TOKENS: int = int(os.getenv("CLOUD_REVIEW_MAX_TOKENS", "2048"))
-CLOUD_REVIEW_TIMEOUT_SECONDS: float = float(os.getenv("CLOUD_REVIEW_TIMEOUT_SECONDS", "90"))
+CLOUD_REVIEW_MAX_TOKENS: int = int(os.getenv("CLOUD_REVIEW_MAX_TOKENS", "128000"))
+CLOUD_REVIEW_TIMEOUT_SECONDS: float = float(os.getenv("CLOUD_REVIEW_TIMEOUT_SECONDS", "180"))
 
 # LiteLLM Cloud-Provider (DeepSeek, Claude, GPT via OpenRouter o.ä.)
 LITELLM_CLOUD_MODEL: str = os.getenv("LITELLM_CLOUD_MODEL", "")
 LITELLM_CLOUD_API_KEY: str = os.getenv("LITELLM_CLOUD_API_KEY", "")
+LITELLM_CLOUD_API_URL: str = os.getenv("LITELLM_CLOUD_API_URL", "")
+LITELLM_CLOUD_MAX_TOKENS: int = int(os.getenv("LITELLM_CLOUD_MAX_TOKENS", "16384"))
+LITELLM_CLOUD_TIMEOUT_SECONDS: float = float(os.getenv("LITELLM_CLOUD_TIMEOUT_SECONDS", "180"))
 
 # ── Caveman ────────────────────────────────────────────────────────────────
 CAVEMAN_ENABLED: bool = os.getenv("CAVEMAN_ENABLED", "true").lower() in {"1", "true", "yes", "y", "on"}
@@ -99,7 +121,7 @@ CAVEMAN_SYSTEM_PROMPT: str = (
     "No filler, no grammar, no prose. Use ->, !, ?, FIX, RISK, TODO. "
     "Return executable plan only."
 )
-CAVEMAN_MAX_TOKENS: int = int(os.getenv("CAVEMAN_MAX_TOKENS", "1024"))
+CAVEMAN_MAX_TOKENS: int = int(os.getenv("CAVEMAN_MAX_TOKENS", "8192"))
 
 # ── Hindsight / Qdrant ─────────────────────────────────────────────────────
 HINDSIGHT_ENABLED: bool = os.getenv("HINDSIGHT_ENABLED", "true").lower() in {"1", "true", "yes", "y", "on"}
@@ -127,16 +149,17 @@ AGENT_TRIGGER_WORDS: Tuple[str, ...] = (
     "rewrite", "umschreiben", "design", "entwurf",
 )
 DIRECT_TRIGGER_WORDS: Tuple[str, ...] = (
-    "autocomplete", "complete", "kurz", "klein", "trivial",
+    "autocomplete", "kurz", "klein", "trivial",
     "inline", "fix typo", "rename", "format", "linter",
     "kommentar", "comment", "variable umbenennen",
+    "syntax", "indent", "whitespace", "formatting",
 )
 
 # ── Token-Budgets & Timeouts ───────────────────────────────────────────────
-DEFAULT_DIRECT_MAX_TOKENS: int = int(os.getenv("DIRECT_MAX_TOKENS", "2048"))
-DEFAULT_AGENT_MAX_TOKENS: int = int(os.getenv("SUB_AGENT_MAX_TOKENS", "4096"))
-SUB_AGENT_TIMEOUT_SECONDS: float = float(os.getenv("SUB_AGENT_TIMEOUT_SECONDS", "60"))
-VERIFY_TIMEOUT_SECONDS: float = float(os.getenv("VERIFY_TIMEOUT_SECONDS", "45"))
+DEFAULT_DIRECT_MAX_TOKENS: int = int(os.getenv("DIRECT_MAX_TOKENS", "65536"))
+DEFAULT_AGENT_MAX_TOKENS: int = int(os.getenv("SUB_AGENT_MAX_TOKENS", "65536"))
+SUB_AGENT_TIMEOUT_SECONDS: float = float(os.getenv("SUB_AGENT_TIMEOUT_SECONDS", "300"))
+VERIFY_TIMEOUT_SECONDS: float = float(os.getenv("VERIFY_TIMEOUT_SECONDS", "120"))
 
 # ── Phase-3 Verification ───────────────────────────────────────────────────
 VERIFY_ENABLED: bool = os.getenv("VERIFY_ENABLED", "true").lower() in {"1", "true", "yes", "y", "on"}
@@ -146,8 +169,8 @@ VERIFY_TEST_COMMAND: str = os.getenv("VERIFY_TEST_COMMAND", "")
 # ── Display-Namen ──────────────────────────────────────────────────────────
 DISPLAY_NAMES: Dict[str, str] = {
     "architect": "Cloud-Planer",
-    "worker": "Lokaler Worker (80B)",
-    "fast_worker": "Lokaler Fast Worker (27B)",
+    "worker": f"Lokaler Worker ({MODEL_NAME})",
+    "fast_worker": f"Lokaler Fast Worker ({FAST_MODEL_NAME})",
     "direct": "Direkt Lokal",
     "memory": "Hindsight Memory",
     "caveman": "Caveman Plan",
@@ -174,11 +197,15 @@ def _apply_config_file() -> None:
         return cfg_val  # Env wurde bereits in den Modul-Konstanten gelesen
 
     # Models
-    global VLLM_API_URL, VLLM_MODELS_URL, MODEL_NAME, FAST_MODEL_NAME
+    global VLLM_API_URL, VLLM_MODELS_URL, VLLM_API_KEY, MODEL_NAME, FAST_MODEL_NAME
     if not os.getenv("VLLM_API_URL"):
         VLLM_API_URL = cfg.get("models", {}).get("vllm_api_url", VLLM_API_URL)
     if not os.getenv("VLLM_MODELS_URL"):
         VLLM_MODELS_URL = cfg.get("models", {}).get("vllm_models_url", VLLM_MODELS_URL)
+    # API-Keys: config.json überschreibt Env — WebUI-Speicherung soll immer wirken
+    ak = cfg.get("models", {}).get("vllm_api_key", "")
+    if ak:
+        VLLM_API_KEY = ak
     if not os.getenv("MODEL_NAME"):
         MODEL_NAME = cfg.get("models", {}).get("model_name", MODEL_NAME)
     if not os.getenv("FAST_MODEL_NAME"):
@@ -190,10 +217,10 @@ def _apply_config_file() -> None:
         PROXY_PORT = cfg.get("proxy", {}).get("port", PROXY_PORT)
     if not os.getenv("PROXY_AUTH_ENABLED"):
         PROXY_AUTH_ENABLED = cfg.get("proxy", {}).get("auth_enabled", PROXY_AUTH_ENABLED)
-    if not os.getenv("PROXY_API_KEY"):
-        pk = cfg.get("proxy", {}).get("api_key", "")
-        if pk:
-            PROXY_API_KEY = pk
+    # Proxy-Auth: config.json überschreibt Env (WebUI-Save wirkt)
+    pk = cfg.get("proxy", {}).get("api_key", "")
+    if pk:
+        PROXY_API_KEY = pk
     if not os.getenv("CHATTY_MODE"):
         CHATTY_MODE = cfg.get("proxy", {}).get("chatty_mode", CHATTY_MODE)
 
@@ -204,10 +231,10 @@ def _apply_config_file() -> None:
         CLOUD_REVIEW_ENABLED = cfg.get("cloud", {}).get("enabled", CLOUD_REVIEW_ENABLED)
     if not os.getenv("CLOUD_REVIEW_API_URL"):
         CLOUD_REVIEW_API_URL = cfg.get("cloud", {}).get("api_url", CLOUD_REVIEW_API_URL)
-    if not os.getenv("CLOUD_REVIEW_API_KEY"):
-        ck = cfg.get("cloud", {}).get("api_key", "")
-        if ck:
-            CLOUD_REVIEW_API_KEY = ck
+    # Cloud API-Key: config.json überschreibt Env (WebUI-Save wirkt)
+    ck = cfg.get("cloud", {}).get("api_key", "")
+    if ck:
+        CLOUD_REVIEW_API_KEY = ck
     if not os.getenv("CLOUD_REVIEW_MODEL"):
         CLOUD_REVIEW_MODEL = cfg.get("cloud", {}).get("model", CLOUD_REVIEW_MODEL)
     if not os.getenv("CLOUD_REVIEW_MAX_TOKENS"):
@@ -216,13 +243,20 @@ def _apply_config_file() -> None:
         CLOUD_REVIEW_TIMEOUT_SECONDS = cfg.get("cloud", {}).get("timeout_seconds", CLOUD_REVIEW_TIMEOUT_SECONDS)
 
     # LiteLLM
-    global LITELLM_CLOUD_MODEL, LITELLM_CLOUD_API_KEY
+    global LITELLM_CLOUD_MODEL, LITELLM_CLOUD_API_KEY, LITELLM_CLOUD_API_URL
+    global LITELLM_CLOUD_MAX_TOKENS, LITELLM_CLOUD_TIMEOUT_SECONDS
     if not os.getenv("LITELLM_CLOUD_MODEL"):
         LITELLM_CLOUD_MODEL = cfg.get("litellm", {}).get("model", LITELLM_CLOUD_MODEL)
-    if not os.getenv("LITELLM_CLOUD_API_KEY"):
-        lk = cfg.get("litellm", {}).get("api_key", "")
-        if lk:
-            LITELLM_CLOUD_API_KEY = lk
+    # LiteLLM API-Key: config.json überschreibt Env (WebUI-Save wirkt)
+    lk = cfg.get("litellm", {}).get("api_key", "")
+    if lk:
+        LITELLM_CLOUD_API_KEY = lk
+    if not os.getenv("LITELLM_CLOUD_API_URL"):
+        LITELLM_CLOUD_API_URL = cfg.get("litellm", {}).get("api_url", LITELLM_CLOUD_API_URL)
+    if not os.getenv("LITELLM_CLOUD_MAX_TOKENS"):
+        LITELLM_CLOUD_MAX_TOKENS = cfg.get("litellm", {}).get("max_tokens", LITELLM_CLOUD_MAX_TOKENS)
+    if not os.getenv("LITELLM_CLOUD_TIMEOUT_SECONDS"):
+        LITELLM_CLOUD_TIMEOUT_SECONDS = cfg.get("litellm", {}).get("timeout_seconds", LITELLM_CLOUD_TIMEOUT_SECONDS)
 
     # Tokens
     global DEFAULT_DIRECT_MAX_TOKENS, DEFAULT_AGENT_MAX_TOKENS
@@ -232,7 +266,9 @@ def _apply_config_file() -> None:
     if not os.getenv("SUB_AGENT_MAX_TOKENS"):
         DEFAULT_AGENT_MAX_TOKENS = cfg.get("tokens", {}).get("agent_max_tokens", DEFAULT_AGENT_MAX_TOKENS)
     if not os.getenv("SUB_AGENT_TIMEOUT_SECONDS"):
-        SUB_AGENT_TIMEOUT_SECONDS = cfg.get("tokens", {}).get("sub_agent_timeout_seconds", SUB_AGENT_TIMEOUT_SECONDS)
+        raw = cfg.get("tokens", {}).get("sub_agent_timeout_seconds", SUB_AGENT_TIMEOUT_SECONDS)
+        SUB_AGENT_TIMEOUT_SECONDS = max(float(raw), 120.0)  # mind. 120s wg. DFlash JIT
+        _log(f"  ⏱ SUB_AGENT_TIMEOUT_SECONDS = {SUB_AGENT_TIMEOUT_SECONDS:.0f}s (cfg raw={raw})")
     if not os.getenv("VERIFY_TIMEOUT_SECONDS"):
         VERIFY_TIMEOUT_SECONDS = cfg.get("tokens", {}).get("verify_timeout_seconds", VERIFY_TIMEOUT_SECONDS)
 
@@ -251,20 +287,24 @@ def _apply_config_file() -> None:
         HINDSIGHT_ENABLED = cfg.get("hindsight", {}).get("enabled", HINDSIGHT_ENABLED)
     if not os.getenv("QDRANT_URL"):
         QDRANT_URL = cfg.get("hindsight", {}).get("qdrant_url", QDRANT_URL)
-    if not os.getenv("QDRANT_API_KEY"):
-        qk = cfg.get("hindsight", {}).get("qdrant_api_key", "")
-        if qk:
-            QDRANT_API_KEY = qk
+    # Qdrant API-Key: config.json überschreibt Env (WebUI-Save wirkt)
+    qk = cfg.get("hindsight", {}).get("qdrant_api_key", "")
+    if qk:
+        QDRANT_API_KEY = qk
     if not os.getenv("HINDSIGHT_COLLECTION"):
         HINDSIGHT_COLLECTION = cfg.get("hindsight", {}).get("collection", HINDSIGHT_COLLECTION)
     if not os.getenv("HINDSIGHT_EMBEDDING_DIM"):
-        HINDSIGHT_EMBEDDING_DIM = cfg.get("hindsight", {}).get("embedding_dim", HINDSIGHT_EMBEDDING_DIM)
+        val = cfg.get("hindsight", {}).get("embedding_dim", HINDSIGHT_EMBEDDING_DIM)
+        HINDSIGHT_EMBEDDING_DIM = int(val) if not isinstance(val, int) else val
     if not os.getenv("HINDSIGHT_MAX_MEMORY_TOKENS"):
-        HINDSIGHT_MAX_MEMORY_TOKENS = cfg.get("hindsight", {}).get("max_memory_tokens", HINDSIGHT_MAX_MEMORY_TOKENS)
+        val = cfg.get("hindsight", {}).get("max_memory_tokens", HINDSIGHT_MAX_MEMORY_TOKENS)
+        HINDSIGHT_MAX_MEMORY_TOKENS = int(val) if not isinstance(val, int) else val
     if not os.getenv("HINDSIGHT_MIN_SIMILARITY"):
-        HINDSIGHT_MIN_SIMILARITY = cfg.get("hindsight", {}).get("min_similarity", HINDSIGHT_MIN_SIMILARITY)
+        val = cfg.get("hindsight", {}).get("min_similarity", HINDSIGHT_MIN_SIMILARITY)
+        HINDSIGHT_MIN_SIMILARITY = float(val) if not isinstance(val, (int, float)) else val
     if not os.getenv("HINDSIGHT_RETAIN_DELAY_SECONDS"):
-        HINDSIGHT_RETAIN_DELAY_SECONDS = cfg.get("hindsight", {}).get("retain_delay_seconds", HINDSIGHT_RETAIN_DELAY_SECONDS)
+        val = cfg.get("hindsight", {}).get("retain_delay_seconds", HINDSIGHT_RETAIN_DELAY_SECONDS)
+        HINDSIGHT_RETAIN_DELAY_SECONDS = float(val) if not isinstance(val, (int, float)) else val
     if not os.getenv("HINDSIGHT_USE_QDRANT"):
         HINDSIGHT_USE_QDRANT = cfg.get("hindsight", {}).get("use_qdrant", HINDSIGHT_USE_QDRANT)
     if not os.getenv("HINDSIGHT_DIR"):
@@ -286,6 +326,76 @@ def _apply_config_file() -> None:
 
 
 _apply_config_file()
+
+# ── URL-Normalisierung ──────────────────────────────────────────────────
+_api_base_clean = VLLM_API_URL.rstrip("/")
+if not _api_base_clean.endswith("/chat/completions"):
+    if _api_base_clean.endswith("/v1"):
+        VLLM_API_URL = _api_base_clean + "/chat/completions"
+    else:
+        VLLM_API_URL = _api_base_clean + "/chat/completions"
+    _log(f"🔧 URL-Norm: VLLM_API_URL → {VLLM_API_URL}")
+
+_models_base_clean = VLLM_MODELS_URL.rstrip("/")
+# Models-URL muss ein gültiges Protokoll haben — sonst aus API-URL ableiten
+if not _models_base_clean.startswith(("http://", "https://")):
+    _api_for_models = VLLM_API_URL.rstrip("/")
+    if "/chat/completions" in _api_for_models:
+        VLLM_MODELS_URL = _api_for_models.rsplit("/chat/completions", 1)[0] + "/models"
+    elif _api_for_models.endswith("/v1"):
+        VLLM_MODELS_URL = _api_for_models + "/models"
+    else:
+        VLLM_MODELS_URL = _api_for_models + "/v1/models"
+    _log(f"🔧 URL-Norm: VLLM_MODELS_URL aus API-URL → {VLLM_MODELS_URL}")
+elif not _models_base_clean.endswith("/models") and not _models_base_clean.endswith("/v1/models"):
+    VLLM_MODELS_URL = _models_base_clean + "/models"
+    _log(f"🔧 URL-Norm: VLLM_MODELS_URL → {VLLM_MODELS_URL}")
+
+# ── Cloud-URL-Normalisierung ────────────────────────────────────────────
+# Moonshot: /v1 → /v1/chat/completions, DeepSeek: direkt /chat/completions
+_cloud_clean = CLOUD_REVIEW_API_URL.rstrip("/")
+if not _cloud_clean.endswith("/chat/completions"):
+    if _cloud_clean.endswith("/v1"):
+        CLOUD_REVIEW_API_URL = _cloud_clean + "/chat/completions"
+    else:
+        _log(f"ℹ️  Cloud-URL '{CLOUD_REVIEW_API_URL}' endet nicht auf /chat/completions – wird trotzdem verwendet")
+    _log(f"🔧 URL-Norm: CLOUD_REVIEW_API_URL → {CLOUD_REVIEW_API_URL}")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Reasoning-Content Cache (für Tool-Continuations)
+# ═══════════════════════════════════════════════════════════════════════════
+# DeepSeek erfordert, dass reasoning_content bei Folgerequests mit tool_calls
+# im Assistant-Message erhalten bleibt. VS Code kennt dieses Feld nicht und
+# sendet es nicht zurück — also cachen wir es und injizieren es automatisch.
+
+_reasoning_cache: Dict[str, str] = {}  # tool_call_id → reasoning_content
+
+def _cache_reasoning(tool_calls: Any, reasoning_content: Optional[str]) -> None:
+    """Speichert reasoning_content, keyed by tool_call_id."""
+    if not reasoning_content or not tool_calls:
+        return
+    for tc in tool_calls:
+        tc_id = tc.get("id") or tc.get("function", {}).get("name", "")
+        if tc_id:
+            _reasoning_cache[tc_id] = reasoning_content
+
+def _inject_reasoning_from_cache(messages: List[Dict[str, Any]]) -> None:
+    """Inject missing reasoning_content into assistant messages with tool_calls."""
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        if not msg.get("tool_calls"):
+            continue
+        if msg.get("reasoning_content"):
+            continue  # schon vorhanden
+        # reasoning_content fehlt → aus Cache holen
+        for tc in msg["tool_calls"]:
+            tc_id = tc.get("id") or tc.get("function", {}).get("name", "")
+            cached = _reasoning_cache.get(tc_id)
+            if cached:
+                msg["reasoning_content"] = cached
+                break
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Hindsight Memory Netzwerke (4 logische Ebenen)
@@ -331,9 +441,9 @@ class HindsightMemory:
             try:
                 self._qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY or None)
                 self._ensure_collection()
-                print(f"🧠 Hindsight: Qdrant connected @ {QDRANT_URL}")
+                _log(f"🧠 Hindsight: Qdrant connected @ {QDRANT_URL}")
             except Exception as exc:
-                print(f"⚠️  Qdrant nicht erreichbar ({exc}), fallback auf JSONL")
+                _log(f"⚠️  Qdrant nicht erreichbar ({exc}), fallback auf JSONL")
                 self._use_qdrant = False
                 self._qdrant = None
 
@@ -400,15 +510,16 @@ class HindsightMemory:
                 ))
             return records
         except Exception as exc:
-            print(f"⚠️  Qdrant recall fehlgeschlagen: {exc}")
+            _log(f"⚠️  Qdrant recall fehlgeschlagen: {exc}")
             return []
 
     def _recall_jsonl(self, query: str, min_similarity: float, _limit: int) -> List[MemoryRecord]:
         records = _load_memory_records()
         scored = []
+        ms = float(min_similarity)  # config.json speichert manchmal strings
         for rec in records:
             score = max(_text_similarity(query, rec.text), rec.score)
-            if score >= min_similarity:
+            if score >= ms:
                 rec.score = score
                 scored.append(rec)
         scored.sort(key=lambda r: r.score, reverse=True)
@@ -455,7 +566,7 @@ class HindsightMemory:
                 ],
             )
         except Exception as exc:
-            print(f"⚠️  Qdrant retain fehlgeschlagen: {exc}")
+            _log(f"⚠️  Qdrant retain fehlgeschlagen: {exc}")
 
     def _retain_jsonl(self, point_id: str, text: str, networks: List[str]) -> None:
         records = _load_memory_records()
@@ -476,7 +587,7 @@ class HindsightMemory:
             return ""
         chunks: List[str] = []
         total_chars = 0
-        budget = HINDSIGHT_MAX_MEMORY_TOKENS * 4
+        budget = int(HINDSIGHT_MAX_MEMORY_TOKENS) * 4
         for rec in records:
             nets = ", ".join(rec.networks)
             chunk = f"- [{rec.score:.2f}] [{nets}] {rec.text}"
@@ -557,12 +668,18 @@ def _classify_networks(text: str) -> List[str]:
     return networks
 
 
-def _extract_choice_content(result: Dict[str, Any]) -> str:
+def _extract_choice_message(result: Dict[str, Any]) -> Dict[str, Any]:
     choices = result.get("choices", [])
     if not choices:
-        return ""
+        return {}
     message = choices[0].get("message", {})
-    return message.get("content", "") if isinstance(message, dict) else ""
+    return message if isinstance(message, dict) else {}
+
+
+def _extract_choice_content(result: Dict[str, Any]) -> str:
+    message = _extract_choice_message(result)
+    content = message.get("content", "")
+    return content or ""
 
 
 def _sum_usage(results: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -620,22 +737,111 @@ def _save_memory_records(records: List[MemoryRecord]) -> None:
 def _classify_intent_deterministic(text: str) -> Optional[str]:
     """Deterministische Intent-Erkennung via Trigger-Wörter."""
     t = text.lower()
-    if any(trigger in t for trigger in DIRECT_TRIGGER_WORDS):
-        return "direct"
+
+    # AGENT zuerst prüfen — Agent-Intent hat Vorrang
     if any(trigger in t for trigger in AGENT_TRIGGER_WORDS):
         return "agent"
+
+    # Lange Texte (>500 Zeichen) immer als Agent behandeln
+    if len(t) > 500:
+        return "agent"
+
+    # DIRECT nur wenn KEIN Agent-Wort gefunden wurde
+    if any(trigger in t for trigger in DIRECT_TRIGGER_WORDS):
+        return "direct"
+
+    # Kurze Texte ohne klare Trigger → direct
     if len(t) < 240:
         return "direct"
-    return None
+
+    # Mittellange Texte ohne Trigger → Agent (vorsichtshalber)
+    return "agent"
+
+
+def _is_tool_continuation(messages: Sequence[Dict[str, Any]]) -> bool:
+    """Erkennt ob dieser Request eine Tool-Ausführungs-Fortsetzung ist."""
+    for msg in messages:
+        if msg.get("role") in ("tool", "function"):
+            return True
+        # Cline/Roo senden tool_result als eigenen role-Typ oder als Content
+        if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+            for block in msg["content"]:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    return True
+    return False
+
+
+def _contains_tool_calls(text: str) -> bool:
+    """Erkennt Tool-Call-Markup inkl. VS Code/Copilot DSML-Format."""
+    if not text:
+        return False
+    return bool(
+        re.search(r'</?(?:tool_call|tool_calls|invoke|function_call)', text)
+        or re.search(r'<[a-z_]+_tool', text)
+        or "callTool" in text
+        or "DSML" in text
+        or "｜｜tool_calls" in text
+        or "｜｜invoke" in text
+        or "<｜｜DSML｜｜tool_calls>" in text
+    )
 
 
 def _classify_intent(messages: Sequence[Dict[str, Any]]) -> str:
     """Intent-Klassifizierung: deterministisch, bei Mehrdeutigkeit 'agent'."""
+    # Tool-Continuation → immer direkt (kein neuer Plan!)
+    if _is_tool_continuation(messages):
+        _log("→ Intent: direct (tool-continuation, Pipeline übersprungen)")
+        return "direct"
+
     text = _last_user_text(messages)
+
+    # Prüfen ob Cloud/LiteLLM konfiguriert ist → weniger aggressive Bypässe
+    _cloud_available = bool(
+        (CLOUD_REVIEW_ENABLED and CLOUD_REVIEW_API_KEY) or
+        (LITELLM_CLOUD_MODEL and LITELLM_CLOUD_API_KEY)
+    )
+
+    if _cloud_available:
+        # Cloud verfügbar: Ausgewogener – Cloud nur für komplexe Tasks,
+        # triviale Kurzanfragen bleiben direkt.
+        t = text.lower()
+        has_agent = any(w in t for w in AGENT_TRIGGER_WORDS)
+        has_direct = any(w in t for w in DIRECT_TRIGGER_WORDS)
+        is_short = len(t) < 60
+        is_medium = 60 <= len(t) < 400
+
+        if has_agent:
+            # Agent-Trigger → Cloud-Planer sinnvoll
+            _log(f"→ Intent: agent (Cloud verfügbar, Agent-Trigger)")
+            return "agent"
+        if is_short and not has_agent:
+            # Sehr kurze Anfragen OHNE Agent-Trigger → direkt (auch mit Cloud)
+            _log(f"→ Intent: direct (Cloud verfügbar, Kurzanfrage)")
+            return "direct"
+        if has_direct:
+            # Direkt-Trigger → direkt
+            _log(f"→ Intent: direct (Cloud verfügbar, Direct-Trigger)")
+            return "direct"
+        if is_medium:
+            # Mittellang → Cloud-Planer (lohnt sich)
+            _log(f"→ Intent: agent (Cloud verfügbar, mittellang)")
+            return "agent"
+        # Lang (>400) → Cloud-Planer
+        _log(f"→ Intent: agent (Cloud verfügbar, langer Text)")
+        return "agent"
+
+    # Kein Cloud → normale deterministische Klassifikation
     result = _classify_intent_deterministic(text)
-    if result is not None:
-        return result
-    return "agent"
+    trigger_info = ""
+    t = text.lower()
+    if result == "agent":
+        matches = [w for w in AGENT_TRIGGER_WORDS if w in t]
+        trigger_info = f" triggers={matches[:3]}" if matches else " length"
+    elif result == "direct":
+        matches = [w for w in DIRECT_TRIGGER_WORDS if w in t]
+        trigger_info = f" triggers={matches[:3]}" if matches else " length"
+    _log(f"→ Intent: {result} (deterministisch, text_len={len(text)}{trigger_info})")
+    return result
 
 
 async def _classify_intent_with_fast_model(
@@ -663,7 +869,7 @@ async def _classify_intent_with_fast_model(
             "temperature": 0.0,
             "stream": False,
         }
-        response = await client.post(VLLM_API_URL, json=classify_payload, timeout=15.0)
+        response = await client.post(VLLM_API_URL, json=classify_payload, headers=_vllm_headers(), timeout=15.0)
         if response.status_code == 200:
             result = response.json()
             content = _extract_choice_content(result).strip().lower()
@@ -679,17 +885,33 @@ async def _classify_intent_with_fast_model(
 # Prompt-Builder (Caveman + Hindsight + Worker)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _clean_payload(payload: Dict[str, Any], keep_tools: bool = False) -> Dict[str, Any]:
+    """Entfernt Client-spezifische Felder, die Provider verwirren."""
+    # stream_options darf nur bei stream=true existieren
+    if not payload.get("stream") and "stream_options" in payload:
+        payload.pop("stream_options")
+    # Weitere problematische Felder auf Top-Level
+    strip_keys = ["stop_sequences", "safety_settings", "response_format", "top_k"]
+    if not keep_tools:
+        strip_keys += ["tool_choice", "tools", "functions", "function_call"]
+    for key in strip_keys:
+        payload.pop(key, None)
+    return payload
+
+
 def _build_direct_payload(
     body: Dict[str, Any],
     model_name: Optional[str] = None,
     max_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     payload = copy.deepcopy(body)
-    payload["model"] = model_name or body.get("model", MODEL_NAME)
+    payload["model"] = model_name or body.get("model") or MODEL_NAME
     payload["max_tokens"] = int(max_tokens or payload.get("max_tokens", DEFAULT_DIRECT_MAX_TOKENS))
     payload["stream"] = False
-    payload["messages"] = _compact_messages(payload.get("messages", []))
-    return payload
+    # ALLE Messages behalten – kein Compact!
+    # Die System-Message (mit Tool-Definitionen) muss immer erhalten bleiben.
+    payload["messages"] = list(payload.get("messages", []))
+    return _clean_payload(payload, keep_tools=True)
 
 
 def _build_worker_payload(
@@ -699,22 +921,44 @@ def _build_worker_payload(
     model_name: Optional[str] = None,
     max_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
+    """
+    Baut den Payload für den WORKER – ein FULLY TOOL-CAPABLE Sub-Agent.
+    Der Worker bekommt die KOMPLETTE VS Code Umgebung:
+      - Originale System-Message (mit Tool-Definitionen & Calling-Format)
+      - Alle Messages (kein Compact!)
+      - tools / tool_choice aus dem Original-Body
+      - Plan + Memory als ZUSÄTZLICHER Kontext in der letzten User-Message
+    Keine redundante Worker-Instruktion – die VS Code System-Prompt steuert das Verhalten.
+    """
     payload = copy.deepcopy(body)
-    payload["model"] = model_name or body.get("model", MODEL_NAME)
+    payload["model"] = model_name or body.get("model") or MODEL_NAME
     payload["max_tokens"] = int(max_tokens or payload.get("max_tokens", DEFAULT_AGENT_MAX_TOKENS))
     payload["stream"] = False
 
     messages = list(payload.get("messages", []))
-    if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
-        user_content = _message_text(messages[-1])
-        memory_block = f"\n\n[HINDSIGHT RECALL]\n{memory_context}" if memory_context else ""
-        plan_block = f"\n\n[CAVEMAN EXECUTION PLAN — FOLLOW STRICTLY]\n{plan}" if plan else ""
-        messages[-1]["content"] = f"{user_content}{memory_block}{plan_block}"
-    else:
-        messages.append({"role": "user", "content": f"{memory_context}\n{plan}"})
 
-    payload["messages"] = _compact_messages(messages)
-    return payload
+    # Nur Kontext ANHÄNGEN, ohne die originale Struktur zu beschädigen
+    context_blocks = []
+    if memory_context:
+        context_blocks.append(f"[HINDSIGHT MEMORY]\n{memory_context}")
+    if plan:
+        context_blocks.append(f"[CLOUD EXECUTION PLAN]\n{plan}")
+    context_str = "\n\n".join(context_blocks)
+
+    # Plan + Memory an die letzte User-Message anhängen
+    if context_str:
+        if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
+            user_content = messages[-1]["content"]
+            if isinstance(user_content, str):
+                messages[-1]["content"] = f"{user_content}\n\n{context_str}"
+            elif isinstance(user_content, list):
+                messages[-1]["content"] = user_content + [{"type": "text", "text": context_str}]
+        else:
+            messages.append({"role": "user", "content": context_str})
+
+    # ALLE Messages behalten – kein Compact! Das System-Prompt mit Tool-Defs bleibt erhalten.
+    payload["messages"] = messages
+    return _clean_payload(payload, keep_tools=True)
 
 
 def _build_cloud_plan_payload(body: Dict[str, Any], memory_context: str) -> Dict[str, Any]:
@@ -725,9 +969,10 @@ def _build_cloud_plan_payload(body: Dict[str, Any], memory_context: str) -> Dict
         user_text,
         "",
         "CONSTRAINTS:",
-        "- Return ONLY abstract execution plan.",
-        "- Include: files, operations, interfaces, tests, risks, dependencies.",
-        "- NO final code. NO explanations.",
+        "- Return ONLY abstract execution plan (no code, no tool calls).",
+        "- Each step: WHAT to do, WHICH file, WHY.",
+        "- DO NOT write code. DO NOT explore. Just plan.",
+        "- DO NOT say 'future' or 'later'. This plan will be executed NOW.",
         "- Use symbols: -> ! ? FIX RISK TODO",
     ]
     if CAVEMAN_ENABLED:
@@ -738,15 +983,17 @@ def _build_cloud_plan_payload(body: Dict[str, Any], memory_context: str) -> Dict
     if memory_context:
         prompt = f"[HINDSIGHT MEMORY]\n{memory_context}\n\n" + prompt
 
-    return {
+    payload = _clean_payload({
         "model": CLOUD_REVIEW_MODEL,
         "messages": [
             {
                 "role": "system",
                 "content": (
-                    "You are a strategic planning model. Create only an abstract execution plan. "
-                    "Use Caveman Ultra mode: symbols, arrows, terse keywords. "
-                    "No code, no prose."
+                    "STRATEGIC PLANNER ONLY. You have NO tools, NO terminal, NO file access. "
+                    "Your ONLY output: a terse abstract execution plan (5-8 bullet points). "
+                    "DO NOT produce code. DO NOT use tool_calls, invoke, or function calls. "
+                    "DO NOT explore the workspace — just plan from the task description. "
+                    "Format: numbered list, each line < 80 chars, symbols only (-> ! ? TODO FIX)."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -754,7 +1001,9 @@ def _build_cloud_plan_payload(body: Dict[str, Any], memory_context: str) -> Dict
         "max_tokens": CAVEMAN_MAX_TOKENS,
         "temperature": 0.2,
         "stream": False,
-    }
+    })
+    _patch_moonshot_payload(payload)
+    return payload
 
 
 def _build_verify_payload(
@@ -817,12 +1066,32 @@ def _format_openai_stream_chunk(
     content: str = "",
     finish_reason: Optional[str] = None,
     include_role: bool = False,
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
+    reasoning_content: Optional[str] = None,
+    chunk_id: Optional[str] = None,
 ) -> str:
-    delta: Dict[str, Any] = {"content": content}
-    if include_role:
-        delta["role"] = "assistant"
+    delta: Dict[str, Any] = {}
+    if finish_reason and not tool_calls and not content and not include_role and not reasoning_content:
+        # Reiner Finish-Chunk: delta MUSS leer sein ({}) für OpenAI-Kompatibilität
+        pass
+    elif tool_calls is not None:
+        # Tool-Calls-Modus: content explizit None setzen
+        delta["content"] = None
+        if reasoning_content is not None:
+            delta["reasoning_content"] = reasoning_content
+        delta["tool_calls"] = tool_calls
+        if include_role:
+            delta["role"] = "assistant"
+    else:
+        if reasoning_content is not None:
+            delta["reasoning_content"] = reasoning_content
+        delta["content"] = content
+        if include_role:
+            delta["role"] = "assistant"
+    # Konsistente Chunk-ID für den gesamten Stream
+    cid = chunk_id or f"chatcmpl-spark-{uuid.uuid4().hex}"
     payload = {
-        "id": f"chatcmpl-spark-{uuid.uuid4().hex}",
+        "id": cid,
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model,
@@ -836,18 +1105,112 @@ def _build_response_payload(
     combined_response_text: str,
     results: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    # Pipeline-Summary (nur bei Text, nicht bei Tool-Calls)
+    is_tool_cont = any(r.get("tool_calls") for r in results)
+    has_dsml = any(_contains_tool_calls(str(r.get("content", ""))) for r in results)
+    if is_tool_cont or has_dsml:
+        intent = "direct"
+        if not is_tool_cont and has_dsml:
+            _log(f"  ⚠ Non-Streaming: DSML erkannt, Summary unterdrückt")
+    else:
+        has_cloud = any(r.get("agent_key") == "cloud_planner" for r in results)
+        has_worker = any(r.get("agent_key") == "worker" for r in results)
+        intent = "agent" if (has_cloud or has_worker) else "direct"
+        summary = _build_pipeline_summary(results, intent)
+        combined_response_text = combined_response_text.rstrip() + summary
+
+    message: Dict[str, Any] = {"role": "assistant", "content": combined_response_text}
+    # Falls Provider echte OpenAI tool_calls zurückgibt: strukturiert durchreichen.
+    # reasoning_content aus dem ersten passenden Result übernehmen.
+    reasoning_found = None
+    for r in reversed(results):
+        if r.get("reasoning_content") and reasoning_found is None:
+            reasoning_found = r.get("reasoning_content")
+        if r.get("tool_calls"):
+            message = {
+                "role": "assistant",
+                "content": r.get("content") or None,
+                "tool_calls": r.get("tool_calls"),
+            }
+            if reasoning_found:
+                message["reasoning_content"] = reasoning_found
+            break
+    else:
+        # Keine tool_calls gefunden → reasoning_content an die Message anhängen
+        if reasoning_found:
+            message["reasoning_content"] = reasoning_found
+
     return {
         "id": f"chatcmpl-spark-{uuid.uuid4().hex}",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": body.get("model", MODEL_NAME),
+        "model": body.get("model") or MODEL_NAME,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": combined_response_text},
-            "finish_reason": "stop",
+            "message": message,
+            "finish_reason": "tool_calls" if message.get("tool_calls") else "stop",
         }],
         "usage": _sum_usage(results),
     }
+
+
+def _build_pipeline_summary(
+    results: List[Dict[str, Any]],
+    intent: str,
+) -> str:
+    """Erzeugt eine kompakte Pipeline-Zusammenfassung."""
+    parts = []
+    total_duration = 0.0
+
+    # Durchsicht der Results nach agent_keys
+    cloud_dur = None
+    worker_dur = None
+    cloud_model = None
+    verify_ok = None
+
+    for r in results:
+        dur = r.get("duration_seconds", 0) or 0
+        total_duration += dur
+        ak = r.get("agent_key", "")
+
+        if ak == "cloud_planner" and r.get("status") == "ok":
+            cloud_dur = dur
+            cloud_model = CLOUD_REVIEW_MODEL if CLOUD_REVIEW_ENABLED else LITELLM_CLOUD_MODEL
+        elif ak == "worker" and r.get("status") == "ok":
+            worker_dur = dur
+        elif ak == "verify":
+            stage = r.get("stage", "")
+            if "passed" in stage or "ok" in stage:
+                verify_ok = True
+            elif "failed" in stage:
+                verify_ok = False
+
+    # Fallback: Wenn kein worker result mit agent_key, nimm das letzte "ok" result
+    if worker_dur is None:
+        for r in reversed(results):
+            if r.get("status") == "ok" and r.get("duration_seconds"):
+                worker_dur = r["duration_seconds"]
+                break
+
+    if intent == "direct":
+        parts.append(f"📋 Pipeline: direkt")
+    else:
+        parts.append(f"📋 Pipeline: agent")
+        if cloud_dur is not None:
+            parts.append(f"Cloud: {cloud_model or '?'} ({cloud_dur:.1f}s)")
+        elif any(r.get("agent_key") == "cloud_planner" and r.get("status") in ("failed", "error", "skipped") for r in results):
+            parts.append(f"Cloud: ⛔")
+
+    if worker_dur is not None:
+        parts.append(f"Worker: {worker_dur:.1f}s")
+    if verify_ok is True:
+        parts.append(f"Verify: ✅")
+    elif verify_ok is False:
+        parts.append(f"Verify: ❌")
+
+    total = total_duration or time.perf_counter()
+    parts.append(f"∑ {total:.1f}s")
+    return "  \n" + " · ".join(parts)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -870,10 +1233,15 @@ async def _call_cloud_planner(
         }
 
     # LiteLLM-Route (OpenRouter / DeepSeek / Claude)
-    if LITELLM_CLOUD_MODEL and LITELLM_CLOUD_API_KEY and _LITELLM_AVAILABLE:
+    # - Wenn die litellm-Library installiert ist: Nutze sie (unterstützt Provider-Prefix)
+    # - Wenn LITELLM_CLOUD_API_URL gesetzt ist: HTTPX-Direktaufruf (auch ohne litellm-Library)
+    _lite_available = _LITELLM_AVAILABLE or bool(LITELLM_CLOUD_API_URL)
+    if LITELLM_CLOUD_MODEL and LITELLM_CLOUD_API_KEY and _lite_available:
+        _log(f"  ☁️ Cloud-Planner via LiteLLM: model={LITELLM_CLOUD_MODEL}")
         return await _call_cloud_via_litellm(body, memory_context)
 
     # Standard OpenAI-kompatible Route
+    _log(f"  ☁️ Cloud-Planner: model={CLOUD_REVIEW_MODEL} url={CLOUD_REVIEW_API_URL}")
     payload = _build_cloud_plan_payload(body, memory_context)
     started = time.perf_counter()
     headers = {"Authorization": f"Bearer {CLOUD_REVIEW_API_KEY}"}
@@ -888,6 +1256,7 @@ async def _call_cloud_planner(
         duration = time.perf_counter() - started
         if response.status_code == 200:
             result = response.json()
+            _log(f"  ✓ Cloud-Planner OK: duration={duration:.1f}s")
             return {
                 "agent_key": "cloud_planner",
                 "status": "ok",
@@ -895,6 +1264,7 @@ async def _call_cloud_planner(
                 "duration_seconds": duration,
                 "usage": result.get("usage"),
             }
+        _log(f"  ⚠ Cloud-Planner STATUS {response.status_code}: duration={duration:.1f}s")
         return {
             "agent_key": "cloud_planner",
             "status": "failed",
@@ -903,6 +1273,7 @@ async def _call_cloud_planner(
             "usage": None,
         }
     except Exception as exc:
+        _log(f"  ✗ Cloud-Planner ERROR: model={CLOUD_REVIEW_MODEL} – {exc}")
         return {
             "agent_key": "cloud_planner",
             "status": "error",
@@ -913,32 +1284,82 @@ async def _call_cloud_planner(
 
 
 async def _call_cloud_via_litellm(body: Dict[str, Any], memory_context: str) -> Dict[str, Any]:
-    """Cloud-Planer via LiteLLM (unterstützt OpenRouter, DeepSeek, Claude, GPT)."""
-    if litellm is None:
-        return {"agent_key": "cloud_planner", "status": "error", "content": "LiteLLM not available", "duration_seconds": 0.0, "usage": None}
-
+    """Cloud-Planer via LiteLLM (direkter httpx-Call wenn URL gesetzt, sonst via litellm-Library)."""
     user_text = _last_user_text(body.get("messages", []))
-    prompt = f"TASK:\n{user_text}\n\nCreate ONLY an abstract execution plan. No code. Terse symbols."
+    prompt = (
+        f"TASK:\n{user_text}\n\n"
+        "Create an abstract execution plan (5-8 steps). WHAT to do, WHICH file. "
+        "NO code. NO tool calls. NO exploration. This will be executed NOW."
+    )
     if CAVEMAN_ENABLED:
         prompt = f"{CAVEMAN_SYSTEM_PROMPT}\n\n{prompt}"
     if memory_context:
         prompt = f"[HINDSIGHT]\n{memory_context}\n\n{prompt}"
 
+    payload = {
+        "model": LITELLM_CLOUD_MODEL,
+        "messages": [
+            {"role": "system", "content": (
+                "STRATEGIC PLANNER ONLY. NO tools. NO code execution. NO file access. "
+                "Output ONLY: 5-8 bullet point abstract plan. Terse symbols. No code. No tool calls."
+            )},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": min(max(1, int(LITELLM_CLOUD_MAX_TOKENS or CAVEMAN_MAX_TOKENS or 65536)), 131072),
+        "temperature": 0.2,
+        "stream": False,
+    }
+    _patch_moonshot_payload(payload)
+    payload = _clean_payload(payload)
+    _log(f"  🔍 LiteLLM payload: max_tokens={payload['max_tokens']} model={payload['model']} temp={payload.get('temperature')}")
+    headers = {"Authorization": f"Bearer {LITELLM_CLOUD_API_KEY}"}
+
     started = time.perf_counter()
     try:
-        result = await asyncio.to_thread(
-            litellm.completion,
+        # Wenn eine API-URL gesetzt ist, direkt per httpx (funktioniert für opencode.ai etc.)
+        if LITELLM_CLOUD_API_URL:
+            async with httpx.AsyncClient(timeout=LITELLM_CLOUD_TIMEOUT_SECONDS) as lc:
+                r = await lc.post(LITELLM_CLOUD_API_URL, json=payload, headers=headers)
+            duration = time.perf_counter() - started
+            if r.status_code == 200:
+                result = r.json()
+                content = _extract_choice_content(result)
+                _log(f"  ✓ LiteLLM OK: model={LITELLM_CLOUD_MODEL} duration={duration:.1f}s")
+                return {
+                    "agent_key": "cloud_planner", "status": "ok",
+                    "content": content or "", "duration_seconds": duration,
+                    "usage": result.get("usage"),
+                }
+            _log(f"  ⚠ LiteLLM STATUS {r.status_code}: model={LITELLM_CLOUD_MODEL} duration={duration:.1f}s")
+            err_detail = ""
+            try:
+                err_body = r.json()
+                err_detail = err_body.get("error", {}).get("message", "") if isinstance(err_body.get("error"), dict) else str(err_body.get("error",""))
+            except Exception:
+                err_detail = r.text[:200]
+            if err_detail:
+                _log(f"  ⚠ LiteLLM Fehlerdetails: {err_detail}")
+            return {
+                "agent_key": "cloud_planner", "status": "failed",
+                "content": f"LiteLLM status {r.status_code}: {r.text[:500]}",
+                "duration_seconds": duration, "usage": None,
+            }
+
+        # Fallback: litellm-Library (braucht Provider-Prefix wie openai/gpt-4)
+        if litellm is None:
+            return {"agent_key": "cloud_planner", "status": "error", "content": "LiteLLM not available", "duration_seconds": 0.0, "usage": None}
+        kwargs = dict(
             model=LITELLM_CLOUD_MODEL,
-            messages=[
-                {"role": "system", "content": "Strategic planner. Caveman style. Terse plan only."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=CAVEMAN_MAX_TOKENS,
-            temperature=0.2,
+            messages=payload["messages"],
+            max_tokens=payload["max_tokens"],
+            temperature=payload["temperature"],
             api_key=LITELLM_CLOUD_API_KEY,
+            timeout=LITELLM_CLOUD_TIMEOUT_SECONDS,
         )
+        result = await asyncio.to_thread(litellm.completion, **kwargs)
         duration = time.perf_counter() - started
         content = result.choices[0].message.content if result.choices else ""
+        _log(f"  ✓ LiteLLM OK: model={LITELLM_CLOUD_MODEL} duration={duration:.1f}s")
         return {
             "agent_key": "cloud_planner",
             "status": "ok",
@@ -947,6 +1368,7 @@ async def _call_cloud_via_litellm(body: Dict[str, Any], memory_context: str) -> 
             "usage": result.usage.dict() if hasattr(result, 'usage') and result.usage else None,
         }
     except Exception as exc:
+        _log(f"  ✗ LiteLLM ERROR: model={LITELLM_CLOUD_MODEL} – {exc}")
         return {
             "agent_key": "cloud_planner",
             "status": "error",
@@ -957,8 +1379,195 @@ async def _call_cloud_via_litellm(body: Dict[str, Any], memory_context: str) -> 
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# vLLM Calls
+# Lokal/Free Calls
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _vllm_headers() -> Dict[str, str]:
+    """Gibt Auth-Header für Lokal/Free-Anfragen zurück (leer falls kein Key gesetzt)."""
+    if VLLM_API_KEY:
+        return {"Authorization": f"Bearer {VLLM_API_KEY}"}
+    return {}
+
+
+def _patch_moonshot_payload(payload: Dict[str, Any]) -> None:
+    """Erzwingt Moonshot-kompatible Parameter (nur spezifische Werte erlaubt)."""
+    model = str(payload.get("model", ""))
+    
+    model_lower = model.lower()
+    vllm_url_lower = VLLM_API_URL.lower()
+    cloud_url_lower = CLOUD_REVIEW_API_URL.lower()
+    lite_url_lower = LITELLM_CLOUD_API_URL.lower()
+    
+    is_moonshot = (
+        "kimi" in model_lower or "moonshot" in model_lower or
+        "moonshot" in vllm_url_lower or "kimi" in vllm_url_lower or
+        "moonshot" in cloud_url_lower or "kimi" in cloud_url_lower or
+        "moonshot" in lite_url_lower or "kimi" in lite_url_lower
+    )
+    
+    _log(f"  🔍 Moonshot-check: model={model} VLLM_URL={VLLM_API_URL[:50]} "
+         f"CLOUD_URL={CLOUD_REVIEW_API_URL[:50]} "
+         f"LITELLM_URL={LITELLM_CLOUD_API_URL[:50]} is_moonshot={is_moonshot}")
+    
+    if not is_moonshot:
+        return
+    
+    fixes = []
+    
+    # Temperature: only 1.0 allowed
+    if payload.get("temperature") is not None and payload["temperature"] != 1.0:
+        fixes.append(f"temp {payload['temperature']}→1.0")
+        payload["temperature"] = 1.0
+    
+    # top_p: only 0.95 allowed
+    if payload.get("top_p") is not None and payload["top_p"] != 0.95:
+        fixes.append(f"top_p {payload['top_p']}→0.95")
+        payload["top_p"] = 0.95
+    
+    # top_k: Moonshot lehnt manchmal bestimmte Werte ab → entfernen
+    if "top_k" in payload:
+        fixes.append("top_k entfernt")
+        del payload["top_k"]
+    
+    # presence_penalty / frequency_penalty: Moonshot lehnt != 0 ab
+    for key in ("presence_penalty", "frequency_penalty"):
+        val = payload.get(key)
+        if val is not None and val != 0.0:
+            fixes.append(f"{key} {val}→0")
+            payload[key] = 0.0
+    
+    if fixes:
+        _log(f"  🔧 Moonshot-Fixes: {'; '.join(fixes)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fallback: Cloud als Worker-Ersatz bei Lokal/Free-Timeout
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _call_cloud_as_worker(
+    payload: Dict[str, Any],
+    agent_key: str,
+) -> Dict[str, Any]:
+    """
+    Ruft die Cloud (LiteLLM/DeepSeek oder Cloud Reviewer) mit den ORIGINALEN
+    User-Messages als Worker-Ersatz auf. Wird verwendet, wenn Lokal/Free
+    timeoutet oder fehlschlägt.
+    """
+    started = time.perf_counter()
+    model = payload.get("model", "?")
+    _log(f"  ☁️☁️ CLOUD-FALLBACK agent_key={agent_key} original_model={model}")
+
+    # Payload für Cloud vorbereiten: nur Messages + max_tokens, keine Tools
+    cloud_payload = {
+        "model": "",
+        "messages": list(payload.get("messages", [])),
+        "max_tokens": int(payload.get("max_tokens", DEFAULT_DIRECT_MAX_TOKENS)),
+        "temperature": 0.3,
+        "stream": False,
+    }
+    cloud_payload = _clean_payload(cloud_payload, keep_tools=False)
+
+    # ── Versuch 1: LiteLLM (DeepSeek) ──────────────────────────────────
+    if LITELLM_CLOUD_API_URL and LITELLM_CLOUD_API_KEY:
+        cloud_payload["model"] = LITELLM_CLOUD_MODEL
+        _patch_moonshot_payload(cloud_payload)
+        headers = {"Authorization": f"Bearer {LITELLM_CLOUD_API_KEY}"}
+        _log(f"  ☁️ Fallback-Versuch 1: LiteLLM model={LITELLM_CLOUD_MODEL}")
+        try:
+            async with httpx.AsyncClient(timeout=LITELLM_CLOUD_TIMEOUT_SECONDS) as lc:
+                r = await lc.post(LITELLM_CLOUD_API_URL, json=cloud_payload, headers=headers)
+            duration = time.perf_counter() - started
+            if r.status_code == 200:
+                result = r.json()
+                content = _extract_choice_content(result)
+                _log(f"  ✓ Cloud-Fallback OK via LiteLLM duration={duration:.1f}s")
+                return {
+                    "agent_key": agent_key,
+                    "status": "ok",
+                    "content": content or "",
+                    "duration_seconds": duration,
+                    "usage": result.get("usage"),
+                    "fallback": "liteilm",
+                }
+            _log(f"  ⚠ Cloud-Fallback LiteLLM STATUS {r.status_code}: duration={duration:.1f}s")
+        except Exception as exc:
+            _log(f"  ✗ Cloud-Fallback LiteLLM ERROR: {exc}")
+
+    # ── Versuch 2: Cloud Reviewer (Moonshot) ───────────────────────────
+    if CLOUD_REVIEW_ENABLED and CLOUD_REVIEW_API_KEY and CLOUD_REVIEW_API_URL:
+        cloud_payload["model"] = CLOUD_REVIEW_MODEL
+        _patch_moonshot_payload(cloud_payload)
+        headers = {"Authorization": f"Bearer {CLOUD_REVIEW_API_KEY}"}
+        _log(f"  ☁️ Fallback-Versuch 2: Cloud Reviewer model={CLOUD_REVIEW_MODEL}")
+        try:
+            async with httpx.AsyncClient(timeout=CLOUD_REVIEW_TIMEOUT_SECONDS) as cc:
+                r = await cc.post(CLOUD_REVIEW_API_URL, json=cloud_payload, headers=headers)
+            duration = time.perf_counter() - started
+            if r.status_code == 200:
+                result = r.json()
+                content = _extract_choice_content(result)
+                _log(f"  ✓ Cloud-Fallback OK via Cloud Reviewer duration={duration:.1f}s")
+                return {
+                    "agent_key": agent_key,
+                    "status": "ok",
+                    "content": content or "",
+                    "duration_seconds": duration,
+                    "usage": result.get("usage"),
+                    "fallback": "cloud_reviewer",
+                }
+            _log(f"  ⚠ Cloud-Fallback Cloud Reviewer STATUS {r.status_code}: duration={duration:.1f}s")
+        except Exception as exc:
+            _log(f"  ✗ Cloud-Fallback Cloud Reviewer ERROR: {exc}")
+
+    duration = time.perf_counter() - started
+    _log(f"  ✗ Cloud-Fallback KOMPLETT FEHLGESCHLAGEN duration={duration:.1f}s")
+    return {
+        "agent_key": agent_key,
+        "status": "error",
+        "content": f"Lokal/Free + Cloud-Fallback fehlgeschlagen nach {duration:.0f}s",
+        "duration_seconds": duration,
+        "usage": None,
+        "fallback": "failed",
+    }
+
+
+async def _call_vllm_with_fallback(
+    client: httpx.AsyncClient,
+    payload: Dict[str, Any],
+    agent_key: str,
+    timeout_seconds: float = SUB_AGENT_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """
+    Ruft Lokal/Free (vLLM/Spark) auf. Bei Timeout/Error → automatischer
+    Fallback auf Cloud (LiteLLM → Cloud Reviewer).
+    """
+    result = await _call_vllm(client, payload, agent_key, timeout_seconds)
+
+    if result.get("status") == "ok":
+        return result
+
+    # Timeout oder Error → Cloud-Fallback
+    duration = result.get("duration_seconds", 0)
+    status = result.get("status", "?")
+    _log(f"  ⚠ Lokal/Free {status} nach {duration:.1f}s → Cloud-Fallback wird gestartet")
+    _log(f"  └─ Original-Fehler: {result.get('content', '')[:200]}")
+
+    cloud_result = await _call_cloud_as_worker(payload, agent_key)
+
+    # Cloud-Fallback-Ergebnis mit einem deutlichen Hinweis versehen
+    if cloud_result.get("status") == "ok":
+        fb_type = cloud_result.get("fallback", "cloud")
+        cloud_result["content"] = (
+            f"[⚠️ Lokal/Free nach {duration:.0f}s nicht verfügbar – "
+            f"Antwort via {fb_type}-Cloud-Fallback]\n\n"
+            f"{cloud_result['content']}"
+        )
+        _log(f"  ✓ Fallback erfolgreich via {fb_type}")
+    else:
+        _log(f"  ✗ Auch Cloud-Fallback fehlgeschlagen")
+
+    return cloud_result
+
 
 async def _call_vllm(
     client: httpx.AsyncClient,
@@ -967,33 +1576,117 @@ async def _call_vllm(
     timeout_seconds: float = SUB_AGENT_TIMEOUT_SECONDS,
 ) -> Dict[str, Any]:
     started = time.perf_counter()
+    model = payload.get("model", "?")
+    msg_count = len(payload.get("messages", []))
+    total_chars = sum(len(str(m.get("content", ""))) for m in payload.get("messages", []))
+    _log(f"  → Lokal/Free call agent_key={agent_key} model={model} "
+         f"messages={msg_count} chars={total_chars} timeout={timeout_seconds:.0f}s")
+
+    # Moonshot/Kimi-Temperatur-Korrektur (Moonshot erlaubt nur 1.0)
+    _patch_moonshot_payload(payload)
+
+    # Reasoning-Content aus Cache in Assistant-Messages injizieren
+    # (DeepSeek braucht reasoning_content beim Folgerequest mit tool_calls)
+    messages = payload.get("messages", [])
+    if isinstance(messages, list):
+        _inject_reasoning_from_cache(messages)
+
+    # Heartbeat-Task: alle 30s loggen, dass wir noch warten
+    hb_task: Optional[asyncio.Task] = None
+
+    async def _heartbeat():
+        while True:
+            await asyncio.sleep(30)
+            elapsed = time.perf_counter() - started
+            _log(f"  … ⏳ Lokal/Free noch am Warten agent_key={agent_key} "
+                 f"elapsed={elapsed:.0f}s timeout={timeout_seconds:.0f}s")
+
     try:
-        response = await client.post(VLLM_API_URL, json=payload, timeout=timeout_seconds)
+        hb_task = asyncio.ensure_future(_heartbeat())
+        # Kurz warten bis Heartbeat-Task wirklich läuft
+        await asyncio.sleep(0.2)
+    except Exception:
+        pass  # Heartbeat ist nice-to-have
+
+    try:
+        response = await client.post(VLLM_API_URL, json=payload, headers=_vllm_headers(), timeout=timeout_seconds)
         duration = time.perf_counter() - started
         if response.status_code == 200:
             result = response.json()
+            message = _extract_choice_message(result)
+            tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+            reasoning_content = message.get("reasoning_content") if isinstance(message, dict) else None
+            if tool_calls:
+                _log(f"  🔧 Lokal/Free returned structured tool_calls: {len(tool_calls)}")
+            if reasoning_content:
+                _log(f"  🧠 Lokal/Free returned reasoning_content: {len(reasoning_content)} chars")
+            # reasoning_content für Folge-Requests cachen
+            _cache_reasoning(tool_calls, reasoning_content)
+            _log(f"  ✓ Lokal/Free OK agent_key={agent_key} duration={duration:.1f}s")
             return {
                 "agent_key": agent_key,
                 "status": "ok",
                 "content": _extract_choice_content(result),
+                "message": message,
+                "tool_calls": tool_calls,
+                "reasoning_content": reasoning_content,
                 "duration_seconds": duration,
                 "usage": result.get("usage"),
             }
+        _log(f"  ⚠ Lokal/Free STATUS {response.status_code} agent_key={agent_key} duration={duration:.1f}s model={model}")
+        # Extrahiere Fehlerdetails aus Response-Body
+        err_detail = ""
+        try:
+            err_body = response.json()
+            if isinstance(err_body.get("error"), dict):
+                err_detail = err_body["error"].get("message", "")
+            elif isinstance(err_body.get("error"), str):
+                err_detail = err_body["error"]
+            else:
+                err_detail = str(err_body.get("message") or err_body.get("detail") or "")
+        except Exception:
+            err_detail = response.text[:200]
+        if err_detail:
+            _log(f"  ⚠ Fehlerdetails: {err_detail}")
         return {
             "agent_key": agent_key,
             "status": "failed",
-            "content": f"vLLM status {response.status_code}: {response.text[:500]}",
+            "content": f"Lokal/Free status {response.status_code}: {response.text[:500]}",
+            "duration_seconds": duration,
+            "usage": None,
+        }
+    except asyncio.CancelledError:
+        duration = time.perf_counter() - started
+        _log(f"  ✗ Lokal/Free CANCELLED agent_key={agent_key} duration={duration:.1f}s")
+        return {
+            "agent_key": agent_key,
+            "status": "error",
+            "content": f"Lokal/Free cancelled after {duration:.0f}s",
             "duration_seconds": duration,
             "usage": None,
         }
     except Exception as exc:
+        duration = time.perf_counter() - started
+        # Timeout erkennen und detailliert loggen
+        exc_type = type(exc).__name__
+        if hasattr(exc, "__cause__") and exc.__cause__:
+            exc_type += f" → {type(exc.__cause__).__name__}"
+        _log(f"  ✗ Lokal/Free ERROR agent_key={agent_key} duration={duration:.1f}s "
+             f"type={exc_type}: {exc}")
+        if "timeout" in str(exc).lower() or "timed out" in str(exc).lower():
+            _log(f"  ⏰ TIMEOUT nach {duration:.0f}s (Limit: {timeout_seconds:.0f}s). "
+                 f"vLLM/Spark braucht für den ersten Request oft 60-90s (DFlash JIT).")
         return {
             "agent_key": agent_key,
             "status": "error",
-            "content": f"vLLM error: {exc}",
-            "duration_seconds": time.perf_counter() - started,
+            "content": f"Lokal/Free error nach {duration:.0f}s ({exc_type}): {exc}",
+            "duration_seconds": duration,
             "usage": None,
         }
+    finally:
+        # Heartbeat sauber beenden
+        if hb_task is not None:
+            hb_task.cancel()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1078,9 +1771,13 @@ async def _run_direct_local(
 ) -> Dict[str, Any]:
     """Direkter lokaler Request (kein Agent, kein Cloud-Planer)."""
     start_time = time.perf_counter()
+    model = body.get("model") or MODEL_NAME
+    messages_raw = body.get("messages", [])
+    is_tool = _is_tool_continuation(messages_raw)
+    _log(f"▶ DIREKT: model={model} messages={len(messages_raw)} tool_cont={is_tool}")
     progress: List[str] = [
         _format_chat_progress_message("intent", "Direkte lokale Anfrage. Keine Cloud-Planung.", {
-            "intent": "direct", "model": body.get("model", MODEL_NAME),
+            "intent": "direct", "model": model,
         }),
     ]
 
@@ -1091,20 +1788,45 @@ async def _run_direct_local(
 
     try:
         assert client is not None
-        result = await _call_vllm(client, payload, "direct")
+        result = await _call_vllm_with_fallback(client, payload, "direct")
     finally:
         if own_client and client is not None:
             await client.aclose()
 
+    duration = time.perf_counter() - start_time
+    status = result.get("status", "?")
+    content = result.get("content", "")
+    if status != "ok":
+        _log(f"⚠ DIREKT FEHLER: model={model} status={status} duration={duration:.1f}s "
+             f"content={content[:300]}")
+        return {
+            "combined_response_text": content,
+            "results": [result],
+            "duration_seconds": duration,
+        }
+
+    _log(f"✓ DIREKT OK: model={model} duration={duration:.1f}s "
+         f"content_len={len(content)}")
+
+    # Tool-Continuation + Model returned structured/DSML tool_calls → raw durchreichen
+    if is_tool or result.get("tool_calls") or _contains_tool_calls(content):
+        if _contains_tool_calls(content):
+            _log(f"  🔧 DIREKT erkannte DSML-Tool-Calls in content ({len(content)} chars)")
+        return {
+            "combined_response_text": content,
+            "results": [result],
+            "duration_seconds": duration,
+        }
+
     progress.append(_format_chat_progress_message("completed", "Direkte lokale Antwort fertig.", {
-        "duration_seconds": time.perf_counter() - start_time,
-        "status": result.get("status"),
+        "duration_seconds": duration,
+        "status": status,
     }))
 
     return {
         "combined_response_text": "".join(progress) + result.get("content", ""),
         "results": [result],
-        "duration_seconds": time.perf_counter() - start_time,
+        "duration_seconds": duration,
     }
 
 
@@ -1112,7 +1834,7 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
     """
     3-Phasen-Agenten-Workflow:
       Phase 1: Hindsight Recall → Cloud-Planer (Caveman)
-      Phase 2: Lokaler Worker (80B) führt Plan aus
+      Phase 2: Worker führt Caveman-Plan aus
       Phase 3: Verifikation & Self-Correction (Linter/Tests + lokales Modell)
     """
     start_time = time.perf_counter()
@@ -1120,6 +1842,7 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
     results: List[Dict[str, Any]] = []
 
     query = _last_user_text(body.get("messages", []))
+    _log(f"▶ AGENT: worker={MODEL_NAME} cloud={CLOUD_REVIEW_MODEL if CLOUD_REVIEW_ENABLED else '–'} litellm={LITELLM_CLOUD_MODEL or '–'} messages={len(body.get('messages',[]))}")
     client = httpx.AsyncClient()
 
     # ── Phase 1: Hindsight Recall + Cloud-Planung ──────────────────────
@@ -1148,9 +1871,9 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             f"Cloud-Planer nicht verfügbar ({plan_status}). Fallback: direkte lokale Ausführung.",
             {"status": plan_status},
         ))
-        # Fallback: direkt lokal ausführen
+        # Fallback: direkt lokal ausführen (mit Cloud-Fallback)
         worker_payload = _build_direct_payload(body)
-        worker_result = await _call_vllm(client, worker_payload, "worker")
+        worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
         results.append(worker_result)
         await client.aclose()
         combined = "".join(progress) + worker_result.get("content", "")
@@ -1161,17 +1884,29 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             "duration_seconds": time.perf_counter() - start_time,
         }
 
-    # ── Phase 2: Lokaler Worker (80B) ──────────────────────────────────
+    # ── Phase 2: Worker ─────────────────────────────────────────────
     progress.append(_format_chat_progress_message(
         "phase2_execute",
-        "Lokaler Qwen 80B Worker führt Caveman-Plan aus.",
+        f"Worker ({MODEL_NAME}) führt Caveman-Plan aus.",
         {"model": body.get("model", MODEL_NAME)},
     ))
 
     worker_payload = _build_worker_payload(body, plan, memory_context)
-    worker_result = await _call_vllm(client, worker_payload, "worker")
+    worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
     results.append(worker_result)
     worker_response = worker_result.get("content", "")
+
+    # Wenn der Worker Tool-Calls generiert: SOFORT raw an VS Code zurückgeben.
+    # Keine Phase 3, keine Status-/Plan-Präfixe, sonst kann VS Code die Calls nicht parsen.
+    if worker_result.get("tool_calls") or _contains_tool_calls(worker_response):
+        _log("  🔧 Worker enthält Tool-Calls/DSML → sofort Durchreiche an Client")
+        await client.aclose()
+        _hindsight.retain(body, worker_response)
+        return {
+            "combined_response_text": worker_response,
+            "results": results,
+            "duration_seconds": time.perf_counter() - start_time,
+        }
 
     progress.append(_format_chat_progress_message(
         "phase2_done",
@@ -1195,17 +1930,27 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
 
     await client.aclose()
 
+    # ── Tool-Calls aus Cloud-Plan filtern (Planer hat keine Tools) ────
+    if _contains_tool_calls(plan):
+        _log("  ⚠ Cloud-Plan enthält Tool-Calls → wird gefiltert")
+        plan = re.sub(r'<[^>]+>.*?</[^>]+>', '', plan, flags=re.DOTALL).strip()
+
     # ── Antwort zusammenbauen ──────────────────────────────────────────
-    if CHATTY_MODE and planner_result.get("status") == "ok":
+    # Wenn der Worker Tool-Calls generiert hat → raw durchreichen (Client führt sie aus)
+    has_tools = _contains_tool_calls(worker_response)
+    if has_tools:
+        _log("  🔧 Worker enthält Tool-Calls → raw Durchreiche an Client")
+        combined = worker_response  # KEINE Progress-Messages, KEIN Plan-Text!
+    elif CHATTY_MODE and planner_result.get("status") == "ok":
         final_response = (
             f"## 🧭 Caveman Cloud Plan\n\n{plan}\n\n"
             f"---\n\n"
-            f"## 🛠️ Lokale Umsetzung (Qwen 80B)\n\n{verified_response}"
+            f"## 🛠️ Lokale Umsetzung ({MODEL_NAME})\n\n{verified_response}"
         )
+        combined = "".join(progress) + final_response
     else:
         final_response = verified_response
-
-    combined = "".join(progress) + final_response
+        combined = "".join(progress) + final_response
     _hindsight.retain(body, combined)
 
     return {
@@ -1228,7 +1973,12 @@ async def _stream_chat_completion(body: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _stream_events(request: Request, body: Dict[str, Any]) -> AsyncIterator[str]:
-    """SSE-Streaming: Sendet Progress-Events + finale Antwort als OpenAI-Chunks."""
+    """
+    SSE-Streaming: Sendet OpenAI-kompatible Chunks.
+    - Wenn der Worker/Direct structured tool_calls returned: korrektes
+      Streaming-Format mit tool_calls-Deltas + finish_reason='tool_calls'.
+    - Sonst: normaler Text-Content + finish_reason='stop'.
+    """
     model = body.get("model", MODEL_NAME)
     intent = _classify_intent(body.get("messages", []))
 
@@ -1237,8 +1987,84 @@ async def _stream_events(request: Request, body: Dict[str, Any]) -> AsyncIterato
     else:
         streamed = await _run_direct_local(body)
 
-    yield _format_openai_stream_chunk(model, streamed["combined_response_text"], include_role=True)
-    yield _format_openai_stream_chunk(model, "", finish_reason="stop")
+    # Pipeline-Summary bauen
+    has_cloud = any(r.get("agent_key") == "cloud_planner" for r in streamed.get("results", []))
+    has_worker = any(r.get("agent_key") == "worker" for r in streamed.get("results", []))
+    is_tool_cont = any(r.get("tool_calls") for r in streamed.get("results", []))
+    if is_tool_cont:
+        s_intent = "direct"
+    elif has_cloud or has_worker:
+        s_intent = "agent"
+    else:
+        s_intent = "direct"
+    pipeline_summary = _build_pipeline_summary(streamed.get("results", []), s_intent)
+
+    # Strukturierte Tool-Calls + Reasoning aus den Ergebnissen extrahieren
+    tool_calls = None
+    reasoning_content = None
+    for r in reversed(streamed.get("results", [])):
+        tc = r.get("tool_calls")
+        if tc:
+            tool_calls = tc
+        rc = r.get("reasoning_content")
+        if rc and not reasoning_content:
+            reasoning_content = rc
+        if tool_calls and reasoning_content:
+            break
+
+    # Prüfen auf DSML-Tool-Calls im Text (auch ohne structured tool_calls)
+    text_content = streamed.get("combined_response_text", "")
+    has_dsml = _contains_tool_calls(text_content) and not tool_calls
+    
+    if has_dsml:
+        _log(f"  ⚠ Streaming: DSML in content erkannt, ohne structured tool_calls – "
+             f"Content wird pur an Client durchgereicht (keine Summary)")
+    
+    if tool_calls:
+        # ── STRUKTURIERTE TOOL_CALLS STREAMING (OpenAI-Format) ──
+        # Bei Tool-Calls KEINE Summary anhängen (würde Format brechen)
+        stream_id = f"chatcmpl-spark-{uuid.uuid4().hex}"
+        
+        # 1. Role-Chunk: assistant + content=null + reasoning_content
+        #    reasoning_content MUSS im ersten Delta sein, damit VS Code es in der
+        #    History speichert – sonst fehlt es beim nächsten DeepSeek-Request → 400.
+        yield _format_openai_stream_chunk(model, include_role=True, reasoning_content=reasoning_content, chunk_id=stream_id)
+        
+        # 2. Tool-Call Header-Chunk: id + type + function.name (leere arguments)
+        first_tcs = []
+        for i, tc in enumerate(tool_calls):
+            func = tc.get("function", {})
+            first_tcs.append({
+                "index": i,
+                "id": tc.get("id", f"call_{uuid.uuid4().hex}"),
+                "type": "function",
+                "function": {
+                    "name": func.get("name", ""),
+                    "arguments": "",
+                },
+            })
+        yield _format_openai_stream_chunk(model, tool_calls=first_tcs, chunk_id=stream_id)
+
+        # 3. Arguments für jeden Tool-Call als separater Chunk
+        for i, tc in enumerate(tool_calls):
+            args = tc.get("function", {}).get("arguments", "")
+            if args:
+                yield _format_openai_stream_chunk(model, tool_calls=[
+                    {"index": i, "function": {"arguments": args}},
+                ], chunk_id=stream_id)
+
+        # 4. Finaler Chunk mit finish_reason='tool_calls' (leeres delta)
+        yield _format_openai_stream_chunk(model, finish_reason="tool_calls", chunk_id=stream_id)
+    else:
+        # ── NORMALES TEXT-STREAMING ──
+        # Pipeline-Summary anhängen (nur wenn weder tool_calls noch DSML)
+        if has_dsml:
+            text = streamed["combined_response_text"]
+        else:
+            text = streamed["combined_response_text"].rstrip() + pipeline_summary
+        # Reasoning-Content im ersten Chunk mitsenden
+        yield _format_openai_stream_chunk(model, content=text, include_role=True, reasoning_content=reasoning_content)
+        yield _format_openai_stream_chunk(model, "", finish_reason="stop")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1432,21 +2258,157 @@ app = FastAPI(
 
 @app.on_event("startup")
 async def _startup_event() -> None:
-    """Log startup configuration."""
-    print(f"🚀 LocalProxy starting on port {PROXY_PORT}")
-    print(f"   Worker:  {MODEL_NAME}")
-    print(f"   Fast:    {FAST_MODEL_NAME}")
-    print(f"   vLLM:    {VLLM_API_URL}")
-    print(f"   Cloud:   {'enabled' if CLOUD_REVIEW_ENABLED else 'disabled'}")
-    print(f"   Caveman: {'enabled' if CAVEMAN_ENABLED else 'disabled'}")
-    print(f"   Memory:  {'Qdrant' if _hindsight._use_qdrant else 'JSONL' if HINDSIGHT_ENABLED else 'disabled'}")
-    print(f"   Verify:  {'enabled' if VERIFY_ENABLED else 'disabled'}")
-    print(f"   MCP:     {'enabled' if MCP_ENABLED else 'disabled'}")
+    """Log startup configuration und führt Health-Checks für alle Modelle aus."""
+    _log(f"🚀 LocalProxy starting on port {PROXY_PORT}")
+    _log(f"   Worker:  {MODEL_NAME}")
+    _log(f"   Fast:    {FAST_MODEL_NAME}")
+    _log(f"   Lokal/Free: {VLLM_API_URL}")
+    _log(f"   Lokal/Free Key: {'✓ gesetzt' if VLLM_API_KEY else '–'}")
+    _log(f"   Cloud:   {'enabled' if CLOUD_REVIEW_ENABLED else 'disabled'}")
+    _log(f"   LiteLLM: {'enabled' if LITELLM_CLOUD_MODEL else 'disabled'} ({LITELLM_CLOUD_MODEL or '–'})")
+    _log(f"   Caveman: {'enabled' if CAVEMAN_ENABLED else 'disabled'}")
+    _log(f"   Memory:  {'Qdrant' if _hindsight._use_qdrant else 'JSONL' if HINDSIGHT_ENABLED else 'disabled'}")
+    _log(f"   Verify:  {'enabled' if VERIFY_ENABLED else 'disabled'}")
+    _log(f"   MCP:     {'enabled' if MCP_ENABLED else 'disabled'}")
+
+    # ── Health-Checks für alle Modell-Endpoints ──────────────────────────
+    _log("🔍 Health-Checks werden gestartet...")
+    async with httpx.AsyncClient(timeout=10.0) as hc:
+
+        def _parse_error(r):
+            """Versucht aus einer Error-Response JSON den message-String zu extrahieren."""
+            try:
+                body = r.json()
+                # OpenAI-kompatibel
+                if isinstance(body.get("error"), dict):
+                    return body["error"].get("message", "")
+                # Anthropic-Format
+                if isinstance(body.get("error"), str):
+                    return body["error"]
+                # Zencoder / andere
+                return str(body.get("message") or body.get("detail") or "")
+            except Exception:
+                return r.text[:200] if r.text else ""
+
+        # 1. Worker-Modell – /v1/models testen (robuster, vermeidet JIT-Timeout)
+        _models_url = VLLM_MODELS_URL
+        if not _models_url.startswith(("http://", "https://")):
+            _models_url = VLLM_API_URL.rstrip("/").rsplit("/chat/completions", 1)[0] + "/models"
+        elif not _models_url.endswith("/models") and not _models_url.endswith("/v1/models"):
+            _models_url = VLLM_API_URL.rstrip("/") + "/models"
+        _log(f"   🔍 Worker '{MODEL_NAME}' @ {VLLM_API_URL} ...")
+        try:
+            r = await hc.get(
+                _models_url,
+                headers=_vllm_headers(),
+                timeout=httpx.Timeout(30.0, connect=5.0),
+            )
+            if r.status_code == 200:
+                data = r.json()
+                ids = [m.get("id","?") for m in data.get("data",[])]
+                if MODEL_NAME in ids:
+                    _log(f"   ✅ Worker: OK ({MODEL_NAME} gelistet, {len(ids)} total)")
+                else:
+                    _log(f"   ⚠️  Worker: Models geladen ({len(ids)}), aber '{MODEL_NAME}' nicht in Liste – {', '.join(ids[:8])}")
+            elif r.status_code == 404:
+                _log(f"   ❌ Worker: 404 – {_models_url} nicht erreichbar")
+            else:
+                _log(f"   ❌ Worker: HTTP {r.status_code}")
+        except Exception as exc:
+            _log(f"   ❌ Worker: NICHT ERREICHBAR – {exc}")
+
+        # 1b. Fast-Modell separat testen falls abweichend
+        if FAST_MODEL_NAME != MODEL_NAME:
+            _log(f"   🔍 Fast '{FAST_MODEL_NAME}' @ {VLLM_API_URL} ...")
+            try:
+                r = await hc.post(
+                    VLLM_API_URL,
+                    json={"model": FAST_MODEL_NAME, "messages": [{"role":"user","content":"ping"}], "max_tokens":1},
+                    headers=_vllm_headers(),
+                )
+                if r.status_code == 200:
+                    _log(f"   ✅ Fast-Modell: OK ({FAST_MODEL_NAME})")
+                elif r.status_code in (401,403):
+                    err = _parse_error(r) or "AUTH-DENIED"
+                    _log(f"   ❌ Fast-Modell: AUTH-FEHLER {r.status_code} – {err}")
+                elif r.status_code == 404:
+                    err = _parse_error(r) or "Modell nicht gefunden"
+                    _log(f"   ❌ Fast-Modell: 404 – {err} ({FAST_MODEL_NAME})")
+                else:
+                    err = _parse_error(r) or f"HTTP {r.status_code}"
+                    _log(f"   ❌ Fast-Modell: {err} ({FAST_MODEL_NAME})")
+            except Exception as exc:
+                _log(f"   ❌ Fast-Modell: NICHT ERREICHBAR – {exc}")
+
+        # 1c. Models-Liste (nice-to-have, viele Cloud-Proxys haben keinen /models-Endpoint)
+        _log(f"   🔍 Models-Liste via {VLLM_MODELS_URL} ...")
+        try:
+            r = await hc.get(VLLM_MODELS_URL, headers=_vllm_headers())
+            if r.status_code == 200:
+                data = r.json()
+                ids = [m.get("id","?") for m in data.get("data",[])]
+                _log(f"   ✅ Models-Liste: OK ({len(ids)} Modelle: {', '.join(ids[:5])}{'...' if len(ids)>5 else ''})")
+            else:
+                _log(f"   ℹ️  Models-Liste: STATUS {r.status_code} (viele Cloud-Proxys haben keinen /models-Endpoint)")
+        except Exception as exc:
+            _log(f"   ℹ️  Models-Liste: nicht erreichbar – {exc} (viele Cloud-Proxys haben keinen /models-Endpoint)")
+
+        # 2. Cloud Reviewer
+        if CLOUD_REVIEW_ENABLED and CLOUD_REVIEW_API_KEY:
+            _log(f"   🔍 Cloud '{CLOUD_REVIEW_MODEL}' @ {CLOUD_REVIEW_API_URL} ...")
+            try:
+                r = await hc.post(
+                    CLOUD_REVIEW_API_URL,
+                    json={"model": CLOUD_REVIEW_MODEL, "messages": [{"role":"user","content":"ping"}], "max_tokens":1},
+                    headers={"Authorization": f"Bearer {CLOUD_REVIEW_API_KEY}"},
+                )
+                if r.status_code in (200,201):
+                    _log(f"   ✅ Cloud Reviewer: OK ({CLOUD_REVIEW_MODEL})")
+                elif r.status_code in (401,403):
+                    err = _parse_error(r) or "AUTH-DENIED"
+                    _log(f"   ❌ Cloud Reviewer: AUTH-FEHLER {r.status_code} – {err}")
+                elif r.status_code == 404:
+                    err = _parse_error(r) or "Modell nicht gefunden"
+                    _log(f"   ❌ Cloud Reviewer: 404 – {err} ({CLOUD_REVIEW_MODEL})")
+                else:
+                    err = _parse_error(r) or f"HTTP {r.status_code}"
+                    _log(f"   ❌ Cloud Reviewer: {err} ({CLOUD_REVIEW_MODEL})")
+            except Exception as exc:
+                _log(f"   ❌ Cloud Reviewer: NICHT ERREICHBAR – {exc}")
+        elif CLOUD_REVIEW_ENABLED:
+            _log(f"   ⚠️  Cloud Reviewer: aktiviert aber KEIN API-KEY")
+
+        # 3. LiteLLM
+        if LITELLM_CLOUD_MODEL and LITELLM_CLOUD_API_KEY:
+            lite_url = LITELLM_CLOUD_API_URL or "https://api.openai.com/v1/chat/completions"
+            _log(f"   🔍 LiteLLM '{LITELLM_CLOUD_MODEL}' @ {lite_url} ...")
+            try:
+                r = await hc.post(
+                    lite_url,
+                    json={"model": LITELLM_CLOUD_MODEL, "messages": [{"role":"user","content":"ping"}], "max_tokens":1},
+                    headers={"Authorization": f"Bearer {LITELLM_CLOUD_API_KEY}"},
+                )
+                if r.status_code in (200,201):
+                    _log(f"   ✅ LiteLLM: OK ({LITELLM_CLOUD_MODEL})")
+                elif r.status_code in (401,403):
+                    err = _parse_error(r) or "AUTH-DENIED"
+                    _log(f"   ❌ LiteLLM: AUTH-FEHLER {r.status_code} – {err}")
+                elif r.status_code == 404:
+                    err = _parse_error(r) or "Modell nicht gefunden"
+                    _log(f"   ❌ LiteLLM: 404 – {err} ({LITELLM_CLOUD_MODEL})")
+                else:
+                    err = _parse_error(r) or f"HTTP {r.status_code}"
+                    _log(f"   ❌ LiteLLM: {err} ({LITELLM_CLOUD_MODEL})")
+            except Exception as exc:
+                _log(f"   ❌ LiteLLM: NICHT ERREICHBAR – {exc}")
+        elif LITELLM_CLOUD_MODEL:
+            _log(f"   ⚠️  LiteLLM: Modell gesetzt aber KEIN API-KEY")
+    _log("🔍 Health-Checks abgeschlossen")
 
 
 @app.on_event("shutdown")
 async def _shutdown_event() -> None:
-    print("👋 LocalProxy shutting down.")
+    _log("👋 LocalProxy shutting down.")
 
 
 # ── Auth ───────────────────────────────────────────────────────────────────
@@ -1478,6 +2440,12 @@ async def chat_completions(request: Request):
     if "messages" not in body:
         raise HTTPException(status_code=400, detail="Invalid payload: 'messages' required.")
 
+    # Ignoriere Client-Modell – der Proxy verwendet sein konfiguriertes Modell
+    body["model"] = MODEL_NAME
+
+    msgs = body.get("messages", [])
+    _log(f"📨 Request: {len(msgs)} messages, stream={body.get('stream')}, tool_cont={_is_tool_continuation(msgs)}")
+
     if body.get("stream"):
         return StreamingResponse(
             _stream_events(request, body),
@@ -1495,12 +2463,12 @@ async def chat_completions(request: Request):
 async def list_models(request: Request):
     await _auth_or_raise(request)
     models = [
-        {"id": MODEL_NAME, "object": "model", "owned_by": "vllm"},
-        {"id": FAST_MODEL_NAME, "object": "model", "owned_by": "vllm"},
+        {"id": MODEL_NAME, "object": "model", "owned_by": "local-free"},
+        {"id": FAST_MODEL_NAME, "object": "model", "owned_by": "local-free"},
     ]
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(VLLM_MODELS_URL)
+            response = await client.get(VLLM_MODELS_URL, headers=_vllm_headers())
             if response.status_code == 200:
                 data = response.json()
                 for m in data.get("data", []):
@@ -1519,15 +2487,36 @@ async def healthz(request: Request):
         "version": "2.0.0",
         "routes": ["direct-local", "hybrid-agent"],
         "models": {"fast": FAST_MODEL_NAME, "worker": MODEL_NAME},
+        "local_free_api_key_configured": bool(VLLM_API_KEY),
         "proxy_auth_enabled": PROXY_AUTH_ENABLED,
         "cloud_review_enabled": CLOUD_REVIEW_ENABLED,
         "cloud_review_model": CLOUD_REVIEW_MODEL if CLOUD_REVIEW_ENABLED else None,
         "litellm_model": LITELLM_CLOUD_MODEL or None,
+        "litellm_api_url": LITELLM_CLOUD_API_URL or None,
+        "litellm_max_tokens": LITELLM_CLOUD_MAX_TOKENS,
         "hindsight_enabled": HINDSIGHT_ENABLED,
         "hindsight_backend": "qdrant" if _hindsight._use_qdrant else "jsonl",
         "caveman_enabled": CAVEMAN_ENABLED,
         "verify_enabled": VERIFY_ENABLED,
         "mcp_enabled": MCP_ENABLED,
+    })
+
+
+# ── /logs ──────────────────────────────────────────────────────────────────
+@app.get("/logs")
+async def get_logs(request: Request, lines: int = 200):
+    """Gibt die letzten Log-Zeilen zurück. Ohne Auth (WebUI-Aufruf ohne Bearer-Token)."""
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            all_lines = f.readlines()
+    except (FileNotFoundError, OSError):
+        all_lines = []
+    last = all_lines[-lines:] if lines > 0 else all_lines
+    return JSONResponse(content={
+        "count": len(last),
+        "total": len(all_lines),
+        "file": LOG_FILE,
+        "lines": last,
     })
 
 
@@ -1588,7 +2577,7 @@ async def mcp_endpoint(request: Request):
 # ── Webinterface mounten ───────────────────────────────────────────────────
 if _WEBUI_AVAILABLE:
     mount_webui(app)
-    print("🌐 Web-Konfigurationsinterface: http://0.0.0.0:" + str(PROXY_PORT) + "/webui/")
+    _log("🌐 Web-Konfigurationsinterface: http://0.0.0.0:" + str(PROXY_PORT) + "/webui/")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1598,7 +2587,7 @@ if _WEBUI_AVAILABLE:
 if __name__ == "__main__":
     import uvicorn
 
-    print(f"""
+    _log(f"""
 ╔══════════════════════════════════════════════════════════════╗
 ║          DX Spark Hybrid Agentic Proxy  v2.0.0               ║
 ║  OpenAI-kompatibel · Hindsight · Caveman · 3-Phasen-Agent   ║
