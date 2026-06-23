@@ -624,6 +624,63 @@ def _message_text(message: Dict[str, Any]) -> str:
     return _normalize_text(message.get("content", ""))
 
 
+# ── Pipeline-Steuerflags ─────────────────────────────────────────────────
+# Prompt-Zusätze, die die Pipeline manuell steuern:
+#   -force planning   → Cloud-Planung erzwingen (Phase 1)
+#   -force review     → Cloud-Review/Verifikation erzwingen (Phase 3)
+#   -bypass worker    → Lokalen Worker (80B) überspringen, Cloud antwortet direkt
+
+_PIPELINE_FLAG_PATTERN = re.compile(
+    r'(-\s*(?:force|bypass)\s*(?:planning|review|worker))',
+    re.IGNORECASE,
+)
+
+_FLAG_ALIASES = {
+    "force-planning": "force_planning",
+    "force planning": "force_planning",
+    "force-review": "force_review",
+    "force review": "force_review",
+    "bypass-worker": "bypass_worker",
+    "bypass worker": "bypass_worker",
+}
+
+
+def _extract_pipeline_flags(text: str) -> Tuple[str, Dict[str, bool]]:
+    """Erkennt Pipeline-Steuerflags im Text und gibt bereinigten Text + Flags zurück."""
+    flags: Dict[str, bool] = {
+        "force_planning": False,
+        "force_review": False,
+        "bypass_worker": False,
+    }
+    cleaned = text
+    for match in _PIPELINE_FLAG_PATTERN.finditer(text):
+        raw = match.group(1).strip().lower().replace(" ", "-").replace("--", "-")
+        # Normalisieren: "-force-planning" → "force_planning"
+        key = _FLAG_ALIASES.get(raw.replace("-", " ").strip(), raw.replace("-", "_"))
+        if key in flags:
+            flags[key] = True
+    # Entferne alle Flags aus dem Text
+    for flag_text in _FLAG_ALIASES:
+        # Case-insensitive Replacement
+        cleaned = re.sub(re.escape(flag_text), "", cleaned, flags=re.IGNORECASE)
+    # Cleanup: mehrfache Leerzeichen & leere Zeilen
+    cleaned = re.sub(r' {2,}', ' ', cleaned)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    cleaned = cleaned.strip()
+    return cleaned, flags
+
+
+def _strip_pipeline_flags_from_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Entfernt Pipeline-Steuerflags aus allen User-Messages (in-place)."""
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content")
+            if isinstance(content, str):
+                cleaned, _ = _extract_pipeline_flags(content)
+                msg["content"] = cleaned
+    return messages
+
+
 def _last_user_text(messages: Sequence[Dict[str, Any]]) -> str:
     for msg in reversed(messages):
         if isinstance(msg, dict) and msg.get("role") == "user":
@@ -794,6 +851,18 @@ def _classify_intent(messages: Sequence[Dict[str, Any]]) -> str:
         return "direct"
 
     text = _last_user_text(messages)
+
+    # ── Pipeline-Steuerflags prüfen ──────────────────────────────────
+    _, pflags = _extract_pipeline_flags(text)
+    if pflags.get("force_planning"):
+        _log("→ Intent: agent (Flag: -force planning)")
+        return "agent"
+    if pflags.get("force_review"):
+        _log("→ Intent: agent (Flag: -force review)")
+        return "agent"
+    if pflags.get("bypass_worker"):
+        _log("→ Intent: agent (Flag: -bypass worker)")
+        return "agent"
 
     # Prüfen ob Cloud/LiteLLM konfiguriert ist → weniger aggressive Bypässe
     _cloud_available = bool(
@@ -1221,9 +1290,11 @@ async def _call_cloud_planner(
     client: httpx.AsyncClient,
     body: Dict[str, Any],
     memory_context: str,
+    force: bool = False,
 ) -> Dict[str, Any]:
-    """Cloud-Planer via HTTPX (OpenAI-kompatibel) oder LiteLLM."""
-    if not CLOUD_REVIEW_ENABLED or not CLOUD_REVIEW_API_KEY:
+    """Cloud-Planer via HTTPX (OpenAI-kompatibel) oder LiteLLM.
+    Wenn force=True, wird CLOUD_REVIEW_ENABLED ignoriert (aber Key wird noch benötigt)."""
+    if (not CLOUD_REVIEW_ENABLED and not force) or not CLOUD_REVIEW_API_KEY:
         return {
             "agent_key": "cloud_planner",
             "status": "skipped",
@@ -1373,6 +1444,192 @@ async def _call_cloud_via_litellm(body: Dict[str, Any], memory_context: str) -> 
             "agent_key": "cloud_planner",
             "status": "error",
             "content": f"LiteLLM error: {exc}",
+            "duration_seconds": time.perf_counter() - started,
+            "usage": None,
+        }
+
+
+async def _call_cloud_as_responder(
+    client: httpx.AsyncClient,
+    body: Dict[str, Any],
+    plan: str,
+    memory_context: str,
+) -> Dict[str, Any]:
+    """Cloud (LiteLLM/ReviewLLM) als direkter Responder — Worker-Bypass.
+    Sendet den Task + Caveman-Plan an das Cloud-Modell, das die Antwort generiert."""
+    user_text = _last_user_text(body.get("messages", []))
+    prompt = (
+        f"TASK:\n{user_text}\n\n"
+        f"EXECUTE THIS PLAN:\n{plan}\n\n"
+        "You are the executor. Implement the plan. Provide complete code, "
+        "detailed explanation, and working solution. No tool calls — write code directly."
+    )
+    if memory_context:
+        prompt = f"[HINDSIGHT]\n{memory_context}\n\n{prompt}"
+
+    # Prefer LiteLLM, fallback to Cloud Reviewer
+    if LITELLM_CLOUD_MODEL and LITELLM_CLOUD_API_KEY:
+        model = LITELLM_CLOUD_MODEL
+        api_key = LITELLM_CLOUD_API_KEY
+        api_url = LITELLM_CLOUD_API_URL
+        max_tok = LITELLM_CLOUD_MAX_TOKENS
+        timeout = LITELLM_CLOUD_TIMEOUT_SECONDS
+        _log(f"  ☁️ Cloud-Responder via LiteLLM: model={model}")
+    elif CLOUD_REVIEW_ENABLED and CLOUD_REVIEW_API_KEY:
+        model = CLOUD_REVIEW_MODEL
+        api_key = CLOUD_REVIEW_API_KEY
+        api_url = CLOUD_REVIEW_API_URL
+        max_tok = CLOUD_REVIEW_MAX_TOKENS
+        timeout = CLOUD_REVIEW_TIMEOUT_SECONDS
+        _log(f"  ☁️ Cloud-Responder via ReviewLLM: model={model}")
+    else:
+        _log("  ✗ Cloud-Responder: Kein Cloud-Modell verfügbar")
+        return {
+            "agent_key": "cloud_responder",
+            "status": "skipped",
+            "content": "[Cloud-Responder nicht verfügbar — kein API-Key konfiguriert]",
+            "duration_seconds": 0.0,
+            "usage": None,
+        }
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": (
+                "You are a senior software engineer. Execute the plan precisely. "
+                "Provide complete, working code. Be thorough and detailed."
+            )},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": min(max(1, int(max_tok or 32768)), 131072),
+        "temperature": 0.3,
+        "stream": False,
+    }
+    _patch_moonshot_payload(payload)
+    payload = _clean_payload(payload)
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    started = time.perf_counter()
+    try:
+        target_url = api_url or "https://api.openai.com/v1/chat/completions"
+        async with httpx.AsyncClient(timeout=timeout) as lc:
+            r = await lc.post(target_url, json=payload, headers=headers)
+        duration = time.perf_counter() - started
+        if r.status_code == 200:
+            result = r.json()
+            content = _extract_choice_content(result)
+            _log(f"  ✓ Cloud-Responder OK: model={model} duration={duration:.1f}s")
+            return {
+                "agent_key": "cloud_responder",
+                "status": "ok",
+                "content": content or "",
+                "duration_seconds": duration,
+                "usage": result.get("usage"),
+            }
+        _log(f"  ⚠ Cloud-Responder STATUS {r.status_code}: duration={duration:.1f}s")
+        return {
+            "agent_key": "cloud_responder",
+            "status": "failed",
+            "content": f"Cloud-Responder status {r.status_code}: {r.text[:500]}",
+            "duration_seconds": duration,
+            "usage": None,
+        }
+    except Exception as exc:
+        _log(f"  ✗ Cloud-Responder ERROR: model={model} – {exc}")
+        return {
+            "agent_key": "cloud_responder",
+            "status": "error",
+            "content": f"Cloud-Responder error: {exc}",
+            "duration_seconds": time.perf_counter() - started,
+            "usage": None,
+        }
+
+
+async def _call_cloud_reviewer(
+    client: httpx.AsyncClient,
+    task: str,
+    response: str,
+) -> Dict[str, Any]:
+    """Cloud-Review: Sendet Worker-Antwort zur Qualitätsprüfung an die Cloud."""
+    prompt = (
+        f"ORIGINAL TASK:\n{task}\n\n"
+        f"RESPONSE TO REVIEW:\n{response}\n\n"
+        "Review the response. Check for: correctness, completeness, bugs, edge cases, "
+        "security issues. Be concise. Output format:\n"
+        "## Review Result: [PASS / NEEDS FIX]\n"
+        "## Issues Found:\n- ...\n"
+        "## Suggestions:\n- ...\n"
+        "If PASS, just say 'PASS — no issues found.'"
+    )
+
+    # Prefer LiteLLM, fallback to Cloud Reviewer
+    if LITELLM_CLOUD_MODEL and LITELLM_CLOUD_API_KEY:
+        model = LITELLM_CLOUD_MODEL
+        api_key = LITELLM_CLOUD_API_KEY
+        api_url = LITELLM_CLOUD_API_URL
+        timeout = LITELLM_CLOUD_TIMEOUT_SECONDS
+        _log(f"  🔍 Cloud-Reviewer via LiteLLM: model={model}")
+    elif CLOUD_REVIEW_ENABLED and CLOUD_REVIEW_API_KEY:
+        model = CLOUD_REVIEW_MODEL
+        api_key = CLOUD_REVIEW_API_KEY
+        api_url = CLOUD_REVIEW_API_URL
+        timeout = CLOUD_REVIEW_TIMEOUT_SECONDS
+        _log(f"  🔍 Cloud-Reviewer via ReviewLLM: model={model}")
+    else:
+        _log("  ✗ Cloud-Reviewer: Kein Cloud-Modell verfügbar")
+        return {
+            "agent_key": "cloud_reviewer",
+            "status": "skipped",
+            "content": "",
+            "duration_seconds": 0.0,
+            "usage": None,
+        }
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a strict code reviewer. Be concise."},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 4096,
+        "temperature": 0.1,
+        "stream": False,
+    }
+    _patch_moonshot_payload(payload)
+    payload = _clean_payload(payload)
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    started = time.perf_counter()
+    try:
+        target_url = api_url or "https://api.openai.com/v1/chat/completions"
+        async with httpx.AsyncClient(timeout=timeout) as lc:
+            r = await lc.post(target_url, json=payload, headers=headers)
+        duration = time.perf_counter() - started
+        if r.status_code == 200:
+            result = r.json()
+            content = _extract_choice_content(result)
+            _log(f"  ✓ Cloud-Reviewer OK: model={model} duration={duration:.1f}s")
+            return {
+                "agent_key": "cloud_reviewer",
+                "status": "ok",
+                "content": content or "",
+                "duration_seconds": duration,
+                "usage": result.get("usage"),
+            }
+        _log(f"  ⚠ Cloud-Reviewer STATUS {r.status_code}: duration={duration:.1f}s")
+        return {
+            "agent_key": "cloud_reviewer",
+            "status": "failed",
+            "content": "",
+            "duration_seconds": duration,
+            "usage": None,
+        }
+    except Exception as exc:
+        _log(f"  ✗ Cloud-Reviewer ERROR: model={model} – {exc}")
+        return {
+            "agent_key": "cloud_reviewer",
+            "status": "error",
+            "content": "",
             "duration_seconds": time.perf_counter() - started,
             "usage": None,
         }
@@ -1836,17 +2093,39 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
       Phase 1: Hindsight Recall → Cloud-Planer (Caveman)
       Phase 2: Worker führt Caveman-Plan aus
       Phase 3: Verifikation & Self-Correction (Linter/Tests + lokales Modell)
+
+    Pipeline-Steuerflags (via Prompt-Zusätze):
+      -force planning  → Cloud-Planung erzwingen (auch wenn deaktiviert)
+      -force review    → Cloud-Review nach Worker-Ausführung erzwingen
+      -bypass worker   → Worker (80B) überspringen, Cloud antwortet direkt
     """
     start_time = time.perf_counter()
     progress: List[str] = []
     results: List[Dict[str, Any]] = []
 
     query = _last_user_text(body.get("messages", []))
-    _log(f"▶ AGENT: worker={MODEL_NAME} cloud={CLOUD_REVIEW_MODEL if CLOUD_REVIEW_ENABLED else '–'} litellm={LITELLM_CLOUD_MODEL or '–'} messages={len(body.get('messages',[]))}")
+    _, pflags = _extract_pipeline_flags(query)
+    force_planning = pflags.get("force_planning", False)
+    force_review = pflags.get("force_review", False)
+    bypass_worker = pflags.get("bypass_worker", False)
+
+    # Flags aus Messages strippen bevor sie an Modelle gehen
+    _strip_pipeline_flags_from_messages(body.get("messages", []))
+    query_clean = _last_user_text(body.get("messages", []))
+
+    flag_summary = []
+    if force_planning: flag_summary.append("force_planning")
+    if force_review: flag_summary.append("force_review")
+    if bypass_worker: flag_summary.append("bypass_worker")
+    flag_str = ", ".join(flag_summary) if flag_summary else "none"
+
+    _log(f"▶ AGENT: worker={MODEL_NAME} cloud={CLOUD_REVIEW_MODEL if CLOUD_REVIEW_ENABLED else '–'} "
+         f"litellm={LITELLM_CLOUD_MODEL or '–'} messages={len(body.get('messages',[]))} "
+         f"flags=[{flag_str}]")
     client = httpx.AsyncClient()
 
     # ── Phase 1: Hindsight Recall + Cloud-Planung ──────────────────────
-    memory_records = _hindsight.recall(query)
+    memory_records = _hindsight.recall(query_clean)
     memory_context = _hindsight.format_context(memory_records)
     progress.append(_format_chat_progress_message(
         "phase1_recall",
@@ -1854,7 +2133,7 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         {"memory_records": len(memory_records), "networks": list(set(n for r in memory_records for n in r.networks))},
     ))
 
-    planner_result = await _call_cloud_planner(client, body, memory_context)
+    planner_result = await _call_cloud_planner(client, body, memory_context, force=force_planning)
     results.append(planner_result)
     plan_status = planner_result.get("status")
     plan = planner_result.get("content", "") if plan_status == "ok" else ""
@@ -1862,13 +2141,18 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
     if plan_status == "ok":
         progress.append(_format_chat_progress_message(
             "phase1_plan_ready",
-            "Cloud-Planer: Caveman-Plan erstellt.",
+            f"Cloud-Planer: Caveman-Plan erstellt{' (forced)' if force_planning else ''}.",
             {"duration_seconds": planner_result.get("duration_seconds")},
         ))
     else:
+        # Planer fehlgeschlagen → Fallback
+        fallback_reason = f"Cloud-Planer nicht verfügbar ({plan_status})."
+        if force_planning:
+            fallback_reason += " -force planning ignoriert, Fallback auf lokale Ausführung."
+
         progress.append(_format_chat_progress_message(
             "phase1_plan_fallback",
-            f"Cloud-Planer nicht verfügbar ({plan_status}). Fallback: direkte lokale Ausführung.",
+            f"{fallback_reason}",
             {"status": plan_status},
         ))
         # Fallback: direkt lokal ausführen (mit Cloud-Fallback)
@@ -1884,49 +2168,97 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             "duration_seconds": time.perf_counter() - start_time,
         }
 
-    # ── Phase 2: Worker ─────────────────────────────────────────────
-    progress.append(_format_chat_progress_message(
-        "phase2_execute",
-        f"Worker ({MODEL_NAME}) führt Caveman-Plan aus.",
-        {"model": body.get("model", MODEL_NAME)},
-    ))
+    # ── Phase 2: Worker (oder Cloud-Bypass) ─────────────────────────────
+    if bypass_worker:
+        # ── -bypass worker: Cloud (LiteLLM/ReviewLLM) antwortet direkt ──
+        _log("  ⚡ -bypass worker: Worker übersprungen, Cloud antwortet direkt")
+        progress.append(_format_chat_progress_message(
+            "phase2_bypass",
+            f"⚡ Worker übersprungen. Cloud ({LITELLM_CLOUD_MODEL or CLOUD_REVIEW_MODEL}) antwortet direkt.",
+            {"bypass": True, "plan_len": len(plan)},
+        ))
 
-    worker_payload = _build_worker_payload(body, plan, memory_context)
-    worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
-    results.append(worker_result)
-    worker_response = worker_result.get("content", "")
+        cloud_response = await _call_cloud_as_responder(client, body, plan, memory_context)
+        results.append(cloud_response)
+        worker_response = cloud_response.get("content", "")
 
-    # Wenn der Worker Tool-Calls generiert: SOFORT raw an VS Code zurückgeben.
-    # Keine Phase 3, keine Status-/Plan-Präfixe, sonst kann VS Code die Calls nicht parsen.
-    if worker_result.get("tool_calls") or _contains_tool_calls(worker_response):
-        _log("  🔧 Worker enthält Tool-Calls/DSML → sofort Durchreiche an Client")
-        await client.aclose()
-        _hindsight.retain(body, worker_response)
-        return {
-            "combined_response_text": worker_response,
-            "results": results,
-            "duration_seconds": time.perf_counter() - start_time,
-        }
+        progress.append(_format_chat_progress_message(
+            "phase2_done",
+            "Cloud-Direktantwort abgeschlossen.",
+            {"status": cloud_response.get("status"), "duration_seconds": cloud_response.get("duration_seconds")},
+        ))
+    else:
+        # ── Normaler Worker-Pfad ──────────────────────────────────────────
+        progress.append(_format_chat_progress_message(
+            "phase2_execute",
+            f"Worker ({MODEL_NAME}) führt Caveman-Plan aus.",
+            {"model": body.get("model", MODEL_NAME)},
+        ))
 
-    progress.append(_format_chat_progress_message(
-        "phase2_done",
-        "Worker-Ausführung abgeschlossen.",
-        {"status": worker_result.get("status"), "duration_seconds": worker_result.get("duration_seconds")},
-    ))
+        worker_payload = _build_worker_payload(body, plan, memory_context)
+        worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
+        results.append(worker_result)
+        worker_response = worker_result.get("content", "")
+
+        # Wenn der Worker Tool-Calls generiert: SOFORT raw an VS Code zurückgeben.
+        if worker_result.get("tool_calls") or _contains_tool_calls(worker_response):
+            _log("  🔧 Worker enthält Tool-Calls/DSML → sofort Durchreiche an Client")
+            await client.aclose()
+            _hindsight.retain(body, worker_response)
+            return {
+                "combined_response_text": worker_response,
+                "results": results,
+                "duration_seconds": time.perf_counter() - start_time,
+            }
+
+        progress.append(_format_chat_progress_message(
+            "phase2_done",
+            "Worker-Ausführung abgeschlossen.",
+            {"status": worker_result.get("status"), "duration_seconds": worker_result.get("duration_seconds")},
+        ))
 
     # ── Phase 3: Verifikation & Self-Correction ────────────────────────
-    progress.append(_format_chat_progress_message(
-        "phase3_verify",
-        "Phase 3: Linter/Tests + Self-Correction.",
-        {},
-    ))
+    # -force review: Cloud-Review nach Worker-Ausführung
+    if force_review and not bypass_worker:
+        # Cloud-Review der Worker-Antwort
+        _log("  🔍 -force review: Cloud-Review der Worker-Antwort")
+        progress.append(_format_chat_progress_message(
+            "phase3_cloud_review",
+            "🔍 Cloud-Review: Worker-Antwort wird von Cloud geprüft.",
+            {},
+        ))
+        cloud_review_result = await _call_cloud_reviewer(client, query_clean, worker_response)
+        if cloud_review_result.get("status") == "ok":
+            review_text = cloud_review_result.get("content", "")
+            if review_text:
+                worker_response = f"{worker_response}\n\n---\n## 🔍 Cloud Review\n{review_text}"
+            progress.append(_format_chat_progress_message(
+                "phase3_review_done",
+                "Cloud-Review abgeschlossen.",
+                {"status": "ok"},
+            ))
+        else:
+            progress.append(_format_chat_progress_message(
+                "phase3_review_failed",
+                f"Cloud-Review fehlgeschlagen: {cloud_review_result.get('status')}",
+                {"status": cloud_review_result.get("status")},
+            ))
+        verified_response = worker_response
+        verify_info = {"stage": "cloud_review", "status": cloud_review_result.get("status")}
+    else:
+        # Standard-Verifikation (Linter/Tests + lokales Modell)
+        progress.append(_format_chat_progress_message(
+            "phase3_verify",
+            "Phase 3: Linter/Tests + Self-Correction.",
+            {},
+        ))
 
-    verified_response, verify_info = await _verify_and_correct(client, query, worker_response)
-    progress.append(_format_chat_progress_message(
-        "phase3_done",
-        f"Verifikation: {verify_info.get('stage', 'unknown')}",
-        verify_info,
-    ))
+        verified_response, verify_info = await _verify_and_correct(client, query_clean, worker_response)
+        progress.append(_format_chat_progress_message(
+            "phase3_done",
+            f"Verifikation: {verify_info.get('stage', 'unknown')}",
+            verify_info,
+        ))
 
     await client.aclose()
 
@@ -1936,16 +2268,17 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         plan = re.sub(r'<[^>]+>.*?</[^>]+>', '', plan, flags=re.DOTALL).strip()
 
     # ── Antwort zusammenbauen ──────────────────────────────────────────
-    # Wenn der Worker Tool-Calls generiert hat → raw durchreichen (Client führt sie aus)
     has_tools = _contains_tool_calls(worker_response)
     if has_tools:
-        _log("  🔧 Worker enthält Tool-Calls → raw Durchreiche an Client")
-        combined = worker_response  # KEINE Progress-Messages, KEIN Plan-Text!
+        _log("  🔧 Worker/Cloud enthält Tool-Calls → raw Durchreiche an Client")
+        combined = worker_response
     elif CHATTY_MODE and planner_result.get("status") == "ok":
+        source_label = LITELLM_CLOUD_MODEL or CLOUD_REVIEW_MODEL if bypass_worker else MODEL_NAME
+        phase_label = "☁️ Cloud-Direktantwort" if bypass_worker else "🛠️ Lokale Umsetzung"
         final_response = (
             f"## 🧭 Caveman Cloud Plan\n\n{plan}\n\n"
             f"---\n\n"
-            f"## 🛠️ Lokale Umsetzung ({MODEL_NAME})\n\n{verified_response}"
+            f"## {phase_label} ({source_label})\n\n{verified_response}"
         )
         combined = "".join(progress) + final_response
     else:
