@@ -31,7 +31,7 @@ try {
     $response = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 10
     $content = $response.Content | ConvertFrom-Json
     Write-Host "✅ Proxy läuft! Status: $($content.status)" -ForegroundColor Green
-    Write-Host "   vLLM Key konfiguriert: $($content.vllm_api_key_configured)" -ForegroundColor Green
+    Write-Host "   Lokal/Free Key konfiguriert: $($content.local_free_api_key_configured)" -ForegroundColor Green
     Write-Host "   Version: $($content.version)" -ForegroundColor Gray
 } catch {
     Write-Host "❌ Health-Check fehlgeschlagen: $_" -ForegroundColor Red

@@ -11,11 +11,12 @@ import json
 import os
 import secrets
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Set
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Config-Datei
@@ -36,6 +37,121 @@ def _log(msg: str) -> None:
             f.write(line + "\n")
     except Exception:
         pass
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WebUI Auth — Zwangs-Login via SPARK_AUTH_USERNAME / SPARK_AUTH_PASSWORD
+# ═══════════════════════════════════════════════════════════════════════════
+
+WEBUI_USERNAME: str = os.getenv("SPARK_AUTH_USERNAME", "admin")
+WEBUI_PASSWORD: str = os.getenv("SPARK_AUTH_PASSWORD", "")
+if not WEBUI_PASSWORD:
+    WEBUI_PASSWORD = "localfox-" + secrets.token_hex(16)
+    _log(f"⚡ WebUI Auto-Passwort (kein SPARK_AUTH_PASSWORD gesetzt): {WEBUI_PASSWORD}")
+else:
+    _log("🔐 WebUI Login via SPARK_AUTH_USERNAME / SPARK_AUTH_PASSWORD")
+
+# In-Memory Session-Tokens
+_active_tokens: Set[str] = set()
+COOKIE_NAME = "webui_token"
+
+
+def _generate_token() -> str:
+    token = uuid.uuid4().hex + secrets.token_hex(16)
+    _active_tokens.add(token)
+    return token
+
+
+def _validate_token(token: str) -> bool:
+    return token in _active_tokens
+
+
+def _remove_token(token: str) -> None:
+    _active_tokens.discard(token)
+
+
+# ── Login-HTML ────────────────────────────────────────────────────────────
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>LocalProxy Login</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,sans-serif;
+    background: #0d1117; color: #e6edf3;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh;
+  }
+  .login-card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+    padding: 40px; width: 380px; max-width: 90vw;
+    box-shadow: 0 8px 32px rgba(0,0,0,.4);
+  }
+  .login-card h1 { font-size: 1.6rem; margin-bottom: 4px; }
+  .login-card p { color: #8b949e; font-size: 0.85rem; margin-bottom: 24px; }
+  .form-group { margin-bottom: 16px; }
+  .form-group label { display: block; font-size: 0.8rem; margin-bottom: 6px; color: #8b949e; }
+  .form-group input {
+    width: 100%; padding: 10px 12px; background: #0d1117; border: 1px solid #30363d;
+    border-radius: 6px; color: #e6edf3; font-size: 0.9rem; outline: none;
+    transition: border-color .15s;
+  }
+  .form-group input:focus { border-color: #58a6ff; }
+  .btn {
+    width: 100%; padding: 10px; background: #238636; color: #fff; border: none;
+    border-radius: 6px; font-size: 0.9rem; font-weight: 500; cursor: pointer;
+    transition: background .15s;
+  }
+  .btn:hover { background: #2ea043; }
+  .error { color: #f85149; font-size: 0.8rem; margin-top: 12px; text-align: center; display: none; }
+  .badge { font-size: 0.6rem; background: #1f6feb33; color: #58a6ff; padding: 2px 8px; border-radius: 10px; vertical-align: middle; }
+</style>
+</head>
+<body>
+<div class="login-card">
+  <h1>🦊 LocalProxy <span class="badge">v2.0</span></h1>
+  <p>Bitte anmelden um auf das Dashboard zuzugreifen</p>
+  <form id="loginForm">
+    <div class="form-group">
+      <label for="username">Benutzername</label>
+      <input type="text" id="username" name="username" placeholder="admin" autocomplete="username" autofocus>
+    </div>
+    <div class="form-group">
+      <label for="password">Passwort</label>
+      <input type="password" id="password" name="password" placeholder="••••••••" autocomplete="current-password">
+    </div>
+    <div class="error" id="loginError">Falscher Benutzername oder Passwort</div>
+    <button type="submit" class="btn">🔐 Anmelden</button>
+  </form>
+</div>
+<script>
+document.getElementById('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const username = document.getElementById('username').value;
+  const password = document.getElementById('password').value;
+  const errorEl = document.getElementById('loginError');
+  try {
+    const r = await fetch('/webui/api/login', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({username, password})
+    });
+    if (!r.ok) { errorEl.style.display = 'block'; return; }
+    const data = await r.json();
+    // Token im Cookie speichern + als Query-Parameter (Fallback)
+    document.cookie = 'webui_token=' + data.token + '; path=/webui; max-age=86400; SameSite=Lax';
+    window.location.href = '/webui/?token=' + data.token;
+  } catch(e) {
+    errorEl.textContent = 'Netzwerkfehler: ' + e.message;
+    errorEl.style.display = 'block';
+  }
+});
+</script>
+</body>
+</html>"""
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "models": {
@@ -250,10 +366,14 @@ pre { background: var(--surface2); padding: 12px; border-radius: var(--radius); 
     <h1>🦊 LocalProxy <span class="badge">v2.0</span></h1>
     <span style="font-size:0.75rem;color:var(--text2)">Konfiguration &amp; Dashboard</span>
   </div>
-  <div class="status">
-    <span id="proxyStatus"><span class="status-dot err"></span> Proxy</span>
-    <span id="vllmStatus"><span class="status-dot err"></span> vLLM</span>
-    <span id="cloudStatus"><span class="status-dot err"></span> Cloud</span>
+  <div style="display:flex;align-items:center;gap:12px">
+    <span id="userDisplay" style="font-size:0.8rem;color:var(--text2)"></span>
+    <button class="btn btn-secondary" onclick="logout()" style="font-size:0.75rem;padding:4px 12px">🚪 Abmelden</button>
+    <div class="status">
+      <span id="proxyStatus"><span class="status-dot err"></span> Proxy</span>
+      <span id="lokalFreeStatus"><span class="status-dot err"></span> Lokal/Free</span>
+      <span id="cloudStatus"><span class="status-dot err"></span> Cloud</span>
+    </div>
   </div>
 </header>
 <nav>
@@ -269,20 +389,20 @@ pre { background: var(--surface2); padding: 12px; border-radius: var(--radius); 
   <!-- Models -->
   <section id="tab-models" class="active">
     <div class="card">
-      <h3><span class="icon">🖥️</span> Lokale vLLM-Modelle</h3>
+      <h3><span class="icon">🖥️</span> Lokal/Free (Worker &amp; Fast)</h3>
       <div class="form-group">
-        <label>vLLM API URL</label>
+        <label>Lokal/Free API URL</label>
         <input type="url" id="cfg-models-vllm_api_url" placeholder="http://localhost:8000/v1/chat/completions">
-        <div class="hint">Endpoint des lokalen vLLM-Servers</div>
+        <div class="hint">Endpoint für Lokal/Free (lokal oder Cloud-Free-Tier)</div>
       </div>
       <div class="form-group">
-        <label>vLLM Models URL</label>
+        <label>Lokal/Free Models URL</label>
         <input type="url" id="cfg-models-vllm_models_url" placeholder="http://localhost:8000/v1/models">
       </div>
       <div class="form-group">
-        <label>vLLM API Key (optional)</label>
-        <input type="password" id="cfg-models-vllm_api_key" placeholder="sk-... für Cloud-vLLM">
-        <div class="hint">Leer lassen für lokalen vLLM ohne Auth</div>
+        <label>Lokal/Free API Key (optional)</label>
+        <input type="password" id="cfg-models-vllm_api_key" placeholder="sk-... für Cloud-Free-Tier">
+        <div class="hint">Leer lassen für lokalen Endpoint ohne Auth</div>
       </div>
       <div class="row">
         <div class="form-group">
@@ -612,7 +732,7 @@ function collectForm() {
   Object.entries(ID_MAP).forEach(([id,_]) => {
     const el = document.getElementById(id); if (!el) return;
     const val = el.type === 'checkbox' ? el.checked :
-                el.type === 'number' ? (parseFloat(el.value) || 0) : el.value;
+                (el.type === 'number' || el.type === 'range') ? (parseFloat(el.value) || 0) : el.value;
     setField(id, val);
   });
 }
@@ -638,7 +758,7 @@ function toast(msg, type='success') {
 // ── API Calls ──────────────────────────────────────────────────────────
 async function loadConfig() {
   try {
-    const r = await fetch('/webui/api/config');
+    const r = await apiFetch('/webui/api/config');
     currentConfig = await r.json();
     populateForm();
     toast('Konfiguration geladen', 'success');
@@ -648,7 +768,7 @@ async function loadConfig() {
 async function saveConfig() {
   collectForm();
   try {
-    const r = await fetch('/webui/api/config', {
+    const r = await apiFetch('/webui/api/config', {
       method: 'PUT', headers: {'Content-Type':'application/json'},
       body: JSON.stringify(currentConfig)
     });
@@ -662,7 +782,7 @@ async function saveAndRestart() {
   if (!saved) return;
   toast('🔄 Starte Proxy neu...', 'success');
   try {
-    const r = await fetch('/webui/api/restart', {method:'POST'});
+    const r = await apiFetch('/webui/api/restart', {method:'POST'});
     if (r.ok) {
       toast('✅ Neustart läuft — Seite lädt in 4s neu', 'success');
       // Warten bis Proxy wieder da ist, dann neuladen
@@ -697,7 +817,7 @@ async function saveAndRestart() {
 async function clearMemory() {
   if (!confirm('Hindsight Memory wirklich löschen?')) return;
   try {
-    const r = await fetch('/webui/api/memory/clear', {method:'POST'});
+    const r = await apiFetch('/webui/api/memory/clear', {method:'POST'});
     if (r.ok) toast('Memory gelöscht', 'success');
     else toast('Fehler beim Löschen', 'error');
   } catch(e) { toast('Fehler: '+e.message, 'error'); }
@@ -711,10 +831,11 @@ async function refreshStatus() {
     document.querySelector('#proxyStatus').childNodes[1].textContent = ' Proxy';
   } catch(e) {}
   try {
-    const r = await fetch('/webui/api/status');
+    const r = await apiFetch('/webui/api/status');
     const s = await r.json();
-    document.querySelector('#vllmStatus .status-dot').className = 'status-dot ' + (s.vllm_ok?'ok':'err');
+    document.querySelector('#lokalFreeStatus .status-dot').className = 'status-dot ' + (s.vllm_ok?'ok':'err');
     document.querySelector('#cloudStatus .status-dot').className = 'status-dot ' + (s.cloud_configured?'ok':'err');
+    if (s.user) document.getElementById('userDisplay').textContent = '👤 ' + s.user;
   } catch(e) {}
 }
 
@@ -751,6 +872,34 @@ function startLogPolling() {
 }
 
 // ── Init ───────────────────────────────────────────────────────────────
+
+// Benutzer anzeigen
+const params = new URLSearchParams(window.location.search);
+const tokenParam = params.get('token');
+if (tokenParam) {
+  document.cookie = 'webui_token=' + tokenParam + '; path=/webui; max-age=86400; SameSite=Lax';
+}
+document.getElementById('userDisplay').textContent = '👤 ' + ('WEBUI_USER'); // wird von refreshStatus() überschrieben
+
+async function logout() {
+  const r = await fetch('/webui/api/logout', {method:'POST'});
+  if (r.ok) {
+    document.cookie = 'webui_token=; path=/webui; max-age=0; SameSite=Lax';
+    window.location.href = '/webui/login';
+  }
+}
+
+// 401-Handler für API-Fetch
+async function apiFetch(url, options = {}) {
+  const r = await fetch(url, options);
+  if (r.status === 401) {
+    document.cookie = 'webui_token=; path=/webui; max-age=0; SameSite=Lax';
+    window.location.href = '/webui/login';
+    throw new Error('Unauthorized');
+  }
+  return r;
+}
+
 loadConfig();
 refreshStatus();
 refreshLogs();
@@ -769,6 +918,60 @@ def create_webui_app() -> FastAPI:
     """Erstellt eine FastAPI-Sub-App mit dem Webinterface."""
 
     webapp = FastAPI(docs_url=None, openapi_url=None, redoc_url=None)
+
+    # ── Auth-Middleware ──────────────────────────────────────────────────
+    @webapp.middleware("http")
+    async def _auth_middleware(request: Request, call_next):
+        # Unprotected paths
+        if request.url.path in ("/webui/login", "/webui/api/login", "/webui/api/logout"):
+            return await call_next(request)
+
+        # OPTIONS (CORS preflight) immer erlauben
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        # Token aus Cookie oder Query-Parameter
+        token = request.cookies.get(COOKIE_NAME, "")
+        if not token:
+            token = request.query_params.get("token", "")
+
+        if not _validate_token(token):
+            # API-Calls → 401, sonst Redirect zum Login
+            if request.url.path.startswith("/webui/api/"):
+                return JSONResponse(status_code=401, content={"error": "Unauthorized", "login_url": "/webui/login"})
+            return RedirectResponse(url="/webui/login")
+
+        return await call_next(request)
+
+    # ── Login-Seite ──────────────────────────────────────────────────────
+    @webapp.get("/login", response_class=HTMLResponse)
+    async def login_page():
+        return LOGIN_HTML
+
+    # ── Login-API ────────────────────────────────────────────────────────
+    @webapp.post("/api/login")
+    async def api_login(request: Request, response: Response):
+        try:
+            data = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON")
+
+        username = data.get("username", "")
+        password = data.get("password", "")
+
+        if username == WEBUI_USERNAME and password == WEBUI_PASSWORD:
+            token = _generate_token()
+            _log(f"✅ WebUI Login erfolgreich: {username}")
+            return {"token": token, "status": "ok"}
+        _log(f"⚠ WebUI Login fehlgeschlagen: {username}")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    @webapp.post("/api/logout")
+    async def api_logout(request: Request):
+        token = request.cookies.get(COOKIE_NAME, "") or request.query_params.get("token", "")
+        if token:
+            _remove_token(token)
+        return {"status": "ok"}
 
     @webapp.get("/", response_class=HTMLResponse)
     async def dashboard():
@@ -818,7 +1021,7 @@ def create_webui_app() -> FastAPI:
 
     @webapp.get("/api/status")
     async def get_status():
-        """Einfacher Status-Check für vLLM und Cloud."""
+        """Einfacher Status-Check für Lokal/Free und Cloud."""
         import httpx
 
         vllm_ok = False
@@ -838,6 +1041,7 @@ def create_webui_app() -> FastAPI:
             "vllm_ok": vllm_ok,
             "cloud_configured": cloud_configured,
             "config_exists": CONFIG_PATH.exists(),
+            "user": WEBUI_USERNAME,
         })
 
     @webapp.post("/api/restart")
