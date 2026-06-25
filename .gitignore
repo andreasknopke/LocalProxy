@@ -1,6 +1,29 @@
 # LocalProxy — ignorierte Dateien
 config.json
+.env
+.env.local
+.env.*.local
+*.bak
+*.backup
+*_backup_*
+
+# Secrets (falls versehentlich angelegt)
+secrets/
+*.secret
+*.key
+!*.pubkey
+
+# Caches / Temp / Test-Ergebnisse
 .hindsight_memory/
-*.pyc
 __pycache__/
+*.pyc
+test_results_*.jsonl
+localproxy-patch/test_results_*.jsonl
+
+# venvs
 .venv/
+.venv-1/
+
+# Logs
+*.log
+proxy.log

@@ -166,6 +166,35 @@ VERIFY_ENABLED: bool = os.getenv("VERIFY_ENABLED", "true").lower() in {"1", "tru
 VERIFY_LINT_COMMAND: str = os.getenv("VERIFY_LINT_COMMAND", "")
 VERIFY_TEST_COMMAND: str = os.getenv("VERIFY_TEST_COMMAND", "")
 
+# ── Planner Session Tracking ──────────────────────────────────────────────
+# Wenn -force planning aktiv: Cloud-Planner (Kimi K2.7) wird zum vollwertigen
+# VS Code Sub-Agent mit Tools. Er exploriert den Workspace und erstellt einen
+# detaillierten Caveman-Plan, den der Worker dann ausführt.
+_PLANNER_SESSIONS: Dict[str, Dict[str, Any]] = {}  # hash → {"state":"active"|"done", "plan":"...", "pflags":{...}}
+
+# ── Planner-Iteration-Cap (Bug-A-Fix: Endlos-Tool-Loop) ──────────────
+# Cloud-Planner (Kimi) darf maximal MAX_PLANNER_ITERATIONS Runden Tools
+# ausfuehren. Danach wird er via System-Aufforderung gezwungen, den Plan
+# (ohne weitere tool_calls) auszugeben - sonst wuerde er sich endlos
+# versuchen, mehr zu explorieren.
+MAX_PLANNER_ITERATIONS = 8
+
+def _get_planner_session_hash(messages: Sequence[Dict[str, Any]]) -> str:
+    """Hash aus der ersten User-Message (ohne Flags) für Session-Tracking."""
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            text, _ = _extract_pipeline_flags(_message_text(msg))
+            return _simple_hash(text[:300])
+    return "unknown"
+
+def _cleanup_old_planner_sessions(max_age_seconds: float = 600) -> None:
+    """Entfernt Planner-Sessions älter als max_age_seconds."""
+    now = time.time()
+    stale = [h for h, s in _PLANNER_SESSIONS.items() if now - s.get("ts", 0) > max_age_seconds]
+    for h in stale:
+        del _PLANNER_SESSIONS[h]
+
+
 # ── Display-Namen ──────────────────────────────────────────────────────────
 DISPLAY_NAMES: Dict[str, str] = {
     "architect": "Cloud-Planer",
@@ -686,18 +715,18 @@ def _strip_pipeline_flags_from_messages(messages: List[Dict[str, Any]]) -> List[
     return messages
 
 
-def _last_user_text(messages: Sequence[Dict[str, Any]]) -> str:
-    for msg in reversed(messages):
-        if isinstance(msg, dict) and msg.get("role") == "user":
-            return _message_text(msg)
-    return ""
-
-
 def _has_pipeline_flag(messages: Sequence[Dict[str, Any]], flag: str) -> bool:
     """Prüft ob ein bestimmtes Pipeline-Flag in den Messages gesetzt ist."""
     text = _last_user_text(messages)
     _, flags = _extract_pipeline_flags(text)
     return flags.get(flag, False)
+
+
+def _last_user_text(messages: Sequence[Dict[str, Any]]) -> str:
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            return _message_text(msg)
+    return ""
 
 
 def _debug_log_request(body: Dict[str, Any]) -> None:
@@ -756,6 +785,51 @@ def _debug_log_thinking(result: Dict[str, Any], agent_key: str) -> None:
 
     if not reasoning and not tool_calls and content:
         _log(f"  📝 RESPONSE ({agent_key}, {len(content)} chars): {content[:500].replace(chr(10),' ')}")
+
+
+
+def _build_rich_context(messages: Sequence[Dict[str, Any]], max_chars: int = 14000) -> str:
+    """Baut umfassenden Caveman-Kontext aus ALLEN Messages für Cloud-Planner/Reviewer.
+
+    Extrahiert: System-Prompt (Agent-Instruktionen, Tool-Defs, Coding-Rules),
+    Tool-Resultate (ENTHALTEN DIE WORKSPACE-DATEIEN aus read_file!),
+    Konversations-Historie und den aktuellen User-Task.
+    Alles in Caveman-Format komprimiert.
+    """
+    sections: List[str] = []
+
+    # 1. System-Prompt (Agent-Instruktionen, Tool-Defs, Coding-Guidelines)
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "system":
+            sys_text = _message_text(msg)
+            if sys_text:
+                sections.append(f"[AGENT INSTRUCTIONS & TOOLS]\n{_token_budget_guard(sys_text, 5000)}")
+            break
+
+    # 2. Tool-Resultate (ENTHALTEN WORKSPACE-DATEIINHALTE!)
+    tool_results: List[str] = []
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "tool":
+            content = _message_text(msg)
+            if content:
+                tool_name = str(msg.get("name", "") or msg.get("tool_call_id", "tool"))[:40]
+                tool_results.append(f"[TOOL: {tool_name}]\n{_token_budget_guard(content, 3000)}")
+    if tool_results:
+        sections.append(f"[WORKSPACE FILES ({len(tool_results)} tool results, newest last)]\n" + "\n---\n".join(tool_results[-10:]))
+
+    # 3. Konversations-Historie (User/Assistant)
+    history: List[str] = []
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") in ("user", "assistant"):
+            content = _message_text(msg)
+            if content:
+                role = str(msg["role"]).upper()
+                history.append(f"[{role}]\n{_token_budget_guard(content, 2000)}")
+    if history:
+        sections.append(f"[CONVERSATION HISTORY ({len(history)} messages)]\n" + "\n---\n".join(history[-8:]))
+
+    combined = "\n\n".join(sections)
+    return _token_budget_guard(combined, max_chars)
 
 
 def _compact_messages(messages: Sequence[Dict[str, Any]], max_messages: int = 12) -> List[Dict[str, Any]]:
@@ -923,44 +997,131 @@ def _contains_tool_calls(text: str) -> bool:
     )
 
 
-def _normalize_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
-    """Normalisiert Tool-Calls: stellt sicher, dass arguments ein JSON-String ist.
+# ── Tool-Call-Normalisierung (kritisch für Cloud-Planner mit VS Code Tools) ──
+# Bug-B-Fix: Manche Cloud-Modelle (insb. Moonshot/Kimi) liefern tool_calls
+# mit Arguments die KEIN gültiger JSON-String sind (dict, leer, malformed).
+# VS Code Copilot (OpenAI-Standard) verlangt strictly-typed JSON-String-Arguments.
+# Symptom: "Cannot read properties of undefined (reading 'match')" fuer grep_search
+#          "Cannot read properties of undefined (reading 'startsWith')" fuer list_dir
+# Folge: VS Code return ERROR Tool-Results → Kimi probiert es wieder → Endlos-Loop.
+
+
+# Sichere Subset von VS Code Tools, die der Cloud-Planner verwenden darf.
+# Grund: Volle 47 Tools ueberfordern Kimi + riskieren Side-Effects.
+# Der Planner darf nur LESEN/EXPLORIEREN, nichts mutieren.
+_PLANNER_ALLOWED_TOOLS = {
+    "read_file", "grep_search", "list_dir", "file_search", "semantic_search",
+    "view_image", "get_errors", "copilot_getNotebookSummary",
+    "read_notebook_cell_output", "terminal_last_command", "terminal_selection",
+    "get_vscode_api", "github_repo", "github_text_search", "memory",
+    "resolve_memory_file_uri", "session_store_sql",
+}
+
+
+def _filter_planner_tools(tools: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+    """Filtert die vom Client uebergebenen Tool-Definitionen auf das sichere
+    READ-ONLY Subset, das der Cloud-Planner verwenden darf.
     
-    Manche vLLM-Backends (z.B. bestimmte DeepSeek-Versionen) liefern arguments
-    bereits als geparstes dict zurück. Das führt zu Inkonsistenzen beim Streaming
-    (VS Code Copilot erwartet arguments zwingend als String).
+    Das reduziert die Tool-Liste von 47 auf ~15 - Kimi wird stabiler beim
+    Tool-Argument-Mashing und die Komplexitaet des Tool-Auswahl-Logits sinkt.
+    Im Idealfall reduziert das auch die malformed-tool-args-Rate massiv.
+    """
+    if not tools:
+        return tools
+    filtered = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("function", {}).get("name") or tool.get("name", "")
+        if name in _PLANNER_ALLOWED_TOOLS:
+            filtered.append(tool)
+    return filtered or None
+
+
+def _normalize_tool_call_arguments(args: Any) -> str:
+    """Konvertiert beliebige tool_call arguments in einen GUELTIGEN JSON-String.
+    
+    Bug-B: VS Code Copilot ruft JSON.parse(arguments) auf und erwartet danach ein
+    Objekt mit den Parametern. Wenn arguments = '' (leer) oder ungueltiges JSON
+    ist, schlaegt parse fehl → 'undefined.match()' Crash.
+    
+    Diese Funktion garantiert dass ein JSON-Objekt-String returned wird.
+    """
+    # Fall 1: args ist bereits ein String
+    if isinstance(args, str):
+        s = args.strip()
+        if not s:
+            return "{}"
+        # Versuchen als JSON-String zu validieren
+        try:
+            parsed = json.loads(s)
+            # Re-serialisieren fuer konsistente Formatierung
+            return json.dumps(parsed, ensure_ascii=False)
+        except (json.JSONDecodeError, ValueError):
+            # Ungueltiges JSON - versuchen als Plain-Text in "query" zu wrappen
+            _log(f"  ⚠ Tool-Arg kein gueltiges JSON, wrappe als string: {s[:80]}")
+            return json.dumps({"query": s, "text": s}, ensure_ascii=False)
+    
+    # Fall 2: args ist ein dict → als JSON-String serialisieren
+    if isinstance(args, dict):
+        return json.dumps(args, ensure_ascii=False)
+    
+    # Fall 3: args ist None → leeres Objekt
+    if args is None:
+        return "{}"
+    
+    # Fall 4: alles andere → als JSON serialisieren
+    try:
+        return json.dumps(args, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return "{}"
+
+
+def _normalize_tool_calls(
+    tool_calls: Optional[List[Dict[str, Any]]],
+    allowed: Optional[set] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    """Normalisiert eine Liste von tool_calls in OpenAI-kompatibles Format.
+    
+    - arguments werden IMMER zu gueltigem JSON-String konvertiert
+    - function.name wird auf einen String gesichert
+    - id wird bei Bedarf generiert
+    - tool_calls mit leeren/None Namen werden weggeworfen
+    - Filterung auf 'allowed' Set (optional)
     """
     if not tool_calls or not isinstance(tool_calls, list):
-        return []
+        return None
+    
     normalized = []
     for i, tc in enumerate(tool_calls):
         if not isinstance(tc, dict):
             continue
-        tc_copy = dict(tc)
-        func = tc_copy.get("function", {})
-        if isinstance(func, dict):
-            func_copy = dict(func)
-            args = func_copy.get("arguments")
-            if isinstance(args, dict):
-                func_copy["arguments"] = json.dumps(args, ensure_ascii=False)
-            elif not isinstance(args, str) and args is not None:
-                func_copy["arguments"] = str(args)
-            tc_copy["function"] = func_copy
-        tc_copy["index"] = i
-        normalized.append(tc_copy)
-    return normalized
+        func = tc.get("function") or {}
+        if not isinstance(func, dict):
+            func = {}
+        name = str(func.get("name", "")).strip()
+        if not name:
+            continue
+        if allowed and name not in allowed:
+            _log(f"  🔧 Tool '{name}' nicht erlaubt fuer Planner → filtere")
+            continue
+        normalized.append({
+            "id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+            "type": "function",
+            "index": tc.get("index", i),
+            "function": {
+                "name": name,
+                "arguments": _normalize_tool_call_arguments(func.get("arguments")),
+            },
+        })
+    return normalized or None
 
 
 def _classify_intent(messages: Sequence[Dict[str, Any]]) -> str:
     """Intent-Klassifizierung: deterministisch, bei Mehrdeutigkeit 'agent'."""
-    # Tool-Continuation → immer direkt (kein neuer Plan!)
-    if _is_tool_continuation(messages):
-        _log("→ Intent: direct (tool-continuation, Pipeline übersprungen)")
-        return "direct"
-
     text = _last_user_text(messages)
 
-    # ── Pipeline-Steuerflags prüfen ──────────────────────────────────
+    # ── Pipeline-Steuerflags MÜSSEN ZUERST geprüft werden ────────────
     _, pflags = _extract_pipeline_flags(text)
     if pflags.get("force_planning"):
         _log("→ Intent: agent (Flag: -force planning)")
@@ -971,6 +1132,16 @@ def _classify_intent(messages: Sequence[Dict[str, Any]]) -> str:
     if pflags.get("bypass_worker"):
         _log("→ Intent: agent (Flag: -bypass worker)")
         return "agent"
+
+    # Tool-Continuation: Check ob wir in einer Planner-Session sind
+    if _is_tool_continuation(messages):
+        session_hash = _get_planner_session_hash(messages)
+        session = _PLANNER_SESSIONS.get(session_hash)
+        if session and session.get("state") == "active":
+            _log("→ Intent: agent (Planner-Session aktiv, Tool-Fortsetzung → Cloud-Planner)")
+            return "agent"
+        _log("→ Intent: direct (tool-continuation, Pipeline übersprungen)")
+        return "direct"
 
     # Prüfen ob Cloud/LiteLLM konfiguriert ist → weniger aggressive Bypässe
     _cloud_available = bool(
@@ -1099,13 +1270,19 @@ def _build_worker_payload(
     max_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Baut den Payload für den WORKER – ein FULLY TOOL-CAPABLE Sub-Agent.
+    Baut den Payload fuer den WORKER - ein FULLY TOOL-CAPABLE Sub-Agent.
     Der Worker bekommt die KOMPLETTE VS Code Umgebung:
       - Originale System-Message (mit Tool-Definitionen & Calling-Format)
       - Alle Messages (kein Compact!)
       - tools / tool_choice aus dem Original-Body
-      - Plan + Memory als ZUSÄTZLICHER Kontext in der letzten User-Message
-    Keine redundante Worker-Instruktion – die VS Code System-Prompt steuert das Verhalten.
+      - Plan + Memory als ZUSAETZLICHER Kontext in der letzten User-Message
+    
+    USER-VISION "Plan-bindend":
+      Der Worker wird EXPLIZIT angewiesen, den Plan strikt zu befolgen.
+      Er hat ALLE VS Code Tools, aber die System-Instruktion ist der Vertrag:
+      "Implementiere den Plan. Keine(). Neue(). Ideen. Wenn der Plan Fehler
+      hat, mache最小-korrektur und kommentiere. Keine Refactors, keine
+      Zusatz-Features, keine neuen Dateien es sei denn der Plan verlangt es."
     """
     payload = copy.deepcopy(body)
     payload["model"] = model_name or body.get("model") or MODEL_NAME
@@ -1114,15 +1291,37 @@ def _build_worker_payload(
 
     messages = list(payload.get("messages", []))
 
-    # Nur Kontext ANHÄNGEN, ohne die originale Struktur zu beschädigen
+    # ══ Plan-binding System-Prompt injecten ══════════════════════════
+    # Wird an die ERSTE system-message angehaengt, falls vorhanden.
+    # Sonst als neue system-message vorne eingefuegt.
+    if plan:
+        plan_binding = (
+            "\n\n[PLAN-BINDING CONTRACT - READ CAREFULLY]\n"
+            "A strategic plan has been prepared by your senior planner. "
+            "You MUST implement it STRICTLY. Rules:\n"
+            "1. Execute each step of the plan IN ORDER.\n"
+            "2. DO NOT refactor, add features, or 'improve' anything not in the plan.\n"
+            "3. If a step is ambiguous, implement the SIMPLEST interpretation.\n"
+            "4. If a step is impossible (wrong file/line): SKIP it, mark '# SKIPPED: <reason>'.\n"
+            "5. Do NOT create new files unless the plan explicitly says 'CREATE <path>'.\n"
+            "6. After finishing, output a '## Implementation Summary' with each step ✓/⚠/✗.\n"
+            "The plan is included at the end of this prompt."
+        )
+        if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+            existing = str(messages[0].get("content", ""))
+            messages[0]["content"] = existing + plan_binding
+        else:
+            messages.insert(0, {"role": "system", "content": plan_binding.strip()})
+
+    # Nur Kontext ANHAENGEN, ohne die originale Struktur zu beschädigen
     context_blocks = []
     if memory_context:
         context_blocks.append(f"[HINDSIGHT MEMORY]\n{memory_context}")
     if plan:
-        context_blocks.append(f"[CLOUD EXECUTION PLAN]\n{plan}")
+        context_blocks.append(f"[CLOUD EXECUTION PLAN - FOLLOW EXACTLY]\n{plan}")
     context_str = "\n\n".join(context_blocks)
 
-    # Plan + Memory an die letzte User-Message anhängen
+    # Plan + Memory an die letzte User-Message anhaengen
     if context_str:
         if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
             user_content = messages[-1]["content"]
@@ -1133,22 +1332,32 @@ def _build_worker_payload(
         else:
             messages.append({"role": "user", "content": context_str})
 
-    # ALLE Messages behalten – kein Compact! Das System-Prompt mit Tool-Defs bleibt erhalten.
+    # ALLE Messages behalten - kein Compact! Das System-Prompt mit Tool-Defs bleibt erhalten.
     payload["messages"] = messages
     return _clean_payload(payload, keep_tools=True)
 
 
 def _build_cloud_plan_payload(body: Dict[str, Any], memory_context: str) -> Dict[str, Any]:
-    """Baut den Payload für den Cloud-Planer (Caveman Ultra Modus)."""
+    """Baut den Payload für den Cloud-Planer (Caveman Ultra Modus).
+    
+    Sendet JETZT den VOLLEN Workspace-Kontext: Agent-Instruktionen, Tool-Resultate
+    (Dateiinhalte aus read_file!), Konversations-Historie und Task.
+    """
+    rich_context = _build_rich_context(body.get("messages", []))
     user_text = _last_user_text(body.get("messages", []))
+    
     prompt_parts = [
-        "TASK:",
+        "=== FULL WORKSPACE CONTEXT ===",
+        rich_context,
+        "",
+        "=== YOUR TASK ===",
         user_text,
         "",
         "CONSTRAINTS:",
-        "- Return ONLY abstract execution plan (no code, no tool calls).",
-        "- Each step: WHAT to do, WHICH file, WHY.",
-        "- DO NOT write code. DO NOT explore. Just plan.",
+        "- You NOW HAVE the actual codebase context above. Use it to plan precisely.",
+        "- Return a DETAILED execution plan (8-15 steps). Reference specific files/lines.",
+        "- Each step: WHAT to do, WHICH file (exact path), WHY (based on the code you see).",
+        "- DO NOT write code. DO NOT use tool_calls. Just plan from the context provided.",
         "- DO NOT say 'future' or 'later'. This plan will be executed NOW.",
         "- Use symbols: -> ! ? FIX RISK TODO",
     ]
@@ -1166,11 +1375,13 @@ def _build_cloud_plan_payload(body: Dict[str, Any], memory_context: str) -> Dict
             {
                 "role": "system",
                 "content": (
-                    "STRATEGIC PLANNER ONLY. You have NO tools, NO terminal, NO file access. "
-                    "Your ONLY output: a terse abstract execution plan (5-8 bullet points). "
-                    "DO NOT produce code. DO NOT use tool_calls, invoke, or function calls. "
-                    "DO NOT explore the workspace — just plan from the task description. "
-                    "Format: numbered list, each line < 80 chars, symbols only (-> ! ? TODO FIX)."
+                    "STRATEGIC PLANNER WITH FULL CODEBASE CONTEXT. "
+                    "You receive: agent instructions, workspace files (from tool results), "
+                    "conversation history, and the task. "
+                    "Your ONLY output: a detailed execution plan (8-15 steps). "
+                    "Reference SPECIFIC files and lines from the context. "
+                    "DO NOT write code. DO NOT use tool_calls. "
+                    "Format: numbered list, each line < 100 chars."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -1304,11 +1515,10 @@ def _build_response_payload(
         if r.get("reasoning_content") and reasoning_found is None:
             reasoning_found = r.get("reasoning_content")
         if r.get("tool_calls"):
-            normalized_tcs = _normalize_tool_calls(r.get("tool_calls"))
             message = {
                 "role": "assistant",
                 "content": r.get("content") or None,
-                "tool_calls": normalized_tcs,
+                "tool_calls": r.get("tool_calls"),
             }
             if reasoning_found:
                 message["reasoning_content"] = reasoning_found
@@ -1464,12 +1674,16 @@ async def _call_cloud_planner(
 
 
 async def _call_cloud_via_litellm(body: Dict[str, Any], memory_context: str) -> Dict[str, Any]:
-    """Cloud-Planer via LiteLLM (direkter httpx-Call wenn URL gesetzt, sonst via litellm-Library)."""
+    """Cloud-Planer via LiteLLM — JETZT mit vollem Workspace-Kontext."""
+    rich_context = _build_rich_context(body.get("messages", []))
     user_text = _last_user_text(body.get("messages", []))
     prompt = (
-        f"TASK:\n{user_text}\n\n"
-        "Create an abstract execution plan (5-8 steps). WHAT to do, WHICH file. "
-        "NO code. NO tool calls. NO exploration. This will be executed NOW."
+        f"=== FULL WORKSPACE CONTEXT ===\n{rich_context}\n\n"
+        f"=== YOUR TASK ===\n{user_text}\n\n"
+        "Create a DETAILED execution plan (8-15 steps). "
+        "Reference specific files and lines from the context above. "
+        "WHAT to do, WHICH file, WHY. "
+        "NO code. NO tool calls. This will be executed NOW."
     )
     if CAVEMAN_ENABLED:
         prompt = f"{CAVEMAN_SYSTEM_PROMPT}\n\n{prompt}"
@@ -1480,8 +1694,10 @@ async def _call_cloud_via_litellm(body: Dict[str, Any], memory_context: str) -> 
         "model": LITELLM_CLOUD_MODEL,
         "messages": [
             {"role": "system", "content": (
-                "STRATEGIC PLANNER ONLY. NO tools. NO code execution. NO file access. "
-                "Output ONLY: 5-8 bullet point abstract plan. Terse symbols. No code. No tool calls."
+                "STRATEGIC PLANNER WITH FULL CODEBASE CONTEXT. "
+                "You receive agent instructions, workspace files, history, and the task. "
+                "Output: detailed execution plan (8-15 steps) referencing specific files/lines. "
+                "No code. No tool calls."
             )},
             {"role": "user", "content": prompt},
         ],
@@ -1565,13 +1781,16 @@ async def _call_cloud_as_responder(
     memory_context: str,
 ) -> Dict[str, Any]:
     """Cloud (LiteLLM/ReviewLLM) als direkter Responder — Worker-Bypass.
-    Sendet den Task + Caveman-Plan an das Cloud-Modell, das die Antwort generiert."""
+    Sendet den Task + Caveman-Plan + Workspace-Kontext an das Cloud-Modell."""
+    rich_context = _build_rich_context(body.get("messages", []))
     user_text = _last_user_text(body.get("messages", []))
     prompt = (
-        f"TASK:\n{user_text}\n\n"
-        f"EXECUTE THIS PLAN:\n{plan}\n\n"
-        "You are the executor. Implement the plan. Provide complete code, "
-        "detailed explanation, and working solution. No tool calls — write code directly."
+        f"=== FULL WORKSPACE CONTEXT ===\n{rich_context}\n\n"
+        f"=== TASK ===\n{user_text}\n\n"
+        f"=== EXECUTION PLAN ===\n{plan}\n\n"
+        "You are the executor. Implement the plan using the context above. "
+        "Provide complete code, detailed explanation, and working solution. "
+        "No tool calls — write code directly."
     )
     if memory_context:
         prompt = f"[HINDSIGHT]\n{memory_context}\n\n{prompt}"
@@ -1654,37 +1873,448 @@ async def _call_cloud_as_responder(
         }
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Review mit Feedback-Loop (User-Vision: Cloud prüft gegen Plan, ggf Re-Run)
+# ═══════════════════════════════════════════════════════════════════════════
+# -force review: Kimi/LiteLLM prüft die Worker-Antwort GEGEN DEN PLAN.
+# - Bei PASS: ok, Done.
+# - Bei NEEDS FIX: Worker wird mit dem Feedback NOCHMAL gerufen,
+#   max READY_MAX_FEEDBACK_ROUNDES mal. Danach: best-effort rausgeben.
+MAX_FEEDBACK_ROUNDS = 2
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Deterministisches Review-Layout für Provider-Caching (DeepSeek KV-Cache,
+# Moonshot 60s-Context-Cache). Der STABILE Teil (Format-Template, Task, Plan)
+# steht IMMER identisch vorne, nur der variable Teil (Worker-Antwort)
+# variiert zwischen Review-Runden. Prov-Cache-Hit-Rate steigt ~70-90 %
+# in Feedback-Loops.  Siehe /memories/repo/localproxy-plan-execute-verify.md
+# ═══════════════════════════════════════════════════════════════════════════
+REVIEWER_SYSTEM_PROMPT = (
+    "You are a STRICT code reviewer enforcing a plan. Be CONCISE.\n"
+    "You will receive, in this exact order:\n"
+    "  USER message 1: the ORIGINAL TASK (stable across rounds).\n"
+    "  USER message 2: the EXECUTION PLAN (stable across rounds).\n"
+    "  USER message 3: the RESPONSE TO REVIEW (changes each round).\n"
+    "Check the response AGAINST THE PLAN for: correctness, completeness, "
+    "bugs, edge cases, security issues. Did the worker implement the plan "
+    "correctly?\n"
+    "OUTPUT FORMAT (exact, no preface):\n"
+    "## Review Result: [PASS / NEEDS FIX]\n"
+    "## Issues Found:\n- ...\n"
+    "## Suggestions:\n- ...\n"
+    "If PASS, output ONLY:\n"
+    "## Review Result: PASS\n"
+)
+
+
+def _parse_review_verdict(review_text: str) -> str:
+    """Extrahiert 'PASS' / 'NEEDS FIX' aus Cloud-Review-Output."""
+    if not review_text:
+        return "UNKNOWN"
+    r = review_text.strip().upper()
+    # Pattern 1: "## Review Result: PASS" / "NEEDS FIX"
+    m = re.search(r"REVIEW\s*RESULT\s*:?\s*(PASS|NEEDS?\s*FIX|FAIL)", r)
+    if m:
+        v = m.group(1).replace(" ", "")
+        if v.startswith("NEED"):
+            return "NEEDS_FIX"
+        return v if v in {"PASS", "FAIL"} else "UNKNOWN"
+    # Pattern 2: alleine das Wort am Anfang
+    if re.match(r"^\s*PASS\b", r):
+        return "PASS"
+    if re.search(r"\b(NEEDS?\s*FIX|FAIL)\b", r):
+        return "NEEDS_FIX"
+    return "UNKNOWN"
+
+
+async def _review_with_feedback_loop(
+    client: httpx.AsyncClient,
+    body: Dict[str, Any],
+    plan: str,
+    task: str,
+    worker_response: str,
+    force_review: bool,
+    progress: List[str],
+    results: List[Dict[str, Any]],
+) -> str:
+    """Fuehrt Cloud-Review durch + Feedback-Loop bei NEEDS FIX.
+
+    Gibt die finale (ggf re-implementierte) Worker-Antwort zurueck.
+    force_review=False → nur lokale Verifikation, kein Cloud-Loop.
+    """
+    if not force_review:
+        verified, _ = await _verify_and_correct(client, task, worker_response)
+        return verified
+
+    rounds = 0
+    current_response = worker_response
+    while rounds <= MAX_FEEDBACK_ROUNDS:
+        rounds += 1
+        _log(f"  🔍 Review-Runde {rounds}/{MAX_FEEDBACK_ROUNDS+1}")
+        progress.append(_format_chat_progress_message(
+            f"phase3_review_round_{rounds}",
+            f"🔍 Cloud-Review (Runde {rounds}) prüft gegen Plan.",
+            {"round": rounds},
+        ))
+        review_r = await _call_cloud_reviewer(client, task, current_response, plan)
+        results.append(review_r)
+        if review_r.get("status") != "ok":
+            _log("  ⚠ Review fehlgeschlagen → nehme Worker-Output ungeprueft")
+            return current_response
+        rtext = review_r.get("content", "").strip()
+        verdict = _parse_review_verdict(rtext)
+        _log(f"  🔍 Review-Verdict: {verdict}")
+
+        if verdict == "PASS" or verdict == "UNKNOWN":
+            # Pass - Review-Text an Worker-Output anhaengen, fertig
+            if rtext:
+                current_response = f"{current_response}\n\n---\n## 🔍 Cloud Review (PASS, Runde {rounds})\n{rtext}"
+            return current_response
+
+        # NEEDS_FIX (oder FAIL): Worker mit Feedback neu starten
+        current_response = f"{current_response}\n\n---\n## 🔍 Cloud Review (NEEDS FIX, Runde {rounds})\n{rtext}"
+        if rounds > MAX_FEEDBACK_ROUNDS:
+            _log(f"  ⚠ Max Feedback-Runden erreicht ({MAX_FEEDBACK_ROUNDS}) → rausgeben wie es ist")
+            return current_response
+        progress.append(_format_chat_progress_message(
+            f"phase3b_feedback_{rounds}",
+            f"♻️ Review fordert Fixes → Worker-Neuausführung.",
+            {"round": rounds, "verdict": verdict},
+        ))
+        feedback_payload = _build_worker_payload(body, plan, "")
+        # CACHING-FREUNDLICHER Feedback-Payload:
+        # Bisher wurde das REVIEW-FEEDBACK ans Ende der originalen User-Message geklebt
+        # → das zerstört den Prefix-Cache (Original-Message-Ende ist zwischen
+        # Worker-Call 1 und 2 nicht mehr identisch).
+        #
+        # Neu: Wir APPENDEN das Feedback als SEPARATE user-Message. Damit bleibt
+        # der gesamte Prefix (system + tool-defs + plan + plan-binding + history +
+        # originale User-Nachricht + Memory) byteweise identisch zwischen
+        # initial Worker-Call und Fix-Runden. DeepSeek/Moonshot cachen diesen
+        # Prefix, nur die appendede Feedback-Message wird neu berechnet.
+        feedback_text = (
+            "[REVIEW FEEDBACK - FIX THESE ISSUES]\n"
+            f"{rtext}\n\n"
+            "Re-apply ONLY the fixes from the review. Keep everything else intact."
+        )
+        feedback_payload.setdefault("messages", []).append(
+            {"role": "user", "content": feedback_text}
+        )
+        re_result = await _call_vllm_with_fallback(client, feedback_payload, "worker_feedback")
+        results.append(re_result)
+        if re_result.get("status") == "ok":
+            current_response = re_result.get("content", "")
+            _log(f"  ♻️ Worker-Neuausführung fertig ({len(current_response)} chars)")
+        else:
+            _log("  ⚠ Worker-Neuausführung fehlgeschlagen → letzter Stand")
+            return current_response
+    # Fallback (sicherheitshalber)
+    return current_response
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 0: Caveman Compression VOR dem Cloud-Planner
+# ═══════════════════════════════════════════════════════════════════════════
+# User-Vision: Bevor der teure Cloud-Planner (Kimi) die User-Prompt verarbeitet,
+# wird ein CHEAP Modell (FAST_MODEL = deepseek-v4-flash) die User-Prompt ins
+# Caveman-Format komprimieren. Das spart Cloud-Tokens UND zwingt den Planner
+# auf das Wesentliche zu fokussieren.
+
+PHASE0_COMPRESS_SYSTEM = (
+    "You are a CAVEMAN PROMPT COMPRESSOR. Input: a user request (long or short). "
+    "Output: the SAME intent in 30-200 chars max, using only terse keywords + arrows. "
+    "Strip politeness, filler, context-noise. Preserve: file names, function names, "
+    "intent verbs (add/fix/refactor). Format example:\n"
+    "  Input: 'Could you please add a function validateEmail to the User model?'\n"
+    "  Output: 'ADD fn validateEmail -> User model. validate RFC email. fail→throw Error.'\n"
+    "Output ONLY the compressed prompt, no preface."
+)
+
+
+async def _phase0_compress_prompt(
+    client: httpx.AsyncClient,
+    user_text: str,
+) -> str:
+    """Komprimiert die User-Prompt mittels FAST_MODEL (deepseek-v4-flash) in
+    Caveman-Keywords. Gibt bei Fehler das Original zurueck (fail-open).
+    """
+    if not user_text or len(user_text) < 80 or not FAST_MODEL_NAME:
+        # Zu kurz oder kein Fast-Model → Compression skipped, Original zurueck
+        return user_text
+
+    payload = {
+        "model": FAST_MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": PHASE0_COMPRESS_SYSTEM},
+            {"role": "user", "content": user_text},
+        ],
+        "max_tokens": 512,
+        "temperature": 0.0,
+        "stream": False,
+    }
+    payload = _clean_payload(payload)
+    _patch_moonshot_payload(payload)
+
+    started = time.perf_counter()
+    try:
+        # Zustatz-Header: der Fast-Worker laeuft ueber eigenem Endpoint
+        headers = _vllm_headers()
+        url = VLLM_API_URL if VLLM_API_URL.endswith("/chat/completions") else VLLM_API_URL.rstrip("/") + "/chat/completions"
+        response = await client.post(url, json=payload, headers=headers, timeout=20.0)
+        duration = time.perf_counter() - started
+        if response.status_code == 200:
+            rj = response.json()
+            # DeepSeek V4 legt Output bei temperature=0 häufig in reasoning_content,
+            # NICHT in content (BUG: _extract_choice_content hier nicht verwenden).
+            # Deshalb hier direkt content ODER reasoning_content ziehen.
+            msg = _extract_choice_message(rj)
+            compressed = (msg.get("content") or msg.get("reasoning_content") or "").strip()
+            if compressed and 10 < len(compressed) < len(user_text):
+                _log(f"  🗜 Phase-0 Compression: {len(user_text)} → {len(compressed)} chars ({duration:.1f}s)")
+                return compressed
+            _log(f"  ⚠ Phase-0 Compression unnuetz (len {len(compressed)}) → Original")
+            return user_text
+        _log(f"  ⚠ Phase-0 Compression STATUS {response.status_code} → Original")
+        return user_text
+    except Exception as exc:
+        _log(f"  ⚠ Phase-0 Compression ERROR ({exc}) → Original")
+        return user_text
+
+
+async def _call_cloud_planner_agent(
+    client: httpx.AsyncClient,
+    body: Dict[str, Any],
+    memory_context: str = "",
+    parent_results: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Cloud-Planner ALS VOLLWERTIGER SUB-AGENT mit VS Code Tools.
+
+    Sendet die komplette VS Code Umgebung (System-Prompt, Tool-Defs, History, Workspace-Files)
+    an Kimi K2.7 via Moonshot API. Kimi kann Tools aufrufen (read_file, search_code etc.),
+    die VS Code dann ausführt. Ergebnis: ein detaillierter Caveman-Plan (.md).
+
+    Wichtig: max_tokens=65536 für Caveman-komprimierten Output.
+    """
+    if not (CLOUD_REVIEW_ENABLED and CLOUD_REVIEW_API_KEY) and not (LITELLM_CLOUD_MODEL and LITELLM_CLOUD_API_KEY):
+        return {
+            "agent_key": "cloud_planner_agent",
+            "status": "skipped", "content": "",
+            "duration_seconds": 0.0, "usage": None,
+        }
+
+    _log(f"  🧠 Cloud-Planner-Agent: model={CLOUD_REVIEW_MODEL} url={CLOUD_REVIEW_API_URL}")
+
+    # Payload mit VOLLEN VS Code Tools bauen
+    payload = copy.deepcopy(body)
+    payload["model"] = CLOUD_REVIEW_MODEL
+    payload["max_tokens"] = min(CAVEMAN_MAX_TOKENS, 65536)
+    payload["temperature"] = 0.2
+    payload["stream"] = False
+
+    # System-Prompt: Planner-Agent mit Caveman-Output
+    planner_system = (
+        "You are a STRATEGIC PLANNING AGENT. You have FULL access to VS Code tools: "
+        "read_file, search_code, list_dir, run_terminal, and all other tools. "
+        "Your job: EXPLORE the workspace thoroughly, understand the codebase, "
+        "then produce a DETAILED EXECUTION PLAN in Markdown. "
+        "THE PLAN (your final output, no tools):\n"
+        "- 10-20 concrete steps\n"
+        "- Each step: WHAT file, WHAT change, WHY\n"
+        "- Reference specific file paths and line numbers\n"
+        "- CRITICAL: Use EXTREME CAVEMAN COMPRESSION. Terse symbols, no prose.\n"
+        "- Format: `## Plan: <title>`, numbered list, symbols -> ! ? FIX TODO RISK\n"
+        "- Max 4000 chars total. Every word must earn its place.\n"
+        "- DO NOT write code. The worker will implement.\n"
+    )
+    # Original System-Prompt mit Tool-Defs MIT ANHÄNGEN (Kimi braucht die Tool-Schemas)
+    messages = list(payload.get("messages", []))
+    if messages and messages[0].get("role") == "system":
+        messages[0]["content"] = str(messages[0].get("content", "")) + "\n\n" + planner_system
+    else:
+        messages.insert(0, {"role": "system", "content": planner_system})
+    payload["messages"] = messages
+
+    # Memory-Kontext an letzte User-Message anhängen
+    if memory_context:
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                msg["content"] = str(msg.get("content", "")) + f"\n\n[HINDSIGHT]\n{memory_context}"
+                break
+
+    # tools/tool_choice aus Original behalten
+    payload = _clean_payload(payload, keep_tools=True)
+    _patch_moonshot_payload(payload)
+
+    # ══ Bug-B-Fix: Tools filtern + Iteration-Cap ═════════════════════
+    # 1) READ-ONLY Subset verfuettern - verhindert dass Kimi mit allen
+    #    47 Tools Durcheinander anrichtet und falsche Arg-Formate baut.
+    if "tools" in payload:
+        filtered = _filter_planner_tools(payload.get("tools"))
+        if filtered and len(filtered) < len(payload["tools"]):
+            _log(f"  🔧 Planner-Tools gefiltert: {len(payload['tools'])} → {len(filtered)} (read-only)")
+            payload["tools"] = filtered
+        elif not filtered:
+            # Keine passenden Tools gefunden → ganz entfernen (sonst chaos)
+            _log("  ⚠ Keine passenden Planner-Tools → entferne tools完全")
+            payload.pop("tools", None)
+            payload.pop("tool_choice", None)
+
+    # 2) Iteration-Cap: Wenn Kimi schon viele Runden Tools hatte,
+    #    System-Aufforderung injecten, NOW den Plan auszugeben.
+    iteration = 0
+    sh = _get_planner_session_hash(payload.get("messages", []))
+    existing_session = _PLANNER_SESSIONS.get(sh)
+    if existing_session and isinstance(existing_session.get("iterations"), int):
+        iteration = int(existing_session["iterations"])
+    if iteration >= MAX_PLANNER_ITERATIONS:
+        _log(f"  🛑 Planner Iteration-Cap erreicht ({iteration}/{MAX_PLANNER_ITERATIONS}) → erzwinge Plan-Output")
+        # Tools entfernen und FORCE-PLAN Anweisung anhaengen
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+        if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
+            force_msg = (
+                "\n\n[SYSTEM: Du hast bereits ausreichend den Workspace exploriert. "
+                "Gib JETZT deinen finalen Ausfuehrungs-Plan aus. KEINE weiteren tool_calls. "
+                "Format: '## Plan: <title>' + numbered steps. Max 4000 chars.]"
+            )
+            user_content = messages[-1].get("content", "")
+            if isinstance(user_content, str):
+                messages[-1]["content"] = user_content + force_msg
+
+    # ══ FALLBACK-KETTE (Kimi → DeepSeek V4 Pro) ═════════════════════
+    # DEF-Strategie: Probiere primär Kimi (CLOUD_REVIEW_*). Bei non-200,
+    # Exception, oder leerem Plan → versuche DeepSeek V4 Pro via LiteLLM.
+    # Da _patch_moonshot_payload und Stage-spezifische Felder MUTIEREND sind,
+    # muss pro Stuge eine FRISCHE Payload-Kopie erzeugt werden.
+    planner_chain = []
+    if CLOUD_REVIEW_ENABLED and CLOUD_REVIEW_API_KEY:
+        planner_chain.append({
+            "name": "KIMI",
+            "model": CLOUD_REVIEW_MODEL,
+            "api_key": CLOUD_REVIEW_API_KEY,
+            "api_url": CLOUD_REVIEW_API_URL,
+            "timeout": CLOUD_REVIEW_TIMEOUT_SECONDS,
+        })
+    if LITELLM_CLOUD_MODEL and LITELLM_CLOUD_API_KEY:
+        planner_chain.append({
+            "name": "DEEPSEEK-V4-PRO",
+            "model": LITELLM_CLOUD_MODEL,
+            "api_key": LITELLM_CLOUD_API_KEY,
+            "api_url": LITELLM_CLOUD_API_URL or "https://api.openai.com/v1/chat/completions",
+            "timeout": LITELLM_CLOUD_TIMEOUT_SECONDS,
+        })
+
+    started_total = time.perf_counter()
+    last_error = ""
+    for stage_idx, stage in enumerate(planner_chain):
+        stage_name = stage["name"]
+        stage_label = f"[{stage_idx+1}/{len(planner_chain)} {stage_name}]"
+        _log(f"  🧠 Cloud-Planner-Agent {stage_label}: model={stage['model']}")
+
+        # Frisches Payload pro Stufe (mutierende Patches sonst zerstören Loop-Iter)
+        stage_payload = copy.deepcopy(payload)
+        stage_payload["model"] = stage["model"]
+        _patch_moonshot_payload(stage_payload)  # nur wirksam wenn model/url Moonshot ist
+
+        headers = {"Authorization": f"Bearer {stage['api_key']}"}
+        started = time.perf_counter()
+        try:
+            response = await client.post(
+                stage["api_url"],
+                json=stage_payload,
+                headers=headers,
+                timeout=stage["timeout"],
+            )
+            duration = time.perf_counter() - started
+            if response.status_code == 200:
+                result = response.json()
+                message = _extract_choice_message(result)
+                raw_tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+                content = _extract_choice_content(result)
+
+                # ══ Bug-B-Fix: Tool-Calls normalisieren ══════════════════
+                tool_calls = _normalize_tool_calls(raw_tool_calls, allowed=_PLANNER_ALLOWED_TOOLS) if raw_tool_calls else None
+
+                if tool_calls:
+                    _log(f"  🔧 Cloud-Planner {stage_label} returned {len(raw_tool_calls)} tool_calls, "
+                         f"{len(tool_calls)} nach Normalisierung ({duration:.1f}s)")
+                    content_out = content or ""
+                elif content and content.strip():
+                    _log(f"  ✓ Cloud-Planner {stage_label} Plan: {len(content)} chars ({duration:.1f}s)")
+                    content_out = content
+                else:
+                    _log(f"  ⚠ Cloud-Planner {stage_label}: 200 aber kein tool_calls UND leerer Plan → nächste Stufe")
+                    last_error = f"empty plan ({stage_name})"
+                    continue
+
+                return {
+                    "agent_key": "cloud_planner_agent",
+                    "status": "ok",
+                    "content": content_out,
+                    "tool_calls": tool_calls,
+                    "duration_seconds": time.perf_counter() - started_total,
+                    "usage": result.get("usage"),
+                }
+            _log(f"  ⚠ Cloud-Planner {stage_label} STATUS {response.status_code}: {response.text[:300]}")
+            last_error = f"HTTP {response.status_code} ({stage_name})"
+        except Exception as exc:
+            _log(f"  ✗ Cloud-Planner {stage_label} ERROR: {exc}")
+            last_error = f"{type(exc).__name__}: {exc} ({stage_name})"
+
+    _log(f"  ✗ Cloud-Planner: Alle Stufen fehlgeschlagen – letzter Fehler: {last_error}")
+    return {
+        "agent_key": "cloud_planner_agent",
+        "status": "failed",
+        "content": f"Planner all-stages failed: {last_error}",
+        "duration_seconds": time.perf_counter() - started_total, "usage": None,
+    }
+
+
 async def _call_cloud_reviewer(
     client: httpx.AsyncClient,
     task: str,
     response: str,
+    plan: str = "",
 ) -> Dict[str, Any]:
-    """Cloud-Review: Sendet Worker-Antwort zur Qualitätsprüfung an die Cloud."""
-    prompt = (
-        f"ORIGINAL TASK:\n{task}\n\n"
-        f"RESPONSE TO REVIEW:\n{response}\n\n"
-        "Review the response. Check for: correctness, completeness, bugs, edge cases, "
-        "security issues. Be concise. Output format:\n"
-        "## Review Result: [PASS / NEEDS FIX]\n"
-        "## Issues Found:\n- ...\n"
-        "## Suggestions:\n- ...\n"
-        "If PASS, just say 'PASS — no issues found.'"
-    )
+    """Cloud-Review: Sendet Worker-Antwort + Plan zur Qualitätsprüfung an die Cloud.
+    
+    CACHING-OPTIMIERTES LAYOUT (DeepSeek KV-Cache / Moonshot 60s-Cache):
+    Die drei Action-Inputs (task, plan, response) werden in SEPARATE user-Messages
+    zerlegt statt in einen einzigen User-Prompt gemischt. So bleiben der System-Prompt,
+    die Task und der Plan als IDENTISCHER PREFIX über alle Review-Runden erhalten.
+    Nur die letzte user-Nachricht (response) ändert sich pro Runde → Cache-Hit für
+    System+Task+Plan, nur der Diff wird neu berechnet.
+    """
+    # Stable Marker-Konstanten, die zwischen allen Feedback-Runden identisch sind.
+    # Niemals f-String mit variablen Inhalten hier bauen - damit Prefix stabil bleibt.
+    task_msg = {"role": "user", "content": f"ORIGINAL TASK:\n{task}"}
+    plan_msg = {"role": "user", "content": f"EXECUTION PLAN:\n{plan or '(no plan provided)'}"}
+    response_msg = {"role": "user", "content": f"RESPONSE TO REVIEW (contains the actual changes/code):\n{response}\n\nReview now."}
 
-    # Prefer LiteLLM, fallback to Cloud Reviewer
+    # ══ FALLBACK-KETTE (Kimi → DeepSeek V4 Pro) ═════════════════════
+    # DEF-Konstante der 3-stufigen Chain (Variable muss VOR Loop gebaut sein,
+    # damit sie im except-Fall noch referenzierbar ist): Jede Stufe ist ein eigener
+    # Endpoint; bei fehlender Konfiguration (=Skip), non-200, Exception, oder
+    # leerer Content wird die nächste Stufe versucht.
+    review_chain = []
+    if CLOUD_REVIEW_ENABLED and CLOUD_REVIEW_API_KEY:
+        review_chain.append({
+            "name": "KIMI",
+            "model": CLOUD_REVIEW_MODEL,
+            "api_key": CLOUD_REVIEW_API_KEY,
+            "api_url": CLOUD_REVIEW_API_URL,
+            "timeout": CLOUD_REVIEW_TIMEOUT_SECONDS,
+        })
     if LITELLM_CLOUD_MODEL and LITELLM_CLOUD_API_KEY:
-        model = LITELLM_CLOUD_MODEL
-        api_key = LITELLM_CLOUD_API_KEY
-        api_url = LITELLM_CLOUD_API_URL
-        timeout = LITELLM_CLOUD_TIMEOUT_SECONDS
-        _log(f"  🔍 Cloud-Reviewer via LiteLLM: model={model}")
-    elif CLOUD_REVIEW_ENABLED and CLOUD_REVIEW_API_KEY:
-        model = CLOUD_REVIEW_MODEL
-        api_key = CLOUD_REVIEW_API_KEY
-        api_url = CLOUD_REVIEW_API_URL
-        timeout = CLOUD_REVIEW_TIMEOUT_SECONDS
-        _log(f"  🔍 Cloud-Reviewer via ReviewLLM: model={model}")
-    else:
+        review_chain.append({
+            "name": "DEEPSEEK-V4-PRO",
+            "model": LITELLM_CLOUD_MODEL,
+            "api_key": LITELLM_CLOUD_API_KEY,
+            "api_url": LITELLM_CLOUD_API_URL or "https://api.openai.com/v1/chat/completions",
+            "timeout": LITELLM_CLOUD_TIMEOUT_SECONDS,
+        })
+
+    if not review_chain:
         _log("  ✗ Cloud-Reviewer: Kein Cloud-Modell verfügbar")
         return {
             "agent_key": "cloud_reviewer",
@@ -1694,54 +2324,71 @@ async def _call_cloud_reviewer(
             "usage": None,
         }
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "You are a strict code reviewer. Be concise."},
-            {"role": "user", "content": prompt},
-        ],
-        "max_tokens": 4096,
-        "temperature": 0.1,
-        "stream": False,
-    }
-    _patch_moonshot_payload(payload)
-    payload = _clean_payload(payload)
-    headers = {"Authorization": f"Bearer {api_key}"}
+    started_total = time.perf_counter()
+    last_error = ""
+    for stage_idx, stage in enumerate(review_chain):
+        stage_name = stage["name"]
+        model = stage["model"]
+        api_key = stage["api_key"]
+        api_url = stage["api_url"]
+        timeout = stage["timeout"]
+        stage_label = f"[{stage_idx+1}/{len(review_chain)} {stage_name}]"
+        _log(f"  🔍 Cloud-Reviewer {stage_label}: model={model}")
 
-    started = time.perf_counter()
-    try:
-        target_url = api_url or "https://api.openai.com/v1/chat/completions"
-        async with httpx.AsyncClient(timeout=timeout) as lc:
-            r = await lc.post(target_url, json=payload, headers=headers)
-        duration = time.perf_counter() - started
-        if r.status_code == 200:
-            result = r.json()
-            content = _extract_choice_content(result)
-            _log(f"  ✓ Cloud-Reviewer OK: model={model} duration={duration:.1f}s")
-            return {
-                "agent_key": "cloud_reviewer",
-                "status": "ok",
-                "content": content or "",
-                "duration_seconds": duration,
-                "usage": result.get("usage"),
-            }
-        _log(f"  ⚠ Cloud-Reviewer STATUS {r.status_code}: duration={duration:.1f}s")
-        return {
-            "agent_key": "cloud_reviewer",
-            "status": "failed",
-            "content": "",
-            "duration_seconds": duration,
-            "usage": None,
+        # Pro Stufe ein FRISCHES Payload-Objekt (loops müssenzu nicht mutiert werden).
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": REVIEWER_SYSTEM_PROMPT},
+                task_msg,
+                plan_msg,
+                response_msg,  # ← einzige variable Message zwischen Feedback-Runden
+            ],
+            "max_tokens": 4096,
+            "temperature": 0.1,
+            "stream": False,
         }
-    except Exception as exc:
-        _log(f"  ✗ Cloud-Reviewer ERROR: model={model} – {exc}")
-        return {
-            "agent_key": "cloud_reviewer",
-            "status": "error",
-            "content": "",
-            "duration_seconds": time.perf_counter() - started,
-            "usage": None,
-        }
+        _patch_moonshot_payload(payload)
+        payload = _clean_payload(payload)
+        headers = {"Authorization": f"Bearer {api_key}"}
+
+        started = time.perf_counter()
+        try:
+            target_url = api_url or "https://api.openai.com/v1/chat/completions"
+            async with httpx.AsyncClient(timeout=timeout) as lc:
+                r = await lc.post(target_url, json=payload, headers=headers)
+            duration = time.perf_counter() - started
+            if r.status_code == 200:
+                result = r.json()
+                content = _extract_choice_content(result)
+                if content and content.strip():
+                    _log(f"  ✓ Cloud-Reviewer {stage_label} OK: model={model} duration={duration:.1f}s")
+                    return {
+                        "agent_key": "cloud_reviewer",
+                        "status": "ok",
+                        "content": content,
+                        "duration_seconds": time.perf_counter() - started_total,
+                        "usage": result.get("usage"),
+                    }
+                _log(f"  ⚠ Cloud-Reviewer {stage_label}: 200 aber content leer → nächste Stufe")
+                last_error = f"empty content ({stage_name})"
+            else:
+                _log(f"  ⚠ Cloud-Reviewer {stage_label} STATUS {r.status_code} nach {duration:.1f}s → nächste Stufe")
+                last_error = f"HTTP {r.status_code} ({stage_name}): {r.text[:200]}"
+        except Exception as exc:
+            duration = time.perf_counter() - started
+            _log(f"  ✗ Cloud-Reviewer {stage_label} ERROR nach {duration:.1f}s: {exc}")
+            last_error = f"{type(exc).__name__}: {exc} ({stage_name})"
+
+    # Alle Stufen fehlgeschlagen
+    _log(f"  ✗ Cloud-Reviewer: Alle Stufen fehlgeschlagen – letzter Fehler: {last_error}")
+    return {
+        "agent_key": "cloud_reviewer",
+        "status": "failed",
+        "content": "",
+        "duration_seconds": time.perf_counter() - started_total,
+        "usage": None,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1756,24 +2403,18 @@ def _vllm_headers() -> Dict[str, str]:
 
 
 def _patch_moonshot_payload(payload: Dict[str, Any]) -> None:
-    """Erzwingt Moonshot-kompatible Parameter (nur spezifische Werte erlaubt)."""
-    model = str(payload.get("model", ""))
+    """Erzwingt Moonshot-kompatible Parameter (nur spezifische Werte erlaubt).
     
+    Prüft NUR das Model und VLLM_API_URL — nicht die Cloud/LiteLLM URLs,
+    da sonst Moonshot-Fixes fälschlich auf DeepSeek-Calls angewendet werden."""
+    model = str(payload.get("model", ""))
     model_lower = model.lower()
     vllm_url_lower = VLLM_API_URL.lower()
-    cloud_url_lower = CLOUD_REVIEW_API_URL.lower()
-    lite_url_lower = LITELLM_CLOUD_API_URL.lower()
     
     is_moonshot = (
         "kimi" in model_lower or "moonshot" in model_lower or
-        "moonshot" in vllm_url_lower or "kimi" in vllm_url_lower or
-        "moonshot" in cloud_url_lower or "kimi" in cloud_url_lower or
-        "moonshot" in lite_url_lower or "kimi" in lite_url_lower
+        "moonshot" in vllm_url_lower or "kimi" in vllm_url_lower
     )
-    
-    _log(f"  🔍 Moonshot-check: model={model} VLLM_URL={VLLM_API_URL[:50]} "
-         f"CLOUD_URL={CLOUD_REVIEW_API_URL[:50]} "
-         f"LITELLM_URL={LITELLM_CLOUD_API_URL[:50]} is_moonshot={is_moonshot}")
     
     if not is_moonshot:
         return
@@ -1986,9 +2627,13 @@ async def _call_vllm(
                 _log(f"  🔧 Lokal/Free returned structured tool_calls: {len(tool_calls)}")
             if reasoning_content:
                 _log(f"  🧠 Lokal/Free returned reasoning_content: {len(reasoning_content)} chars")
+            # Debug: Zeige DeepSeeks Thinking + Tool-Calls
+            _debug_log_thinking({
+                "message": message, "content": _extract_choice_content(result),
+                "tool_calls": tool_calls,
+            }, agent_key)
             # reasoning_content für Folge-Requests cachen
             _cache_reasoning(tool_calls, reasoning_content)
-            _debug_log_thinking(result, agent_key)
             _log(f"  ✓ Lokal/Free OK agent_key={agent_key} duration={duration:.1f}s")
             return {
                 "agent_key": agent_key,
@@ -2199,15 +2844,22 @@ async def _run_direct_local(
 
 async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
     """
-    3-Phasen-Agenten-Workflow:
-      Phase 1: Hindsight Recall → Cloud-Planer (Caveman)
-      Phase 2: Worker führt Caveman-Plan aus
-      Phase 3: Verifikation & Self-Correction (Linter/Tests + lokales Modell)
+    3-Phasen-Agenten-Workflow mit Planner-First-Architektur:
 
-    Pipeline-Steuerflags (via Prompt-Zusätze):
-      -force planning  → Cloud-Planung erzwingen (auch wenn deaktiviert)
-      -force review    → Cloud-Review nach Worker-Ausführung erzwingen
-      -bypass worker   → Worker (80B) überspringen, Cloud antwortet direkt
+    Bei -force planning:
+      Phase 1: Cloud-Planner (Kimi K2.7) mit VOLLEN Tools exploriert Workspace
+      Phase 2: Worker (DeepSeek) führt den Plan aus
+      Phase 3: Cloud-Review (Kimi) prüft Ergebnis gegen Plan
+
+    Bei normalem Agent-Intent (ohne -force planning):
+      Phase 1: Hindsight → Cloud-Planer (Caveman, ohne Tools)
+      Phase 2: Worker führt Plan aus
+      Phase 3: Verifikation
+
+    Pipeline-Steuerflags:
+      -force planning  → Cloud-Planner als ersten Agent mit Tools
+      -force review    → Cloud-Review nach Worker-Ausführung
+      -bypass worker   → Worker überspringen, Cloud antwortet direkt
     """
     start_time = time.perf_counter()
     progress: List[str] = []
@@ -2219,7 +2871,7 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
     force_review = pflags.get("force_review", False)
     bypass_worker = pflags.get("bypass_worker", False)
 
-    # Flags aus Messages strippen bevor sie an Modelle gehen
+    # Flags aus Messages strippen
     _strip_pipeline_flags_from_messages(body.get("messages", []))
     query_clean = _last_user_text(body.get("messages", []))
 
@@ -2229,12 +2881,153 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
     if bypass_worker: flag_summary.append("bypass_worker")
     flag_str = ", ".join(flag_summary) if flag_summary else "none"
 
+    session_hash = _get_planner_session_hash(body.get("messages", []))
+    session = _PLANNER_SESSIONS.get(session_hash)
+    _cleanup_old_planner_sessions()
+
     _log(f"▶ AGENT: worker={MODEL_NAME} cloud={CLOUD_REVIEW_MODEL if CLOUD_REVIEW_ENABLED else '–'} "
          f"litellm={LITELLM_CLOUD_MODEL or '–'} messages={len(body.get('messages',[]))} "
-         f"flags=[{flag_str}]")
+         f"flags=[{flag_str}] session_state={session.get('state') if session else 'none'}")
     client = httpx.AsyncClient()
 
-    # ── Phase 1: Hindsight Recall + Cloud-Planung ──────────────────────
+    # ═══════════════════════════════════════════════════════════════════
+    # PLANNER-FIRST: Session-Tracking für Cloud-Planner als Tool-Agent
+    # ═══════════════════════════════════════════════════════════════════
+    if session and session.get("state") == "active":
+        # ── Tool-Continuation in aktiver Planner-Session ──────────────
+        planner_flags = session.get("pflags", {})
+        force_review = force_review or planner_flags.get("force_review", False)
+        bypass_worker = bypass_worker or planner_flags.get("bypass_worker", False)
+
+        # Bug-A-Fix: Iteration protokollieren - am Cap wird Planner ohne Tools
+        # gezwungen, den Plan auszugeben (Passiert IN _call_cloud_planner_agent).
+        session["iterations"] = int(session.get("iterations", 0)) + 1
+        _log(f"  🔧 Planner-Iteration {session['iterations']}/{MAX_PLANNER_ITERATIONS}")
+
+        planner_result = await _call_cloud_planner_agent(client, body)
+        results.append(planner_result)
+
+        if planner_result.get("tool_calls"):
+            # Kimi will weitere Tools → Tool-Calls an VS Code weiterleiten
+            _log("  🔧 Cloud-Planner-Agent fordert weitere Tools → Durchreiche an VS Code")
+            await client.aclose()
+            return {
+                "combined_response_text": planner_result.get("content", ""),
+                "results": [planner_result],
+                "duration_seconds": time.perf_counter() - start_time,
+            }
+
+        # Kimi hat fertig → Plan extrahieren
+        plan = planner_result.get("content", "") if planner_result.get("status") == "ok" else ""
+        if plan:
+            _log(f"  📝 Cloud-Planner hat Plan erstellt ({len(plan)} chars)")
+            _PLANNER_SESSIONS[session_hash] = {
+                "state": "done", "ts": time.time(),
+                "plan": plan, "pflags": planner_flags,
+            }
+            progress.append(_format_chat_progress_message(
+                "phase1_plan_ready",
+                f"🧠 Cloud-Planner (Kimi): Plan erstellt ({len(plan)} chars).",
+                {"duration_seconds": planner_result.get("duration_seconds")},
+            ))
+
+            # Jetzt Worker mit Plan ausführen
+            progress.append(_format_chat_progress_message(
+                "phase2_execute",
+                f"🛠️ Worker ({MODEL_NAME}) führt Plan aus.",
+                {"model": MODEL_NAME},
+            ))
+
+            worker_payload = _build_worker_payload(body, plan, "")
+            worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
+            results.append(worker_result)
+            worker_response = worker_result.get("content", "")
+
+            if worker_result.get("tool_calls") or _contains_tool_calls(worker_response):
+                _log("  🔧 Worker enthält Tool-Calls → Durchreiche an Client")
+                await client.aclose()
+                del _PLANNER_SESSIONS[session_hash]
+                _hindsight.retain(body, worker_response)
+                return {
+                    "combined_response_text": worker_response,
+                    "results": results,
+                    "duration_seconds": time.perf_counter() - start_time,
+                }
+
+            progress.append(_format_chat_progress_message(
+                "phase2_done", "Worker-Ausführung abgeschlossen.",
+                {"duration_seconds": worker_result.get("duration_seconds")},
+            ))
+
+            # Phase 3: Review mit Feedback-Loop (nur im Planner-Session-Pfad)
+            verified_response = await _review_with_feedback_loop(
+                client, body, plan, query_clean, worker_response,
+                force_review, progress, results,
+            )
+
+            del _PLANNER_SESSIONS[session_hash]
+            await client.aclose()
+
+            final = verified_response
+            if CHATTY_MODE:
+                plan_preview = plan[:2000] + ("\n...[truncated]" if len(plan) > 2000 else "")
+                final = (
+                    f"## 🧠 Cloud-Planner Plan (Kimi K2.7)\n\n{plan_preview}\n\n"
+                    f"---\n\n## 🛠️ Worker Ausführung ({MODEL_NAME})\n\n{verified_response}"
+                )
+            combined = "".join(progress) + final
+            _hindsight.retain(body, combined)
+            return {
+                "combined_response_text": combined,
+                "results": results,
+                "duration_seconds": time.perf_counter() - start_time,
+            }
+        else:
+            # Planner fehlgeschlagen → Fallback
+            _log("  ⚠ Cloud-Planner-Agent fehlgeschlagen → Fallback auf Worker direkt")
+            del _PLANNER_SESSIONS[session_hash]
+            worker_payload = _build_direct_payload(body)
+            worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
+            results.append(worker_result)
+            await client.aclose()
+            combined = "".join(progress) + worker_result.get("content", "")
+            _hindsight.retain(body, combined)
+            return {
+                "combined_response_text": combined,
+                "results": results,
+                "duration_seconds": time.perf_counter() - start_time,
+            }
+
+    elif session and session.get("state") == "done":
+        # ── Plan ready, Worker soll ausführen (nächste User-Nachricht ohne Tool-Cont) ──
+        plan = session.get("plan", "")
+        planner_flags = session.get("pflags", {})
+        force_review = force_review or planner_flags.get("force_review", False)
+
+        if plan:
+            worker_payload = _build_worker_payload(body, plan, "")
+            worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
+        else:
+            worker_payload = _build_direct_payload(body)
+            worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
+
+        results.append(worker_result)
+        worker_response = worker_result.get("content", "")
+
+        del _PLANNER_SESSIONS[session_hash]
+        await client.aclose()
+        _hindsight.retain(body, worker_response)
+        return {
+            "combined_response_text": worker_response,
+            "results": results,
+            "duration_seconds": time.perf_counter() - start_time,
+        }
+
+    # ═══════════════════════════════════════════════════════════════════
+    # STANDARD / FORCE-PLANNING: Erster Request
+    # ═══════════════════════════════════════════════════════════════════
+
+    # ── Hindsight Recall ──────────────────────────────────────────────
     memory_records = _hindsight.recall(query_clean)
     memory_context = _hindsight.format_context(memory_records)
     progress.append(_format_chat_progress_message(
@@ -2243,76 +3036,131 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         {"memory_records": len(memory_records), "networks": list(set(n for r in memory_records for n in r.networks))},
     ))
 
-    planner_result = await _call_cloud_planner(client, body, memory_context, force=force_planning)
-    results.append(planner_result)
-    plan_status = planner_result.get("status")
-    plan = planner_result.get("content", "") if plan_status == "ok" else ""
-
-    if plan_status == "ok":
+    if force_planning and CLOUD_REVIEW_ENABLED and CLOUD_REVIEW_API_KEY:
+        # ── PLANNER-FIRST: Kimi als Tool-Agent, dann Worker ──────────
+        _log("  🧠 Cloud-Planner-Agent (Kimi K2.7 mit Tools) exploriert Workspace...")
         progress.append(_format_chat_progress_message(
-            "phase1_plan_ready",
-            f"Cloud-Planer: Caveman-Plan erstellt{' (forced)' if force_planning else ''}.",
-            {"duration_seconds": planner_result.get("duration_seconds")},
+            "phase1_planner_start",
+            "🧠 Cloud-Planner (Kimi K2.7) exploriert Workspace und erstellt Plan.",
+            {"model": CLOUD_REVIEW_MODEL},
         ))
+
+        # ══ PHASE 0: User-Prompt mit Fast-Modell komprimieren ══════════
+        # User-Vision: CHEAP model compresses prompt BEFORE teure Cloud.
+        if CAVEMAN_ENABLED and len(query_clean) > 80:
+            progress.append(_format_chat_progress_message(
+                "phase0_compress", "🗜️ Phase 0: User-Prompt wird komprimiert.",
+                {"fast_model": FAST_MODEL_NAME, "original_chars": len(query_clean)},
+            ))
+            compressed = await _phase0_compress_prompt(client, query_clean)
+            # Komprimierte Version an letzte User-Message in body anhaengen
+            if compressed != query_clean:
+                msgs = body.get("messages", [])
+                for msg in reversed(msgs):
+                    if isinstance(msg, dict) and msg.get("role") == "user":
+                        orig = msg.get("content", "")
+                        if isinstance(orig, str):
+                            msg["content"] = f"{orig}\n\n[CAVEMAN-PROMPT-COMPRESSED]\n{compressed}"
+                        break
+
+        planner_result = await _call_cloud_planner_agent(client, body, memory_context, results)
+        results.append(planner_result)
+
+        if planner_result.get("tool_calls"):
+            # Kimi will Tools ausführen → an VS Code weiterleiten, Session speichern
+            _log(f"  🔧 Cloud-Planner will {len(planner_result.get('tool_calls',[]))} Tools → Session starten")
+            _PLANNER_SESSIONS[session_hash] = {
+                "state": "active", "ts": time.time(), "iterations": 1,
+                "pflags": {"force_review": force_review, "bypass_worker": bypass_worker},
+            }
+            await client.aclose()
+            return {
+                "combined_response_text": planner_result.get("content", ""),
+                "results": [planner_result],
+                "duration_seconds": time.perf_counter() - start_time,
+            }
+
+        # Kimi hat direkt einen Plan geliefert (keine Tools nötig)
+        plan = planner_result.get("content", "") if planner_result.get("status") == "ok" else ""
+        if plan:
+            _log(f"  📝 Cloud-Planner direkt: Plan ({len(plan)} chars)")
+            progress.append(_format_chat_progress_message(
+                "phase1_plan_ready",
+                f"🧠 Cloud-Planner: Plan in {planner_result.get('duration_seconds',0):.1f}s erstellt.",
+                {"duration_seconds": planner_result.get("duration_seconds")},
+            ))
+        else:
+            _log("  ⚠ Cloud-Planner lieferte keinen Plan → Fallback")
+            worker_payload = _build_direct_payload(body)
+            worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
+            results.append(worker_result)
+            await client.aclose()
+            combined = "".join(progress) + worker_result.get("content", "")
+            _hindsight.retain(body, combined)
+            return {
+                "combined_response_text": combined,
+                "results": results,
+                "duration_seconds": time.perf_counter() - start_time,
+            }
     else:
-        # Planer fehlgeschlagen → Fallback
-        fallback_reason = f"Cloud-Planer nicht verfügbar ({plan_status})."
-        if force_planning:
-            fallback_reason += " -force planning ignoriert, Fallback auf lokale Ausführung."
+        # ── Klassischer Cloud-Planer (Caveman, ohne Tools) ───────────
+        planner_result = await _call_cloud_planner(client, body, memory_context)
+        results.append(planner_result)
+        plan_status = planner_result.get("status")
+        plan = planner_result.get("content", "") if plan_status == "ok" else ""
 
-        progress.append(_format_chat_progress_message(
-            "phase1_plan_fallback",
-            f"{fallback_reason}",
-            {"status": plan_status},
-        ))
-        # Fallback: direkt lokal ausführen (mit Cloud-Fallback)
-        worker_payload = _build_direct_payload(body)
-        worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
-        results.append(worker_result)
-        await client.aclose()
-        combined = "".join(progress) + worker_result.get("content", "")
-        _hindsight.retain(body, combined)
-        return {
-            "combined_response_text": combined,
-            "results": results,
-            "duration_seconds": time.perf_counter() - start_time,
-        }
+        if plan_status == "ok":
+            progress.append(_format_chat_progress_message(
+                "phase1_plan_ready",
+                f"Cloud-Planer: Caveman-Plan erstellt.",
+                {"duration_seconds": planner_result.get("duration_seconds")},
+            ))
+        else:
+            progress.append(_format_chat_progress_message(
+                "phase1_plan_fallback",
+                f"Cloud-Planer nicht verfügbar ({plan_status}). Fallback auf lokale Ausführung.",
+                {"status": plan_status},
+            ))
+            worker_payload = _build_direct_payload(body)
+            worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
+            results.append(worker_result)
+            await client.aclose()
+            combined = "".join(progress) + worker_result.get("content", "")
+            _hindsight.retain(body, combined)
+            return {
+                "combined_response_text": combined,
+                "results": results,
+                "duration_seconds": time.perf_counter() - start_time,
+            }
 
-    # ── Phase 2: Worker (oder Cloud-Bypass) ─────────────────────────────
+    # ── Phase 2: Worker (oder Bypass) ────────────────────────────────
     if bypass_worker:
-        # ── -bypass worker: Cloud (LiteLLM/ReviewLLM) antwortet direkt ──
         _log("  ⚡ -bypass worker: Worker übersprungen, Cloud antwortet direkt")
         progress.append(_format_chat_progress_message(
             "phase2_bypass",
             f"⚡ Worker übersprungen. Cloud ({LITELLM_CLOUD_MODEL or CLOUD_REVIEW_MODEL}) antwortet direkt.",
-            {"bypass": True, "plan_len": len(plan)},
+            {"bypass": True},
         ))
-
         cloud_response = await _call_cloud_as_responder(client, body, plan, memory_context)
         results.append(cloud_response)
         worker_response = cloud_response.get("content", "")
-
         progress.append(_format_chat_progress_message(
-            "phase2_done",
-            "Cloud-Direktantwort abgeschlossen.",
-            {"status": cloud_response.get("status"), "duration_seconds": cloud_response.get("duration_seconds")},
+            "phase2_done", "Cloud-Direktantwort abgeschlossen.",
+            {"duration_seconds": cloud_response.get("duration_seconds")},
         ))
     else:
-        # ── Normaler Worker-Pfad ──────────────────────────────────────────
         progress.append(_format_chat_progress_message(
             "phase2_execute",
-            f"Worker ({MODEL_NAME}) führt Caveman-Plan aus.",
-            {"model": body.get("model", MODEL_NAME)},
+            f"Worker ({MODEL_NAME}) führt Plan aus.",
+            {"model": MODEL_NAME},
         ))
-
         worker_payload = _build_worker_payload(body, plan, memory_context)
         worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
         results.append(worker_result)
         worker_response = worker_result.get("content", "")
 
-        # Wenn der Worker Tool-Calls generiert: SOFORT raw an VS Code zurückgeben.
         if worker_result.get("tool_calls") or _contains_tool_calls(worker_response):
-            _log("  🔧 Worker enthält Tool-Calls/DSML → sofort Durchreiche an Client")
+            _log("  🔧 Worker enthält Tool-Calls → Durchreiche an Client")
             await client.aclose()
             _hindsight.retain(body, worker_response)
             return {
@@ -2322,80 +3170,23 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             }
 
         progress.append(_format_chat_progress_message(
-            "phase2_done",
-            "Worker-Ausführung abgeschlossen.",
-            {"status": worker_result.get("status"), "duration_seconds": worker_result.get("duration_seconds")},
+            "phase2_done", "Worker-Ausführung abgeschlossen.",
+            {"duration_seconds": worker_result.get("duration_seconds")},
         ))
 
-    # ── Phase 3: Verifikation & Self-Correction ────────────────────────
-    # -force review: Cloud-Review nach Worker-Ausführung
+    # ── Phase 3: Review mit Feedback-Loop ────────────────────────────
     if force_review and not bypass_worker:
-        # Cloud-Review der Worker-Antwort
-        _log("  🔍 -force review: Cloud-Review der Worker-Antwort")
-        progress.append(_format_chat_progress_message(
-            "phase3_cloud_review",
-            "🔍 Cloud-Review: Worker-Antwort wird von Cloud geprüft.",
-            {},
-        ))
-        cloud_review_result = await _call_cloud_reviewer(client, query_clean, worker_response)
-        if cloud_review_result.get("status") == "ok":
-            review_text = cloud_review_result.get("content", "")
-            if review_text:
-                worker_response = f"{worker_response}\n\n---\n## 🔍 Cloud Review\n{review_text}"
-            progress.append(_format_chat_progress_message(
-                "phase3_review_done",
-                "Cloud-Review abgeschlossen.",
-                {"status": "ok"},
-            ))
-        else:
-            progress.append(_format_chat_progress_message(
-                "phase3_review_failed",
-                f"Cloud-Review fehlgeschlagen: {cloud_review_result.get('status')}",
-                {"status": cloud_review_result.get("status")},
-            ))
-        verified_response = worker_response
-        verify_info = {"stage": "cloud_review", "status": cloud_review_result.get("status")}
+        verified_response = await _review_with_feedback_loop(
+            client, body, plan, query_clean, worker_response,
+            force_review, progress, results,
+        )
     else:
-        # Standard-Verifikation (Linter/Tests + lokales Modell)
-        progress.append(_format_chat_progress_message(
-            "phase3_verify",
-            "Phase 3: Linter/Tests + Self-Correction.",
-            {},
-        ))
-
-        verified_response, verify_info = await _verify_and_correct(client, query_clean, worker_response)
-        progress.append(_format_chat_progress_message(
-            "phase3_done",
-            f"Verifikation: {verify_info.get('stage', 'unknown')}",
-            verify_info,
-        ))
+        verified_response, _ = await _verify_and_correct(client, query_clean, worker_response)
 
     await client.aclose()
+    _hindsight.retain(body, verified_response)
 
-    # ── Tool-Calls aus Cloud-Plan filtern (Planer hat keine Tools) ────
-    if _contains_tool_calls(plan):
-        _log("  ⚠ Cloud-Plan enthält Tool-Calls → wird gefiltert")
-        plan = re.sub(r'<[^>]+>.*?</[^>]+>', '', plan, flags=re.DOTALL).strip()
-
-    # ── Antwort zusammenbauen ──────────────────────────────────────────
-    has_tools = _contains_tool_calls(worker_response)
-    if has_tools:
-        _log("  🔧 Worker/Cloud enthält Tool-Calls → raw Durchreiche an Client")
-        combined = worker_response
-    elif CHATTY_MODE and planner_result.get("status") == "ok":
-        source_label = LITELLM_CLOUD_MODEL or CLOUD_REVIEW_MODEL if bypass_worker else MODEL_NAME
-        phase_label = "☁️ Cloud-Direktantwort" if bypass_worker else "🛠️ Lokale Umsetzung"
-        final_response = (
-            f"## 🧭 Caveman Cloud Plan\n\n{plan}\n\n"
-            f"---\n\n"
-            f"## {phase_label} ({source_label})\n\n{verified_response}"
-        )
-        combined = "".join(progress) + final_response
-    else:
-        final_response = verified_response
-        combined = "".join(progress) + final_response
-    _hindsight.retain(body, combined)
-
+    combined = "".join(progress) + verified_response
     return {
         "combined_response_text": combined,
         "results": results,
@@ -2465,31 +3256,38 @@ async def _stream_events(request: Request, body: Dict[str, Any]) -> AsyncIterato
     
     if tool_calls:
         # ── STRUKTURIERTE TOOL_CALLS STREAMING (OpenAI-Format) ──
-        # WICHTIG: Wir senden ALLE tool_calls mit VOLLSTÄNDIGEN arguments in EINEM
-        # kombinierten Delta-Chunk. Der Grund: VS Code Copilot akkumuliert
-        # Tool-Call-Arguments über mehrere Chunks hinweg und konkateniert sie
-        # dabei fälschlicherweise, wenn jede Tool-Call-ID ihre Arguments als
-        # Ganzes in einem separaten Chunk erhält. Mit einem einzigen Delta
-        # werden alle Tool-Calls atomar verarbeitet – kein Accumulation-Bug.
+        # Bei Tool-Calls KEINE Summary anhängen (würde Format brechen)
         stream_id = f"chatcmpl-spark-{uuid.uuid4().hex}"
-
-        # Normalisieren: arguments immer als JSON-String sicherstellen
-        all_tcs = _normalize_tool_calls(tool_calls)
-        # IDs und type ergänzen (falls vom Upstream nicht mitgeliefert)
-        for tc in all_tcs:
-            if not tc.get("id"):
-                tc["id"] = f"call_{uuid.uuid4().hex}"
-            if not tc.get("type"):
-                tc["type"] = "function"
-
-        # 1. Kombinierter Chunk: role + ALLE tool_calls mit VOLLEN arguments
-        #    + reasoning_content (muss im ersten Delta sein für DeepSeek)
+        
+        # 1. KOMBINIERTER Role+Header-Chunk (OpenAI-Standard):
+        #    role + content=null + tool_calls[{id, type, function:{name, arguments:""}}]
+        #    reasoning_content MUSS im ersten Delta sein.
+        first_tcs = []
+        for i, tc in enumerate(tool_calls):
+            func = tc.get("function", {})
+            first_tcs.append({
+                "index": i,
+                "id": tc.get("id", f"call_{uuid.uuid4().hex}"),
+                "type": "function",
+                "function": {
+                    "name": func.get("name", ""),
+                    "arguments": "",
+                },
+            })
         yield _format_openai_stream_chunk(
-            model, include_role=True, tool_calls=all_tcs,
+            model, include_role=True, tool_calls=first_tcs,
             reasoning_content=reasoning_content, chunk_id=stream_id,
         )
 
-        # 2. Finaler Chunk mit finish_reason='tool_calls' (leeres delta {})
+        # 2. Arguments für jeden Tool-Call als separater Chunk
+        for i, tc in enumerate(tool_calls):
+            args = tc.get("function", {}).get("arguments", "")
+            if args:
+                yield _format_openai_stream_chunk(model, tool_calls=[
+                    {"index": i, "function": {"arguments": args}},
+                ], chunk_id=stream_id)
+
+        # 3. Finaler Chunk mit finish_reason='tool_calls' (leeres delta)
         yield _format_openai_stream_chunk(model, finish_reason="tool_calls", chunk_id=stream_id)
     else:
         # ── NORMALES TEXT-STREAMING ──
@@ -2880,8 +3678,8 @@ async def chat_completions(request: Request):
     body["model"] = MODEL_NAME
 
     msgs = body.get("messages", [])
-    _debug_log_request(body)
     _log(f"📨 Request: {len(msgs)} messages, stream={body.get('stream')}, tool_cont={_is_tool_continuation(msgs)}")
+    _debug_log_request(body)
 
     if body.get("stream"):
         return StreamingResponse(
