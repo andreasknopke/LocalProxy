@@ -678,6 +678,11 @@ def _strip_pipeline_flags_from_messages(messages: List[Dict[str, Any]]) -> List[
             if isinstance(content, str):
                 cleaned, _ = _extract_pipeline_flags(content)
                 msg["content"] = cleaned
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        cleaned, _ = _extract_pipeline_flags(block.get("text", ""))
+                        block["text"] = cleaned
     return messages
 
 
@@ -686,6 +691,71 @@ def _last_user_text(messages: Sequence[Dict[str, Any]]) -> str:
         if isinstance(msg, dict) and msg.get("role") == "user":
             return _message_text(msg)
     return ""
+
+
+def _has_pipeline_flag(messages: Sequence[Dict[str, Any]], flag: str) -> bool:
+    """Prüft ob ein bestimmtes Pipeline-Flag in den Messages gesetzt ist."""
+    text = _last_user_text(messages)
+    _, flags = _extract_pipeline_flags(text)
+    return flags.get(flag, False)
+
+
+def _debug_log_request(body: Dict[str, Any]) -> None:
+    """Loggt detailliert, was Copilot an den Proxy sendet."""
+    msgs = body.get("messages", [])
+    tools = body.get("tools", [])
+    tool_choice = body.get("tool_choice")
+
+    # Tool-Defs
+    tool_names = [t.get("function", {}).get("name", "?") for t in tools] if tools else []
+    _log(f"🔍 DEBUG REQUEST: {len(msgs)} messages, {len(tool_names)} tools={tool_names}, "
+         f"tool_choice={tool_choice}, stream={body.get('stream')}")
+
+    # Letzte 5 Messages (Rolle + Länge + erste 300 Zeichen)
+    for i, m in enumerate(msgs[-5:], len(msgs)-4):
+        role = m.get("role", "?")
+        content = _message_text(m)
+        name = m.get("name", "")
+        tool_call_id = m.get("tool_call_id", "")
+        extra = f" name={name}" if name else ""
+        extra += f" tc_id={tool_call_id[:20]}" if tool_call_id else ""
+        content_preview = content[:300].replace("\n", "\\n")
+        _log(f"  [{i}] {role}{extra}: len={len(content)} | {content_preview}")
+
+    # System-Prompt: Tool-Defs aus System-Message extrahieren
+    for m in msgs:
+        if m.get("role") == "system":
+            sys_text = _message_text(m)
+            # Zeilen mit function/tool patterns finden
+            tool_lines = [l for l in sys_text.split("\n") if "function" in l.lower() or "tool" in l.lower()][:20]
+            if tool_lines:
+                _log(f"  🛠️ System-Prompt Tool-Lines ({len(tool_lines)}):")
+                for tl in tool_lines[:10]:
+                    _log(f"    {tl[:200]}")
+            break
+
+
+def _debug_log_thinking(result: Dict[str, Any], agent_key: str) -> None:
+    """Loggt DeepSeeks Thinking/Reasoning aus der Response."""
+    message = result.get("message") or {}
+    reasoning = message.get("reasoning_content", "")
+    content = result.get("content", "")
+    tool_calls = result.get("tool_calls")
+
+    if reasoning:
+        _log(f"  🧠 DEEPSEEK THINKING ({agent_key}, {len(reasoning)} chars):")
+        # Letzte 2000 Zeichen (da kommt meist die Schlussfolgerung)
+        tail = reasoning[-2000:] if len(reasoning) > 2000 else reasoning
+        for line in tail.replace("\r", "").split("\n")[-30:]:
+            _log(f"    {line[:250]}")
+
+    if tool_calls:
+        for i, tc in enumerate(tool_calls):
+            func = tc.get("function", {})
+            _log(f"  🔧 TOOL-CALL[{i}]: {func.get('name')}({func.get('arguments','')[:300]})")
+
+    if not reasoning and not tool_calls and content:
+        _log(f"  📝 RESPONSE ({agent_key}, {len(content)} chars): {content[:500].replace(chr(10),' ')}")
 
 
 def _compact_messages(messages: Sequence[Dict[str, Any]], max_messages: int = 12) -> List[Dict[str, Any]]:
@@ -730,12 +800,20 @@ def _extract_choice_message(result: Dict[str, Any]) -> Dict[str, Any]:
     if not choices:
         return {}
     message = choices[0].get("message", {})
-    return message if isinstance(message, dict) else {}
+    if not isinstance(message, dict):
+        return {}
+    # Qwen3/Aeon: wenn content null ist, aber reasoning existiert → reasoning als content verwenden
+    # (passiert bei --reasoning-parser qwen3 ohne reasoning_effort=none)
+    if message.get("content") is None and message.get("reasoning"):
+        message = dict(message)
+        message["content"] = message["reasoning"]
+        message["reasoning"] = None
+    return message
 
 
 def _extract_choice_content(result: Dict[str, Any]) -> str:
     message = _extract_choice_message(result)
-    content = message.get("content", "")
+    content = message.get("content")
     return content or ""
 
 
@@ -816,15 +894,17 @@ def _classify_intent_deterministic(text: str) -> Optional[str]:
 
 
 def _is_tool_continuation(messages: Sequence[Dict[str, Any]]) -> bool:
-    """Erkennt ob dieser Request eine Tool-Ausführungs-Fortsetzung ist."""
-    for msg in messages:
-        if msg.get("role") in ("tool", "function"):
-            return True
-        # Cline/Roo senden tool_result als eigenen role-Typ oder als Content
-        if msg.get("role") == "user" and isinstance(msg.get("content"), list):
-            for block in msg["content"]:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    return True
+    """True nur wenn Modell aktiv Tool-Calls verarbeitet:
+    - Letzte Message ist assistant mit tool_calls (Modell hat Tools requested)
+    - Letzte Message ist tool (Client hat soeben Tool-Resultate zurückgeschickt)
+    NICHT: wenn irgendwo in der History mal ein Tool vorkam."""
+    if not messages:
+        return False
+    last = messages[-1]
+    if isinstance(last, dict) and last.get("role") == "tool":
+        return True
+    if isinstance(last, dict) and last.get("role") == "assistant" and bool(last.get("tool_calls")):
+        return True
     return False
 
 
@@ -841,6 +921,34 @@ def _contains_tool_calls(text: str) -> bool:
         or "｜｜invoke" in text
         or "<｜｜DSML｜｜tool_calls>" in text
     )
+
+
+def _normalize_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
+    """Normalisiert Tool-Calls: stellt sicher, dass arguments ein JSON-String ist.
+    
+    Manche vLLM-Backends (z.B. bestimmte DeepSeek-Versionen) liefern arguments
+    bereits als geparstes dict zurück. Das führt zu Inkonsistenzen beim Streaming
+    (VS Code Copilot erwartet arguments zwingend als String).
+    """
+    if not tool_calls or not isinstance(tool_calls, list):
+        return []
+    normalized = []
+    for i, tc in enumerate(tool_calls):
+        if not isinstance(tc, dict):
+            continue
+        tc_copy = dict(tc)
+        func = tc_copy.get("function", {})
+        if isinstance(func, dict):
+            func_copy = dict(func)
+            args = func_copy.get("arguments")
+            if isinstance(args, dict):
+                func_copy["arguments"] = json.dumps(args, ensure_ascii=False)
+            elif not isinstance(args, str) and args is not None:
+                func_copy["arguments"] = str(args)
+            tc_copy["function"] = func_copy
+        tc_copy["index"] = i
+        normalized.append(tc_copy)
+    return normalized
 
 
 def _classify_intent(messages: Sequence[Dict[str, Any]]) -> str:
@@ -1196,10 +1304,11 @@ def _build_response_payload(
         if r.get("reasoning_content") and reasoning_found is None:
             reasoning_found = r.get("reasoning_content")
         if r.get("tool_calls"):
+            normalized_tcs = _normalize_tool_calls(r.get("tool_calls"))
             message = {
                 "role": "assistant",
                 "content": r.get("content") or None,
-                "tool_calls": r.get("tool_calls"),
+                "tool_calls": normalized_tcs,
             }
             if reasoning_found:
                 message["reasoning_content"] = reasoning_found
@@ -1879,6 +1988,7 @@ async def _call_vllm(
                 _log(f"  🧠 Lokal/Free returned reasoning_content: {len(reasoning_content)} chars")
             # reasoning_content für Folge-Requests cachen
             _cache_reasoning(tool_calls, reasoning_content)
+            _debug_log_thinking(result, agent_key)
             _log(f"  ✓ Lokal/Free OK agent_key={agent_key} duration={duration:.1f}s")
             return {
                 "agent_key": agent_key,
@@ -2355,38 +2465,31 @@ async def _stream_events(request: Request, body: Dict[str, Any]) -> AsyncIterato
     
     if tool_calls:
         # ── STRUKTURIERTE TOOL_CALLS STREAMING (OpenAI-Format) ──
-        # Bei Tool-Calls KEINE Summary anhängen (würde Format brechen)
+        # WICHTIG: Wir senden ALLE tool_calls mit VOLLSTÄNDIGEN arguments in EINEM
+        # kombinierten Delta-Chunk. Der Grund: VS Code Copilot akkumuliert
+        # Tool-Call-Arguments über mehrere Chunks hinweg und konkateniert sie
+        # dabei fälschlicherweise, wenn jede Tool-Call-ID ihre Arguments als
+        # Ganzes in einem separaten Chunk erhält. Mit einem einzigen Delta
+        # werden alle Tool-Calls atomar verarbeitet – kein Accumulation-Bug.
         stream_id = f"chatcmpl-spark-{uuid.uuid4().hex}"
-        
-        # 1. Role-Chunk: assistant + content=null + reasoning_content
-        #    reasoning_content MUSS im ersten Delta sein, damit VS Code es in der
-        #    History speichert – sonst fehlt es beim nächsten DeepSeek-Request → 400.
-        yield _format_openai_stream_chunk(model, include_role=True, reasoning_content=reasoning_content, chunk_id=stream_id)
-        
-        # 2. Tool-Call Header-Chunk: id + type + function.name (leere arguments)
-        first_tcs = []
-        for i, tc in enumerate(tool_calls):
-            func = tc.get("function", {})
-            first_tcs.append({
-                "index": i,
-                "id": tc.get("id", f"call_{uuid.uuid4().hex}"),
-                "type": "function",
-                "function": {
-                    "name": func.get("name", ""),
-                    "arguments": "",
-                },
-            })
-        yield _format_openai_stream_chunk(model, tool_calls=first_tcs, chunk_id=stream_id)
 
-        # 3. Arguments für jeden Tool-Call als separater Chunk
-        for i, tc in enumerate(tool_calls):
-            args = tc.get("function", {}).get("arguments", "")
-            if args:
-                yield _format_openai_stream_chunk(model, tool_calls=[
-                    {"index": i, "function": {"arguments": args}},
-                ], chunk_id=stream_id)
+        # Normalisieren: arguments immer als JSON-String sicherstellen
+        all_tcs = _normalize_tool_calls(tool_calls)
+        # IDs und type ergänzen (falls vom Upstream nicht mitgeliefert)
+        for tc in all_tcs:
+            if not tc.get("id"):
+                tc["id"] = f"call_{uuid.uuid4().hex}"
+            if not tc.get("type"):
+                tc["type"] = "function"
 
-        # 4. Finaler Chunk mit finish_reason='tool_calls' (leeres delta)
+        # 1. Kombinierter Chunk: role + ALLE tool_calls mit VOLLEN arguments
+        #    + reasoning_content (muss im ersten Delta sein für DeepSeek)
+        yield _format_openai_stream_chunk(
+            model, include_role=True, tool_calls=all_tcs,
+            reasoning_content=reasoning_content, chunk_id=stream_id,
+        )
+
+        # 2. Finaler Chunk mit finish_reason='tool_calls' (leeres delta {})
         yield _format_openai_stream_chunk(model, finish_reason="tool_calls", chunk_id=stream_id)
     else:
         # ── NORMALES TEXT-STREAMING ──
@@ -2777,6 +2880,7 @@ async def chat_completions(request: Request):
     body["model"] = MODEL_NAME
 
     msgs = body.get("messages", [])
+    _debug_log_request(body)
     _log(f"📨 Request: {len(msgs)} messages, stream={body.get('stream')}, tool_cont={_is_tool_continuation(msgs)}")
 
     if body.get("stream"):
