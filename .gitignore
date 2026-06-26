@@ -18,7 +18,6 @@ secrets/
 __pycache__/
 *.pyc
 test_results_*.jsonl
-localproxy-patch/test_results_*.jsonl
 
 # venvs
 .venv/

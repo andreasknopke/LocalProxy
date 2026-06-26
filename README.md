@@ -363,3 +363,58 @@ Das Dashboard ermöglicht die grafische Konfiguration aller Proxy-Einstellungen:
 | ✅ **Verifikation** | Lint- und Test-Befehle für Phase 3 |
 
 Die Konfiguration wird in `config.json` gespeichert und beim nächsten Neustart geladen (Env-Variablen haben Vorrang).
+
+## Docker-Deployment (Coolify)
+
+Der Proxy kann einfach als Docker-Container auf **Coolify** (oder jedem anderen Docker-Host) deployed werden.
+
+### Schnellstart
+
+```bash
+docker build -t localproxy .
+docker run -d --name localproxy \
+  -p 9001:9001 \
+  -e PROXY_AUTH_ENABLED=false \
+  -e VLLM_API_URL=http://192.168.1.100:8000/v1/chat/completions \
+  -e MODEL_NAME="Qwen/Qwen3-Next-80B-Chat-mxfp4" \
+  localproxy
+```
+
+### Coolify-Konfiguration
+
+| Einstellung | Wert |
+|-------------|------|
+| **Build Pack** | `Dockerfile` |
+| **Port** | `9001` |
+| **Healthcheck** | `/healthz` → wird automatisch via `HEALTHCHECK`-Instruction geprüft |
+
+Alle Umgebungsvariablen aus der [Konfigurationstabelle](#konfiguration) können in Coolify unter **Environment Variables** gesetzt werden.
+
+### docker-compose.yml (für Qdrant + Proxy)
+
+```yaml
+version: "3.8"
+services:
+  localproxy:
+    build: .
+    ports:
+      - "9001:9001"
+    environment:
+      - PROXY_AUTH_ENABLED=false
+      - VLLM_API_URL=http://192.168.1.100:8000/v1/chat/completions
+      - MODEL_NAME=Qwen/Qwen3-Next-80B-Chat-mxfp4
+      - HINDSIGHT_USE_QDRANT=true
+      - QDRANT_URL=http://qdrant:6333
+    depends_on:
+      - qdrant
+
+  qdrant:
+    image: qdrant/qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+volumes:
+  qdrant_storage:
+```
