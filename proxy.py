@@ -123,6 +123,12 @@ CAVEMAN_SYSTEM_PROMPT: str = (
 )
 CAVEMAN_MAX_TOKENS: int = int(os.getenv("CAVEMAN_MAX_TOKENS", "8192"))
 
+# ── Tool-Result-Capping ────────────────────────────────────────────────────
+# Verhindert Token-Bombing, wenn VS Code riesige Tool-Results (z.B. 111KB grep
+# auf level_data.json) an den Proxy returniert. Tool-Messages im Payload werden
+# nach TOOL_RESULT_CAP chars hart abgeschnitten (+ TRUNCATED marker).
+TOOL_RESULT_CAP: int = int(os.getenv("TOOL_RESULT_CAP", "8000"))
+
 # ── Hindsight / Qdrant ─────────────────────────────────────────────────────
 HINDSIGHT_ENABLED: bool = os.getenv("HINDSIGHT_ENABLED", "true").lower() in {"1", "true", "yes", "y", "on"}
 QDRANT_URL: str = os.getenv("QDRANT_URL", "http://localhost:6333")
@@ -319,6 +325,18 @@ def _detect_planner_loop(session: Dict[str, Any]) -> Optional[str]:
         if len(recent_sigs) <= 2:
             return f"stagnation: {len(recent_sigs)} distinct tools in last 6 rounds"
 
+    # ── Exploration-only-Loop (NEW, 2024): viele Runden, viele Files
+    #    erkundet, aber KEIN Plan-Output bisher. Das ist das klassische
+    #    Kimi-Kreisen: tiefer Eintauchen in Files, ohne jemals zur
+    #    Konklusion zu kommen. Forciere Plan-Output.
+    if iterations >= 8 and len(distinct_files) >= 5:
+        # Hat Kimi jemals "Plan" in Content geschrieben? → dann ist es kein
+        # Endless-Loop sondern tiefere Exploration.
+        contents = session.get("assistant_contents") or []
+        if not any("## plan:" in str(c).lower()[:200] for c in contents[-4:]):
+            return (f"exploration-only-loop: {iterations} rounds, "
+                    f"{len(distinct_files)} distinct files, no plan yet")
+
     # ── Panik-Tripwire: ARBITRARY HARD-CAP nur noch reiner Safety-Net
     if iterations >= MAX_PLANNER_ITERATIONS:
         return f"hard-tripwire: {iterations}/{MAX_PLANNER_ITERATIONS}"
@@ -457,6 +475,11 @@ def _apply_config_file() -> None:
     global CAVEMAN_ENABLED, CAVEMAN_MAX_TOKENS
     CAVEMAN_ENABLED = bool(cfg.get("caveman", {}).get("enabled", CAVEMAN_ENABLED))
     CAVEMAN_MAX_TOKENS = int(cfg.get("tokens", {}).get("caveman_max_tokens", CAVEMAN_MAX_TOKENS))
+
+    # Tool-Result-Cap (verhindert Token-Bombing)
+    global TOOL_RESULT_CAP
+    TOOL_RESULT_CAP = int(cfg.get("tokens", {}).get("tool_result_cap", TOOL_RESULT_CAP))
+    _log(f"  ✂ TOOL_RESULT_CAP = {TOOL_RESULT_CAP} chars (pro tool-result-message)")
 
     # Hindsight
     global HINDSIGHT_ENABLED, QDRANT_URL, QDRANT_API_KEY, HINDSIGHT_COLLECTION
@@ -1638,6 +1661,45 @@ def _build_direct_payload(
     return _clean_payload(payload, keep_tools=True)
 
 
+def _cap_tool_results_inplace(messages: List[Dict[str, Any]], label: str = "Payload") -> int:
+    """Kappt Tool-Result-Messages in-place auf TOOL_RESULT_CAP chars.
+
+    Verhindert Token-Bombing: Wenn VS Code 111KB grep_hits an den Proxy
+    zurückschickt, würde der gesamte Payload explodieren. Diese Funktion
+    geht jede 'role:tool'-Message durch und kappt content auf TOOL_RESULT_CAP
+    (default 8000) chars plus einen TRUNCATED-Marker.
+
+    Behandelt string und multimodal (list-of-parts) content.
+
+    Returns:
+        Anzahl gekappter Messages (für Logging).
+    """
+    capped_count = 0
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") != "tool":
+            continue
+        content = m.get("content")
+        if isinstance(content, str) and len(content) > TOOL_RESULT_CAP:
+            cut = len(content) - TOOL_RESULT_CAP
+            m["content"] = content[:TOOL_RESULT_CAP] + f"\n...[TRUNCATED by proxy: {cut} chars cut]"
+            capped_count += 1
+        elif isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "text":
+                    continue
+                txt = part.get("content") or part.get("text") or ""
+                if isinstance(txt, str) and len(txt) > TOOL_RESULT_CAP:
+                    new_txt = txt[:TOOL_RESULT_CAP] + "\n...[TRUNCATED by proxy]"
+                    if "content" in part:
+                        part["content"] = new_txt
+                    else:
+                        part["text"] = new_txt
+                    capped_count += 1
+    if capped_count:
+        _log(f"  ✂ {label}-Payload: {capped_count} Tool-Results auf {TOOL_RESULT_CAP} chars gekappt")
+    return capped_count
+
+
 def _build_worker_payload(
     body: Dict[str, Any],
     plan: str,
@@ -1679,6 +1741,11 @@ def _build_worker_payload(
     payload["stream"] = False
 
     messages = list(payload.get("messages", []))
+
+    # ══ Tool-Result-Truncation (NEU): verhindert Token-Bombing ════════
+    # Wenn VS Code riesige Tool-Results (z.B. 111KB grep_hits) zurückschickt,
+    # explodiert der Payload. Cap hart auf TOOL_RESULT_CAP chars pro Tool-Msg.
+    _cap_tool_results_inplace(messages, "Worker")
 
     # ══ reasoning_content von Kimi-Seite entfernen ════════════════════
     removed = _strip_kimi_reasoning(messages)
@@ -2499,6 +2566,232 @@ async def _phase0_compress_prompt(
         return user_text
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Planner-Payload-Konstruktion (Task-zentriert, Recap-basiert ab Runde 2)
+# ═══════════════════════════════════════════════════════════════════════════
+# Warum eigene Logik statt einfach body weiterzureichen?
+#
+# In VSCode-Copilot-Chatsessions wächst die Historie. In Runde 15+ sieht
+# die "letzte" User-Message für Kimi so aus:
+#   [tool] grep_search_98: 100 matches, 111039 chars
+# Dazwischenliegen 14 tool-results. Der ursprüngliche Task ("Mach einen
+# Plan für Feature X") ist im Verlauf begraben. Kimi hat keinen Anker,
+# was es eigentlich tun soll → sucht weiter.
+#
+# Lösung: Aktive Tool-Continuation-Runden kriegen einen EIGENEN Planner-
+# Payload, der aus 4 Teilen besteht:
+#   1. Planner-System ("You are a planner, EXPLORE then PLAN")
+#   2. USER-TASK als eigene user-message an oberster Stelle
+#   3. EXPLORATION RECAP: "You have already done 17 rounds. Tools you ran: …"
+#   4. Tool-Continuation: Die 2 letzten tool-results UND der von Kimi
+#      gewünschte nächste Tool-Call (als assistant-message mit tool_calls)
+#
+# So weiß Kimi in Runde N: was ist mein Auftrag, was habe ich schon,
+# was ist der nächste Schritt. Kein plan-begraben-in-Rauschen mehr.
+
+
+def _extract_original_task(messages: Sequence[Dict[str, Any]]) -> str:
+    """Findet die ursprüngliche User-Query (task) in der History.
+
+    Strategie: die ERSTE User-Message, die nicht leer ist und nicht
+    reiner Pipeline-Flag-Text ist. Falls VS Code zusätzlichen System-
+    Prime führt, wird dieser übersprungen.
+    """
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        text = _message_text(msg)
+        # Pipeline-Flags strippen
+        cleaned, flags = _extract_pipeline_flags(text)
+        # Avatars/system-prime-text überspringen: mins 15 chars nach Flag-clean
+        if len(cleaned.strip()) < 12:
+            continue
+        return cleaned.strip()
+    return ""
+
+
+def _summarize_exploration(messages: Sequence[Dict[str, Any]], max_items: int = 25) -> str:
+    """Baut ein kompaktes Recap aller tool-Aktivitäten in der Historie.
+
+    Beispiel-Output:
+      EXPLORATION RECAP (so far): 17 rounds, 18 distinct tools, 21 files inspected.
+      Tools executed: read_file (12×), grep_search (4×), list_dir (2×)
+      Files seen:
+        - d:/foo/bar.py
+        - d:/baz/qux.py
+        ...
+      Last tool result: <truncated 400 chars>
+    """
+    tool_results: List[Tuple[str, str]] = []
+    tool_call_names: List[str] = []
+    files_seen: List[str] = []
+    last_tool_result_preview: str = ""
+
+    tool_pattern_file_keys = ("filepath", "filename", "filepath_relative",
+                               "path", "includepattern", "uri")
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "assistant":
+            tcs = msg.get("tool_calls")
+            if isinstance(tcs, list):
+                for tc in tcs:
+                    if not isinstance(tc, dict):
+                        continue
+                    func = tc.get("function") or {}
+                    name = str(func.get("name", "?")).lower()
+                    tool_call_names.append(name)
+                    # File-Ref extrahieren
+                    args_raw = func.get("arguments", "")
+                    try:
+                        args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw if isinstance(args_raw, dict) else {})
+                    except Exception:
+                        args = {}
+                    for k, v in args.items():
+                        if k.lower() in tool_pattern_file_keys and v:
+                            ref = f"{name}:{str(v)[:120]}"
+                            if ref not in files_seen:
+                                files_seen.append(ref)
+        elif role == "tool":
+            tn = str(msg.get("name", "") or "tool")[:40]
+            content = _message_text(msg)
+            tool_results.append((tn, content))
+            if content:
+                last_tool_result_preview = content
+
+    if not tool_call_names:
+        return ""
+
+    # Tool-Nutzung aggregieren
+    from collections import Counter
+    counter = Counter(tool_call_names)
+    tool_summary = ", ".join(f"{name} ({n}×)" for name, n in counter.most_common())
+
+    lines = [
+        f"EXPLORATION RECAP — you have already done {len(tool_call_names)} tool-calls "
+        f"across {len(files_seen)} distinct files/queries.",
+        f"Tools executed so far: {tool_summary}",
+    ]
+    if files_seen:
+        shown = files_seen[:max_items]
+        lines.append("Files/queries inspected (most recent first):")
+        for ref in shown:
+            lines.append(f"  - {ref}")
+        if len(files_seen) > max_items:
+            lines.append(f"  ... and {len(files_seen) - max_items} more.")
+    if last_tool_result_preview:
+        preview = last_tool_result_preview[:400].replace("\n", " ")
+        lines.append(f"LAST tool result (truncated, 400 chars): {preview}")
+    return "\n".join(lines)
+
+
+def _build_planner_tool_continuation_context(
+    body: Dict[str, Any],
+    session: Dict[str, Any],
+    original_task: str,
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Baut einen KOMPRAKTIERTEN Planner-Payload für Runde N+1 (Tool-Cont.)
+
+    Anstatt dem Kimi die volle 200+ Message-History (inklusive 111KB
+    grep-Treffern) vorzuwerfen, kriegt es einen fokussierten Payload:
+
+      [system] Planner-Contract
+      [user]   ORIGINAL_TASK
+      [user]   EXPLORATION RECAP + nudge "du hast genug gesehen → PLAN"
+      [assistant] (last assistant with tool_calls — die Anweisung von Kimi
+                                  wurde hierfür bereits von VS Code ausgeführt)
+      [tool..] (last 2 tool results, jeweils gekappt auf 1000 chars)
+
+    Hinweis: 'tools'-Schemas werden mitgegeben (filtered, read-only).
+    """
+    messages = body.get("messages", [])
+    iterations = int(session.get("iterations", 0))
+    distinct_files_count = len(session.get("distinct_files") or [])
+
+    # Planner-Contract-System (klar und trennscharf vom Worker).
+    planner_system = (
+        "You are a STRATEGIC PLANNING AGENT. You have access to VS Code tools. "
+        "Your job: EXPLORE the workspace, UNDERSTAND the user's task, then "
+        "PRODUCE AN EXECUTION PLAN in Markdown.\n\n"
+        "Rules:\n"
+        "1. EXPLORE while you need more info (read_file, grep_search, list_dir).\n"
+        "2. STOP exploring as soon as you have enough context.\n"
+        "3. Then OUTPUT a Plan: format `## Plan: <title>` + numbered steps.\n"
+        "   - 10-20 concrete steps, each with file path + WHAT to change + WHY.\n"
+        "   - Max 4000 chars total. Use terse caveman compression.\n"
+        "   - DO NOT write the code. The worker implements it.\n"
+        "4. If a tool result is unhelpful (e.g. empty matches), DO NOT retry "
+        "the same tool with the same args — change strategy or move on.\n"
+    )
+
+    new_messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": planner_system},
+        {"role": "user", "content": f"USER TASK (do not lose sight of this):\n{original_task}"},
+    ]
+
+    # Exploration-Recap als user-message, mit explorations-bedingtem nudge
+    recap = _summarize_exploration(messages, max_items=25)
+    if recap:
+        # Nudge nach ausreichender Exploration, Härte steigt mit iterations
+        nudge = ""
+        if iterations >= 8 and distinct_files_count >= 5:
+            nudge = (
+                "\n\n⚠️ You have done many rounds of exploration. The workspace is sufficiently "
+                "understood now. STOP calling tools. OUTPUT THE PLAN NOW."
+            )
+        elif iterations >= 4:
+            nudge = (
+                "\n\nℹ️ You have explored enough. If you have enough context, output the plan. "
+                "Only call another tool if truly necessary."
+            )
+        new_messages.append({"role": "user", "content": recap + nudge})
+
+    # Letzte assistant.tool_calls-Message übernehmen (Kimi hatte diese in
+    # voriger Runde generiert, VS Code hat sie ausgeführt → jetzt sind die
+    # tool-results da). Das ist tools/passthrough-essential.
+    last_assistant_with_tools: Optional[Dict[str, Any]] = None
+    last_tool_results: List[Dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            last_assistant_with_tools = msg  # immer letzte merken
+        elif msg.get("role") == "tool":
+            last_tool_results.append(msg)
+
+    if last_assistant_with_tools:
+        # content leeren (pure tool_calls), um Token-Bombing zu vermeiden
+        clean_assistant = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": last_assistant_with_tools.get("tool_calls", []),
+        }
+        new_messages.append(clean_assistant)
+
+    # Letzte 2 tool-results anhängen, jeweils gekappt auf 1000 chars.
+    # WICHTIG: Original-tool_call_id beibehalten, sonst gibt's später
+    # mismatch wenn VS Code seine Antworten injiziert.
+    for tr in last_tool_results[-2:]:
+        body_tr = dict(tr)
+        content = body_tr.get("content", "")
+        if isinstance(content, str) and len(content) > 1000:
+            body_tr["content"] = content[:1000] + "\n...[TRUNCATED]"
+        new_messages.append(body_tr)
+
+    new_payload = copy.deepcopy(body)
+    new_payload["messages"] = new_messages
+    # tools beibehalten (read-only subset) — caller muss schon filtern
+    if tools is not None:
+        new_payload["tools"] = tools
+    new_payload["stream"] = False
+    new_payload["max_tokens"] = min(CAVEMAN_MAX_TOKENS, 65536)
+    new_payload["temperature"] = 0.2
+    return new_payload
+
+
 async def _call_cloud_planner_agent(
     client: httpx.AsyncClient,
     body: Dict[str, Any],
@@ -2522,42 +2815,77 @@ async def _call_cloud_planner_agent(
 
     _log(f"  🧠 Cloud-Planner-Agent: model={CLOUD_REVIEW_MODEL} url={CLOUD_REVIEW_API_URL}")
 
-    # Payload mit VOLLEN VS Code Tools bauen
-    payload = copy.deepcopy(body)
-    payload["model"] = CLOUD_REVIEW_MODEL
-    payload["max_tokens"] = min(CAVEMAN_MAX_TOKENS, 65536)
-    payload["temperature"] = 0.2
-    payload["stream"] = False
-
-    # System-Prompt: Planner-Agent mit Caveman-Output
-    planner_system = (
-        "You are a STRATEGIC PLANNING AGENT. You have FULL access to VS Code tools: "
-        "read_file, search_code, list_dir, run_terminal, and all other tools. "
-        "Your job: EXPLORE the workspace thoroughly, understand the codebase, "
-        "then produce a DETAILED EXECUTION PLAN in Markdown. "
-        "THE PLAN (your final output, no tools):\n"
-        "- 10-20 concrete steps\n"
-        "- Each step: WHAT file, WHAT change, WHY\n"
-        "- Reference specific file paths and line numbers\n"
-        "- CRITICAL: Use EXTREME CAVEMAN COMPRESSION. Terse symbols, no prose.\n"
-        "- Format: `## Plan: <title>`, numbered list, symbols -> ! ? FIX TODO RISK\n"
-        "- Max 4000 chars total. Every word must earn its place.\n"
-        "- DO NOT write code. The worker will implement.\n"
+    # ══ DETECT: Runde 1 (Initial) vs. Runde N+ (Tool-Continuation) ══
+    # Runde 1: 'body' kommt direkt vom standard/force_planning-Pfad. Die
+    #   History ist klein und enthält den User-Task als letzte user-message.
+    #   → klassischer Payload-Build (volles body, system-suffix).
+    # Runde N+: 'body' kommt vom Tool-Continuation-Zweig. Die History ist
+    #   gewuchert (teilweise 100K+ chars tool-results). Stattdessen:
+    #   Recap-basierter Planner-Payload (Task voran, Recap der Exploration).
+    body_messages = body.get("messages", [])
+    body_sh = _get_planner_session_hash(body_messages)
+    body_session = _PLANNER_SESSIONS.get(body_sh)
+    is_tool_continuation = (
+        body_session is not None
+        and body_session.get("state") == "active"
+        and int(body_session.get("iterations", 0)) >= 2
     )
-    # Original System-Prompt mit Tool-Defs MIT ANHÄNGEN (Kimi braucht die Tool-Schemas)
-    messages = list(payload.get("messages", []))
-    if messages and messages[0].get("role") == "system":
-        messages[0]["content"] = str(messages[0].get("content", "")) + "\n\n" + planner_system
-    else:
-        messages.insert(0, {"role": "system", "content": planner_system})
-    payload["messages"] = messages
 
-    # Memory-Kontext an letzte User-Message anhängen
-    if memory_context:
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                msg["content"] = str(msg.get("content", "")) + f"\n\n[HINDSIGHT]\n{memory_context}"
-                break
+    if is_tool_continuation:
+        # ══ RUNDE N+ Recap-Payload ══
+        original_task = _extract_original_task(body_messages)
+        if not original_task:
+            # Fallback: gesamte letzte user-message
+            original_task = _last_user_text(body_messages) or "(no task identified)"
+        _log(f"  🎯 Planner-Recap-Modus (round {body_session.get('iterations')}): "
+             f"task='{original_task[:80]}...'")
+        payload = _build_planner_tool_continuation_context(
+            body=body,
+            session=body_session,
+            original_task=original_task,
+            tools=None,  # wird später gefiltert
+        )
+    else:
+        # ══ RUNDE 1: Klassischer Payload ══
+        # Payload mit VOLLEN VS Code Tools bauen
+        payload = copy.deepcopy(body)
+        payload["model"] = CLOUD_REVIEW_MODEL
+        payload["max_tokens"] = min(CAVEMAN_MAX_TOKENS, 65536)
+        payload["temperature"] = 0.2
+        payload["stream"] = False
+
+        # System-Prompt: Planner-Agent mit Caveman-Output
+        planner_system = (
+            "You are a STRATEGIC PLANNING AGENT. You have FULL access to VS Code tools: "
+            "read_file, search_code, list_dir, run_terminal, and all other tools. "
+            "Your job: EXPLORE the workspace thoroughly, understand the codebase, "
+            "then produce a DETAILED EXECUTION PLAN in Markdown. "
+            "THE PLAN (your final output, no tools):\n"
+            "- 10-20 concrete steps\n"
+            "- Each step: WHAT file, WHAT change, WHY\n"
+            "- Reference specific file paths and line numbers\n"
+            "- CRITICAL: Use EXTREME CAVEMAN COMPRESSION. Terse symbols, no prose.\n"
+            "- Format: `## Plan: <title>`, numbered list, symbols -> ! ? FIX TODO RISK\n"
+            "- Max 4000 chars total. Every word must earn its place.\n"
+            "- DO NOT write code. The worker will implement.\n"
+        )
+        # Original System-Prompt mit Tool-Defs MIT ANHÄNGEN (Kimi braucht die Tool-Schemas)
+        messages = list(payload.get("messages", []))
+        # Tool-Result-Truncation (gleiche Logik wie _build_worker_payload)
+        _cap_tool_results_inplace(messages, "Planner-R1")
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = str(messages[0].get("content", "")) + "\n\n" + planner_system
+        else:
+            messages.insert(0, {"role": "system", "content": planner_system})
+        payload["messages"] = messages
+
+        # Memory-Kontext an letzte User-Message anhängen (nur Runde 1 sinnvoll —
+        # im Recap-Modus ist 'messages' oben neu aufgebaut ohne_HISTORY).
+        if memory_context:
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    msg["content"] = str(msg.get("content", "")) + f"\n\n[HINDSIGHT]\n{memory_context}"
+                    break
 
     # tools/tool_choice aus Original behalten
     payload = _clean_payload(payload, keep_tools=True)
@@ -2578,10 +2906,13 @@ async def _call_cloud_planner_agent(
             payload.pop("tool_choice", None)
 
     # 2) LOOP-DETECTION (ersetzt arbitrary Iteration-Cap):
-    #    Prüfe Session-Historie auf WIRKLICHE Loops. Nur dann Plan erzwingen.
+    #    Prüft Session-Historie auf WIRKLICHE Loops. Nur dann Plan erzwingen.
     #    Legitime Exploration (verschiedene Tools/Files) darf unbegrenzt weiterlaufen.
+    #    ACHTUNG: triggert auch im Recap-Modus, weil die tool-signaturen aus der
+    #    body-session-iteration stammen.
     sh = _get_planner_session_hash(payload.get("messages", []))
-    existing_session = _PLANNER_SESSIONS.get(sh)
+    existing_session = _PLANNER_SESSIONS.get(sh) or body_session
+    cur_messages = payload.get("messages", [])
     if existing_session:
         loop_reason = _detect_planner_loop(existing_session)
         if loop_reason:
@@ -2589,24 +2920,24 @@ async def _call_cloud_planner_agent(
             _log(f"  🛑 Planner LOOP erkannt ({loop_reason}, iter={iteration}) → erzwinge Plan-Output")
             payload.pop("tools", None)
             payload.pop("tool_choice", None)
-            if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
+            if cur_messages and isinstance(cur_messages[-1], dict) and cur_messages[-1].get("role") == "user":
                 force_msg = (
                     "\n\n[SYSTEM: Du scheinst in einer Schleife zu sein "
                     f"({loop_reason}). Gib JETZT deinen finalen Ausfuehrungs-Plan aus. "
                     "KEINE weiteren tool_calls. Format: '## Plan: <title>' + "
                     "numbered steps. Max 4000 chars.]"
                 )
-                user_content = messages[-1].get("content", "")
+                user_content = cur_messages[-1].get("content", "")
                 if isinstance(user_content, str):
-                    messages[-1]["content"] = user_content + force_msg
+                    cur_messages[-1]["content"] = user_content + force_msg
         else:
             # Sanfter Nudge nach ausreichender Exploration (kein Hard-Stop)
             warn = _should_warn_planner(existing_session)
             if warn:
-                if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
-                    user_content = messages[-1].get("content", "")
+                if cur_messages and isinstance(cur_messages[-1], dict) and cur_messages[-1].get("role") == "user":
+                    user_content = cur_messages[-1].get("content", "")
                     if isinstance(user_content, str) and warn not in user_content:
-                        messages[-1]["content"] = user_content + f"\n\n{warn}"
+                        cur_messages[-1]["content"] = user_content + f"\n\n{warn}"
 
     # ══ FALLBACK-KETTE (Kimi → DeepSeek V4 Pro) ═════════════════════
     # DEF-Strategie: Probiere primär Kimi (CLOUD_REVIEW_*). Bei non-200,
@@ -3415,6 +3746,21 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
                 session["distinct_files"] = files_set
             for r in refs:
                 files_set.add(r)
+
+        # Exploration-only-Loop-Detection: Assistent-Content (von Kimi's
+        # voriger Runde) mitschreiben, damit _detect_planner_loop '## plan'
+        # erkennen kann. Wir nehmen den Content aus der LETZEN assistant-msg.
+        last_assistant_content = ""
+        for m in reversed(body.get("messages", [])):
+            if isinstance(m, dict) and m.get("role") == "assistant":
+                last_assistant_content = _message_text(m) or ""
+                break
+        if last_assistant_content:
+            contents_list = session.setdefault("assistant_contents", [])
+            contents_list.append(last_assistant_content[:400])
+            # nur letzte 6 Inhalte halten
+            if len(contents_list) > 6:
+                del contents_list[:len(contents_list) - 6]
 
         session["iterations"] = int(session.get("iterations", 0)) + 1
         sig_count = len(session.get("tool_signatures") or [])
