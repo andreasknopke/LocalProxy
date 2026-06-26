@@ -10,6 +10,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # App-Code kopieren
 COPY proxy.py webui.py config.json* ./
 
+# Datenverzeichnis für persistenten Storage (config.json, Logs, Memory)
+# Über Coolify Storage als Volume auf /app/data mounten
+RUN mkdir -p /app/data
+
 # Port für Coolify freigeben
 EXPOSE 9001
 

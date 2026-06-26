@@ -390,6 +390,28 @@ docker run -d --name localproxy \
 
 Alle Umgebungsvariablen aus der [Konfigurationstabelle](#konfiguration) können in Coolify unter **Environment Variables** gesetzt werden.
 
+> **⚠️ Wichtig — Env-Vars als Source of Truth:**
+> Die Umgebungsvariablen haben **immer Vorrang** vor der WebUI-Konfiguration.
+> Das WebUI schreibt in `config.json` — in Docker ist das ein **ephemeraler Filespace**,
+> der bei jedem Redeploy gelöscht wird. **Env-Vars in Coolify sind die richtige und dauerhafte
+> Konfigurationsmethode.** API-Keys, die nur via WebUI eingegeben wurden, gehen beim Restart verloren.
+>
+> **💾 Storage-Mount für Coolify:**
+> Damit WebUI-Änderungen dauerhaft sind, in Coolify unter **Storage** → **New mount**:
+> - **Source Path:** z.B. `/var/lib/coolify/proxy-data` (ein Verzeichnis auf dem Docker-Host)
+> - **Destination Path:** `/app/data`
+>
+> Nach dem ersten Speichern via WebUI liegt die Konfiguration unter `/app/data/config.json`
+> und bleibt auch nach Redeploy erhalten. Gleicher Ordner enthält `proxy.log` und `.hindsight_memory/`.
+
+> **💡 Tipp — LiteLLM-Modellnamen ohne Provider-Prefix:**
+> In Coolify-Envs `LITELLM_CLOUD_MODEL` **ohne** `deepseek/`-Prefix setzen, da der Proxy
+> direkt per HTTPX (ohne LiteLLM-Library) an die DeepSeek-API sendet:
+> - ✅ `LITELLM_CLOUD_MODEL=deepseek-v4-pro`
+> - ❌ `LITELLM_CLOUD_MODEL=deepseek/deepseek-v4-pro`
+>
+> Die LiteLLM-Library benötigt den Prefix (`deepseek/`), der HTTPX-Direktaufruf nicht.
+
 ### docker-compose.yml (für Qdrant + Proxy)
 
 ```yaml
@@ -405,6 +427,13 @@ services:
       - MODEL_NAME=Qwen/Qwen3-Next-80B-Chat-mxfp4
       - HINDSIGHT_USE_QDRANT=true
       - QDRANT_URL=http://qdrant:6333
+      # LiteLLM ohne Provider-Prefix (HTTPX-Direktmodus)
+      - LITELLM_CLOUD_MODEL=deepseek-v4-pro
+      - LITELLM_CLOUD_API_KEY=sk-...
+      - LITELLM_CLOUD_API_URL=https://api.deepseek.com/v1/chat/completions
+    volumes:
+      # Daten persistent machen (config.json, Logs, Hindsight Memory)
+      - localproxy_data:/app/data
     depends_on:
       - qdrant
 
@@ -417,4 +446,5 @@ services:
 
 volumes:
   qdrant_storage:
+  localproxy_data:
 ```

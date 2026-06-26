@@ -209,11 +209,11 @@ DISPLAY_NAMES: Dict[str, str] = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Config-Datei-Loader (überschreibt Env-Variablen, falls config.json existiert)
+# Config-Datei-Loader — Env-Vars haben IMMER Vorrang (wichtig für Coolify Docker)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _apply_config_file() -> None:
-    """Lädt config.json und überschreibt Modul-Variablen (niedrigere Priorität als Env)."""
+    """Lädt config.json — Env-Vars überschreiben config.json (höchste Priorität)."""
     if not _WEBUI_AVAILABLE:
         return
     try:
@@ -231,9 +231,9 @@ def _apply_config_file() -> None:
         VLLM_API_URL = cfg.get("models", {}).get("vllm_api_url", VLLM_API_URL)
     if not os.getenv("VLLM_MODELS_URL"):
         VLLM_MODELS_URL = cfg.get("models", {}).get("vllm_models_url", VLLM_MODELS_URL)
-    # API-Keys: config.json überschreibt Env — WebUI-Speicherung soll immer wirken
+    # API-Keys: Env hat Vorrang (wichtig für Coolify Docker, wo config.json ephemeral ist)
     ak = cfg.get("models", {}).get("vllm_api_key", "")
-    if ak:
+    if ak and not os.getenv("VLLM_API_KEY"):
         VLLM_API_KEY = ak
     if not os.getenv("MODEL_NAME"):
         MODEL_NAME = cfg.get("models", {}).get("model_name", MODEL_NAME)
@@ -246,9 +246,9 @@ def _apply_config_file() -> None:
         PROXY_PORT = cfg.get("proxy", {}).get("port", PROXY_PORT)
     if not os.getenv("PROXY_AUTH_ENABLED"):
         PROXY_AUTH_ENABLED = cfg.get("proxy", {}).get("auth_enabled", PROXY_AUTH_ENABLED)
-    # Proxy-Auth: config.json überschreibt Env (WebUI-Save wirkt)
+    # Proxy-Auth: Env hat Vorrang (Coolify Docker)
     pk = cfg.get("proxy", {}).get("api_key", "")
-    if pk:
+    if pk and not os.getenv("PROXY_API_KEY"):
         PROXY_API_KEY = pk
     if not os.getenv("CHATTY_MODE"):
         CHATTY_MODE = cfg.get("proxy", {}).get("chatty_mode", CHATTY_MODE)
@@ -260,9 +260,9 @@ def _apply_config_file() -> None:
         CLOUD_REVIEW_ENABLED = cfg.get("cloud", {}).get("enabled", CLOUD_REVIEW_ENABLED)
     if not os.getenv("CLOUD_REVIEW_API_URL"):
         CLOUD_REVIEW_API_URL = cfg.get("cloud", {}).get("api_url", CLOUD_REVIEW_API_URL)
-    # Cloud API-Key: config.json überschreibt Env (WebUI-Save wirkt)
+    # Cloud API-Key: Env hat Vorrang (Coolify Docker)
     ck = cfg.get("cloud", {}).get("api_key", "")
-    if ck:
+    if ck and not os.getenv("CLOUD_REVIEW_API_KEY"):
         CLOUD_REVIEW_API_KEY = ck
     if not os.getenv("CLOUD_REVIEW_MODEL"):
         CLOUD_REVIEW_MODEL = cfg.get("cloud", {}).get("model", CLOUD_REVIEW_MODEL)
@@ -276,9 +276,9 @@ def _apply_config_file() -> None:
     global LITELLM_CLOUD_MAX_TOKENS, LITELLM_CLOUD_TIMEOUT_SECONDS
     if not os.getenv("LITELLM_CLOUD_MODEL"):
         LITELLM_CLOUD_MODEL = cfg.get("litellm", {}).get("model", LITELLM_CLOUD_MODEL)
-    # LiteLLM API-Key: config.json überschreibt Env (WebUI-Save wirkt)
+    # LiteLLM API-Key: Env hat Vorrang (Coolify Docker)
     lk = cfg.get("litellm", {}).get("api_key", "")
-    if lk:
+    if lk and not os.getenv("LITELLM_CLOUD_API_KEY"):
         LITELLM_CLOUD_API_KEY = lk
     if not os.getenv("LITELLM_CLOUD_API_URL"):
         LITELLM_CLOUD_API_URL = cfg.get("litellm", {}).get("api_url", LITELLM_CLOUD_API_URL)
@@ -316,9 +316,9 @@ def _apply_config_file() -> None:
         HINDSIGHT_ENABLED = cfg.get("hindsight", {}).get("enabled", HINDSIGHT_ENABLED)
     if not os.getenv("QDRANT_URL"):
         QDRANT_URL = cfg.get("hindsight", {}).get("qdrant_url", QDRANT_URL)
-    # Qdrant API-Key: config.json überschreibt Env (WebUI-Save wirkt)
+    # Qdrant API-Key: Env hat Vorrang (Coolify Docker)
     qk = cfg.get("hindsight", {}).get("qdrant_api_key", "")
-    if qk:
+    if qk and not os.getenv("QDRANT_API_KEY"):
         QDRANT_API_KEY = qk
     if not os.getenv("HINDSIGHT_COLLECTION"):
         HINDSIGHT_COLLECTION = cfg.get("hindsight", {}).get("collection", HINDSIGHT_COLLECTION)
@@ -1714,6 +1714,16 @@ async def _call_cloud_via_litellm(body: Dict[str, Any], memory_context: str) -> 
     try:
         # Wenn eine API-URL gesetzt ist, direkt per httpx (funktioniert für opencode.ai etc.)
         if LITELLM_CLOUD_API_URL:
+            # LiteLLM-Provider-Prefix entfernen (z.B. "deepseek/deepseek-v4-pro" → "deepseek-v4-pro")
+            # Die LiteLLM-Library braucht den Prefix, die direkte API versteht ihn nicht.
+            model_name = LITELLM_CLOUD_MODEL
+            if "/" in model_name and not model_name.startswith("http"):
+                parts = model_name.split("/", 1)
+                known_prefixes = {"deepseek", "openai", "openrouter", "anthropic", "google", "groq", "together", "mistral", "perplexity", "claude"}
+                if parts[0].lower() in known_prefixes:
+                    _log(f"  ℹ️  Stripped LiteLLM prefix '{parts[0]}' from model name: '{model_name}' → '{parts[1]}'")
+                    model_name = parts[1]
+            payload["model"] = model_name
             async with httpx.AsyncClient(timeout=LITELLM_CLOUD_TIMEOUT_SECONDS) as lc:
                 r = await lc.post(LITELLM_CLOUD_API_URL, json=payload, headers=headers)
             duration = time.perf_counter() - started

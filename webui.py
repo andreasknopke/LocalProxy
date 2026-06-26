@@ -22,7 +22,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 # Config-Datei
 # ═══════════════════════════════════════════════════════════════════════════
 
-CONFIG_PATH = Path(os.getenv("LOCALPROXY_CONFIG", "config.json"))
+CONFIG_PATH = Path(os.getenv("LOCALPROXY_CONFIG", "data/config.json"))
 LOG_FILE = os.getenv("LOG_FILE", str(Path(__file__).parent / "proxy.log"))
 
 
