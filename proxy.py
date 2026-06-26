@@ -205,7 +205,8 @@ _PLANNER_SESSIONS: Dict[str, Dict[str, Any]] = {}
 #
 # Detector-Historie wird beim Start jeder neuen Planner-Session zurückgesetzt.
 MAX_PLANNER_ITERATIONS = 60       # Soft-Tripwire (ehemals 8, jetzt Panik-Schutz)
-PLANNER_REPEAT_HARD_STOP = 2      # Bei N identischen (name,args)-Wiederholungen → Plan erzwingen
+PLANNER_REPEAT_HARD_STOP = 3      # Bei N identischen (name,args)-Wiederholungen in Folge → Plan erzwingen
+                                  # (3 statt 2: read(x)→read(x) kann legitim sein; 3x = echter Loop)
 PLANNER_WARN_AFTER = 12           # Ab Iteration M: sanfter System-Hinweis "bald plan ausgeben"
 PLANNER_DISTINCT_WARN_AFTER = 18  # Ab Iteration M mit kaum Fortschritt: stärkere Warnung
 
@@ -3170,13 +3171,32 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         # Loop-Detection: statt blinden Counter, letzte Tool-Requests tracken.
         # Die Tool-Resultate (vorige Runde) sind in der History (letzter 'tool'-Eintrag).
         # Wir extrahieren die vorigen tool_calls aus der Message-History.
+        #
+        # BUGFIX (Runde-2-Fehlalarm): _extract_last_assistant_tool_calls liefert
+        # bei jeder Tool-Continuation DIESELBEN assistant-Tool-Calls zurück, die
+        # schon bei Session-Creation als first_sigs gespeichert wurden. Ohne ID-
+        # Deduplikation würde Runde 2 den Runde-1-Call ein zweites Mal appenden
+        # → 'exact-repeat x2' → sofortiger Fehl-Loop-Alarm.
+        # Lösung: seen_tool_call_ids pro Session tracken, nur NEUE Calls aufnehmen.
         prev_tool_calls = _extract_last_assistant_tool_calls(body.get("messages", []))
-        if prev_tool_calls:
+        seen_ids = session.setdefault("seen_tool_call_ids", set())
+        if isinstance(seen_ids, list):  # defensive (JSON-Restore aus set)
+            seen_ids = set(seen_ids)
+            session["seen_tool_call_ids"] = seen_ids
+        new_calls: List[Dict[str, Any]] = []
+        for tc in prev_tool_calls:
+            tc_id = (tc.get("id") if isinstance(tc, dict) else "") or ""
+            if tc_id and tc_id in seen_ids:
+                continue
+            if tc_id:
+                seen_ids.add(tc_id)
+            new_calls.append(tc)
+        if new_calls:
             sigs = session.setdefault("tool_signatures", [])
-            for tc in prev_tool_calls:
+            for tc in new_calls:
                 sigs.append(_tool_signature(tc))
             # Fortschritts-Metrik: neue File-Refs hinzufügen
-            refs = _extract_tool_file_refs(prev_tool_calls)
+            refs = _extract_tool_file_refs(new_calls)
             files_set = session.setdefault("distinct_files", set())
             if isinstance(files_set, list):  # defensive (json can't serialize set)
                 files_set = set(files_set)
@@ -3374,12 +3394,15 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             first_calls = planner_result.get("tool_calls", []) or []
             first_sigs = [_tool_signature(tc) for tc in first_calls]
             first_refs = _extract_tool_file_refs(first_calls)
+            first_ids = {tc.get("id", "") for tc in first_calls
+                         if isinstance(tc, dict) and tc.get("id")}
             _log(f"  🔧 Cloud-Planner will {len(first_calls)} Tools → Session starten "
-                 f"(initial signatures: {len(first_sigs)})")
+                 f"(initial signatures: {len(first_sigs)}, ids: {len(first_ids)})")
             _PLANNER_SESSIONS[session_hash] = {
                 "state": "active", "ts": time.time(), "iterations": 1,
                 "tool_signatures": first_sigs,
                 "distinct_files": set(first_refs),
+                "seen_tool_call_ids": first_ids,
                 "pflags": {"force_review": force_review, "bypass_worker": bypass_worker},
             }
             await client.aclose()
