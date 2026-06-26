@@ -215,8 +215,71 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 
+# Mapping: Env-Variable → (config-Sektion, config-Key)
+# Wird NUR beim erstmaligen Erzeugen von config.json verwendet.
+_ENV_TO_CONFIG: Dict[str, Tuple[str, str]] = {
+    "VLLM_API_URL": ("models", "vllm_api_url"),
+    "VLLM_MODELS_URL": ("models", "vllm_models_url"),
+    "VLLM_API_KEY": ("models", "vllm_api_key"),
+    "MODEL_NAME": ("models", "model_name"),
+    "FAST_MODEL_NAME": ("models", "fast_model_name"),
+    "PROXY_PORT": ("proxy", "port"),
+    "PROXY_AUTH_ENABLED": ("proxy", "auth_enabled"),
+    "PROXY_API_KEY": ("proxy", "api_key"),
+    "CHATTY_MODE": ("proxy", "chatty_mode"),
+    "CLOUD_REVIEW_ENABLED": ("cloud", "enabled"),
+    "CLOUD_REVIEW_API_URL": ("cloud", "api_url"),
+    "CLOUD_REVIEW_API_KEY": ("cloud", "api_key"),
+    "CLOUD_REVIEW_MODEL": ("cloud", "model"),
+    "CLOUD_REVIEW_MAX_TOKENS": ("cloud", "max_tokens"),
+    "CLOUD_REVIEW_TIMEOUT_SECONDS": ("cloud", "timeout_seconds"),
+    "LITELLM_CLOUD_MODEL": ("litellm", "model"),
+    "LITELLM_CLOUD_API_KEY": ("litellm", "api_key"),
+    "LITELLM_CLOUD_API_URL": ("litellm", "api_url"),
+    "LITELLM_CLOUD_MAX_TOKENS": ("litellm", "max_tokens"),
+    "LITELLM_CLOUD_TIMEOUT_SECONDS": ("litellm", "timeout_seconds"),
+    "DIRECT_MAX_TOKENS": ("tokens", "direct_max_tokens"),
+    "SUB_AGENT_MAX_TOKENS": ("tokens", "agent_max_tokens"),
+    "SUB_AGENT_TIMEOUT_SECONDS": ("tokens", "sub_agent_timeout_seconds"),
+    "VERIFY_TIMEOUT_SECONDS": ("tokens", "verify_timeout_seconds"),
+    "CAVEMAN_ENABLED": ("caveman", "enabled"),
+    "CAVEMAN_MAX_TOKENS": ("tokens", "caveman_max_tokens"),
+    "HINDSIGHT_ENABLED": ("hindsight", "enabled"),
+    "QDRANT_URL": ("hindsight", "qdrant_url"),
+    "QDRANT_API_KEY": ("hindsight", "qdrant_api_key"),
+    "HINDSIGHT_USE_QDRANT": ("hindsight", "use_qdrant"),
+    "HINDSIGHT_COLLECTION": ("hindsight", "collection"),
+    "HINDSIGHT_EMBEDDING_DIM": ("hindsight", "embedding_dim"),
+    "HINDSIGHT_MAX_MEMORY_TOKENS": ("hindsight", "max_memory_tokens"),
+    "HINDSIGHT_MIN_SIMILARITY": ("hindsight", "min_similarity"),
+    "HINDSIGHT_RETAIN_DELAY_SECONDS": ("hindsight", "retain_delay_seconds"),
+    "HINDSIGHT_DIR": ("hindsight", "dir"),
+    "VERIFY_ENABLED": ("verify", "enabled"),
+    "VERIFY_LINT_COMMAND": ("verify", "lint_command"),
+    "VERIFY_TEST_COMMAND": ("verify", "test_command"),
+    "MCP_ENABLED": ("mcp", "enabled"),
+}
+
+
+def _env_to_config_val(env_val: str, default_val: Any) -> Any:
+    """Konvertiert einen Env-Var-String in den passenden Typ."""
+    if isinstance(default_val, bool):
+        return env_val.lower() in {"1", "true", "yes", "y", "on"}
+    if isinstance(default_val, int):
+        try:
+            return int(env_val)
+        except (ValueError, TypeError):
+            return default_val
+    if isinstance(default_val, float):
+        try:
+            return float(env_val)
+        except (ValueError, TypeError):
+            return default_val
+    return env_val
+
+
 def _load_config() -> Dict[str, Any]:
-    """Lädt Config aus JSON-Datei, merged mit Defaults."""
+    """Lädt Config aus JSON-Datei. Falls nicht vorhanden, aus Env-Vars erzeugen."""
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
     if CONFIG_PATH.exists():
         try:
@@ -225,6 +288,18 @@ def _load_config() -> Dict[str, Any]:
             _deep_merge(cfg, saved)
         except (json.JSONDecodeError, OSError):
             pass
+        return cfg
+
+    # config.json existiert nicht → aus Env-Vars + Defaults erzeugen
+    for env_name, (section, key) in _ENV_TO_CONFIG.items():
+        val = os.environ.get(env_name)
+        if val is not None:
+            default_val = DEFAULT_CONFIG.get(section, {}).get(key)
+            cfg[section][key] = _env_to_config_val(val, default_val)
+
+    # Neu erzeugte Config sofort speichern (überschreibt sich beim nächsten WebUI-Save)
+    _save_config(cfg)
+    _log(f"📝 config.json aus Env-Vars erzeugt: {CONFIG_PATH}")
     return cfg
 
 
