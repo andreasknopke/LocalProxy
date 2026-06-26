@@ -170,14 +170,34 @@ VERIFY_TEST_COMMAND: str = os.getenv("VERIFY_TEST_COMMAND", "")
 # Wenn -force planning aktiv: Cloud-Planner (Kimi K2.7) wird zum vollwertigen
 # VS Code Sub-Agent mit Tools. Er exploriert den Workspace und erstellt einen
 # detaillierten Caveman-Plan, den der Worker dann ausführt.
-_PLANNER_SESSIONS: Dict[str, Dict[str, Any]] = {}  # hash → {"state":"active"|"done", "plan":"...", "pflags":{...}}
+_PLANNER_SESSIONS: Dict[str, Dict[str, Any]] = {}
+# Session-Struktur: {
+#   "state": "active"|"done",
+#   "iterations": int,                       # Anzahl bisheriger Tool-Runden
+#   "tool_signatures": List[str],            # ["grep_search|<hash>", ...] in Reihenfolge
+#   "distinct_files": Set[str],              # Dateien, die read/grep'd wurden → Fortschritts-Metrik
+#   "plan": "...", "pflags": {...}, "ts": float
+# }
 
-# ── Planner-Iteration-Cap (Bug-A-Fix: Endlos-Tool-Loop) ──────────────
-# Cloud-Planner (Kimi) darf maximal MAX_PLANNER_ITERATIONS Runden Tools
-# ausfuehren. Danach wird er via System-Aufforderung gezwungen, den Plan
-# (ohne weitere tool_calls) auszugeben - sonst wuerde er sich endlos
-# versuchen, mehr zu explorieren.
-MAX_PLANNER_ITERATIONS = 8
+# ── Planner-Loop-Detection (Replace für arbitrary Cap) ──────────────
+# FRÜHER: Hard-Cap bei 8 Iterationen → hat legittime Exploration großer
+#         Workspaces abgebrochen (jeder tool_cont zählte als volle Iteration).
+# JETZT: Signature-basierte Loop-Erkennung. Ein echter Endlos-Loop liegt nur
+#         vor, wenn Kimi dasselbe Tool mit denselben Argumenten WIEDERHOLT.
+#
+# Strategie (3-stufig):
+#   1) REPEAT-Detection: Tool-Signaturen (name, arg_hash) werden in der
+#      Session gespeichert. Echter Loop = identische Signatur 2x hintereinander.
+#   2) EXACT-REPEAT Hard-Stop: 2x identischer `(name, args)` → Plan erzwingen.
+#      Verhindert die klassische "No matches found" → gleiches grep nochmal Loop.
+#   3) SOFT-CAP (PLANNER_SOFT_CAP): Sehr hoher Sicherheits-Tripwire, nur
+#      wenn Kimi völlig außer Kontrolle gerät.
+#
+# Detector-Historie wird beim Start jeder neuen Planner-Session zurückgesetzt.
+MAX_PLANNER_ITERATIONS = 60       # Soft-Tripwire (ehemals 8, jetzt Panik-Schutz)
+PLANNER_REPEAT_HARD_STOP = 2      # Bei N identischen (name,args)-Wiederholungen → Plan erzwingen
+PLANNER_WARN_AFTER = 12           # Ab Iteration M: sanfter System-Hinweis "bald plan ausgeben"
+PLANNER_DISTINCT_WARN_AFTER = 18  # Ab Iteration M mit kaum Fortschritt: stärkere Warnung
 
 def _get_planner_session_hash(messages: Sequence[Dict[str, Any]]) -> str:
     """Hash aus der ersten User-Message (ohne Flags) für Session-Tracking."""
@@ -193,6 +213,151 @@ def _cleanup_old_planner_sessions(max_age_seconds: float = 600) -> None:
     stale = [h for h, s in _PLANNER_SESSIONS.items() if now - s.get("ts", 0) > max_age_seconds]
     for h in stale:
         del _PLANNER_SESSIONS[h]
+
+
+# ── Loop-Detection-Helpers (Signature-basiert) ───────────────────────────
+def _tool_signature(tool_call: Dict[str, Any]) -> str:
+    """Erzeugt eine stabile Signatur für einen Tool-Call: 'name|arg_hash'.
+
+   VERSCHIEDENE Tool-Namen, gleiche Args → verschiedene Signatur.
+    GLEICHE Tool-Name, verschiedene Args → verschiedene Signatur.
+    Nur exakt identisch (name+args) → gleiche Signatur → echter Loop.
+    """
+    func = tool_call.get("function") or {} if isinstance(tool_call, dict) else {}
+    name = str(func.get("name", "?"))
+    args_raw = func.get("arguments", "")
+    try:
+        # JSON-String → dict → kanonischer sortierter String → Hash
+        if isinstance(args_raw, str):
+            args_dict = json.loads(args_raw) if args_raw.strip() else {}
+        elif isinstance(args_raw, dict):
+            args_dict = args_raw
+        else:
+            args_dict = {"_raw": str(args_raw)}
+        canonical = json.dumps(args_dict, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        canonical = str(args_raw)[:200]
+    arg_hash = _simple_hash(canonical)
+    return f"{name}|{arg_hash}"
+
+
+def _extract_tool_file_refs(tool_calls: Optional[List[Dict[str, Any]]]) -> List[str]:
+    """Extrahiert Datei-/Pfad-Referenzen aus Tool-Args als Fortschritts-Metrik.
+
+    Gibt Liste normalisierter Pfade/Queries zurück (z.B. für read_file den
+    filePath, für grep_search den includePattern/query-String).
+    Verwendet für die 'distinct_files'-Menge → zeigt, ob Kimi NEUE
+    Information aufdeckt oder nur im Kreis läuft.
+    """
+    refs: List[str] = []
+    if not tool_calls:
+        return refs
+    interesting_keys = ("filepath", "filename", "path", "includepattern",
+                        "query", "symbol", "uri", "filepath_relative")
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        func = tc.get("function") or {}
+        name = str(func.get("name", "")).lower()
+        args_raw = func.get("arguments", "")
+        try:
+            args = json.loads(args_raw) if isinstance(args_raw, str) and args_raw.strip() else (args_raw if isinstance(args_raw, dict) else {})
+        except Exception:
+            args = {}
+        for k, v in args.items():
+            kl = k.lower()
+            if kl in interesting_keys and v:
+                refs.append(f"{name}:{str(v).lower()[:120]}")
+    return refs
+
+
+def _detect_planner_loop(session: Dict[str, Any]) -> Optional[str]:
+    """Erkennt echte Loops im Planner anhand der Tool-Signaturen.
+
+    Returns:
+        None  → kein Loop, normal weitermachen
+        str   → Loop-Grund (für Log + Force-Plan-Decision)
+    """
+    sigs = session.get("tool_signatures") or []
+    if not sigs:
+        return None
+
+    # ── Hard-Stop: 'PLANNER_REPEAT_HARD_STOP' identische Signaturen am Stück
+    #    Klassischer Loop: 'No matches' → gleiches grep nochmal → ...
+    from collections import Counter
+    # Letzte N Signaturen prüfen (rolling window)
+    last_n = sigs[-(PLANNER_REPEAT_HARD_STOP + 2):]  # etwas Kontext
+    if len(last_n) >= PLANNER_REPEAT_HARD_STOP:
+        # Zähle gleiche aufeinanderfolgende am Ende
+        last_sig = last_n[-1]
+        run = 1
+        for s in reversed(last_n[:-1]):
+            if s == last_sig:
+                run += 1
+                if run >= PLANNER_REPEAT_HARD_STOP:
+                    return f"exact-repeat: {last_sig} x{run}"
+            else:
+                break
+
+    # ── Stagnation: viele Runden, fast keine neuen Files entdeckt
+    distinct_files = session.get("distinct_files") or set()
+    iterations = int(session.get("iterations", 0))
+    if iterations >= PLANNER_DISTINCT_WARN_AFTER:
+        # In den letzten 6 Signaturen < 2 neue Files → stagniert
+        recent_sigs = set(sigs[-6:])
+        if len(recent_sigs) <= 2:
+            return f"stagnation: {len(recent_sigs)} distinct tools in last 6 rounds"
+
+    # ── Panik-Tripwire: ARBITRARY HARD-CAP nur noch reiner Safety-Net
+    if iterations >= MAX_PLANNER_ITERATIONS:
+        return f"hard-tripwire: {iterations}/{MAX_PLANNER_ITERATIONS}"
+
+    return None
+
+
+def _should_warn_planner(session: Dict[str, Any]) -> Optional[str]:
+    """Sanftes Nudge statt Hard-Stop. Gibt Warn-Text zurück oder None.
+
+    Wird NICHT in _call_cloud_planner_agent angewendet (dort sind tools ohnehin
+    aktiv), sondern nur als Injekt am System-Prompt im Force-Plan-Branch,
+    damit Kimi nach angemessener Exploration selbst den Plan ausspuckt.
+    """
+    iterations = int(session.get("iterations", 0))
+    if iterations < PLANNER_WARN_AFTER:
+        return None
+    distinct_files = session.get("distinct_files") or set()
+    sigs = session.get("tool_signatures") or []
+    distinct_sigs = len(set(sigs))
+    if iterations >= PLANNER_WARN_AFTER and len(sigs) >= PLANNER_WARN_AFTER:
+        return (f"[SYSTEM NUDGE: Du hast {iterations} Runden Tools ausgeführt "
+                f"({distinct_sigs} distinct, {len(distinct_files)} Dateien/Queries). "
+                "Wenn du genug Kontext hast, gib JETZT den finalen Plan aus. "
+                "Ansonsten explorieren - aber zügig.]")
+    return None
+
+
+def _extract_last_assistant_tool_calls(messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extrahiert die tool_calls des letzten assistant-Message-Paars.
+
+    Planner-Sessions empfangen Tool-Resultate via `tool`-Rollen in der History.
+    Vor jedem Tool-Resultat-Block steht eine assistant-Message mit tool_calls.
+    Diese Funktion findet die zuletzt eingetroffenen tool_calls (also die aus
+    der VORIGEN Planner-Runde, deren Resultate gerade eingetroffen sind).
+    """
+    if not messages:
+        return []
+    # Von hinten nach dem letzten assistant mit tool_calls suchen
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            tcs = msg.get("tool_calls")
+            return tcs if isinstance(tcs, list) else []
+        # Sobald wir ein 'tool'-Ergebnis passiert haben und eine User-Nachricht
+        # sehen, sind wir aus dem Tool-Continuation-Block raus → abbrechen.
+        if msg.get("role") == "user":
+            break
+    return []
 
 
 # ── Display-Namen ──────────────────────────────────────────────────────────
@@ -2129,27 +2294,36 @@ async def _call_cloud_planner_agent(
             payload.pop("tools", None)
             payload.pop("tool_choice", None)
 
-    # 2) Iteration-Cap: Wenn Kimi schon viele Runden Tools hatte,
-    #    System-Aufforderung injecten, NOW den Plan auszugeben.
-    iteration = 0
+    # 2) LOOP-DETECTION (ersetzt arbitrary Iteration-Cap):
+    #    Prüfe Session-Historie auf WIRKLICHE Loops. Nur dann Plan erzwingen.
+    #    Legitime Exploration (verschiedene Tools/Files) darf unbegrenzt weiterlaufen.
     sh = _get_planner_session_hash(payload.get("messages", []))
     existing_session = _PLANNER_SESSIONS.get(sh)
-    if existing_session and isinstance(existing_session.get("iterations"), int):
-        iteration = int(existing_session["iterations"])
-    if iteration >= MAX_PLANNER_ITERATIONS:
-        _log(f"  🛑 Planner Iteration-Cap erreicht ({iteration}/{MAX_PLANNER_ITERATIONS}) → erzwinge Plan-Output")
-        # Tools entfernen und FORCE-PLAN Anweisung anhaengen
-        payload.pop("tools", None)
-        payload.pop("tool_choice", None)
-        if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
-            force_msg = (
-                "\n\n[SYSTEM: Du hast bereits ausreichend den Workspace exploriert. "
-                "Gib JETZT deinen finalen Ausfuehrungs-Plan aus. KEINE weiteren tool_calls. "
-                "Format: '## Plan: <title>' + numbered steps. Max 4000 chars.]"
-            )
-            user_content = messages[-1].get("content", "")
-            if isinstance(user_content, str):
-                messages[-1]["content"] = user_content + force_msg
+    if existing_session:
+        loop_reason = _detect_planner_loop(existing_session)
+        if loop_reason:
+            iteration = int(existing_session.get("iterations", 0))
+            _log(f"  🛑 Planner LOOP erkannt ({loop_reason}, iter={iteration}) → erzwinge Plan-Output")
+            payload.pop("tools", None)
+            payload.pop("tool_choice", None)
+            if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
+                force_msg = (
+                    "\n\n[SYSTEM: Du scheinst in einer Schleife zu sein "
+                    f"({loop_reason}). Gib JETZT deinen finalen Ausfuehrungs-Plan aus. "
+                    "KEINE weiteren tool_calls. Format: '## Plan: <title>' + "
+                    "numbered steps. Max 4000 chars.]"
+                )
+                user_content = messages[-1].get("content", "")
+                if isinstance(user_content, str):
+                    messages[-1]["content"] = user_content + force_msg
+        else:
+            # Sanfter Nudge nach ausreichender Exploration (kein Hard-Stop)
+            warn = _should_warn_planner(existing_session)
+            if warn:
+                if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
+                    user_content = messages[-1].get("content", "")
+                    if isinstance(user_content, str) and warn not in user_content:
+                        messages[-1]["content"] = user_content + f"\n\n{warn}"
 
     # ══ FALLBACK-KETTE (Kimi → DeepSeek V4 Pro) ═════════════════════
     # DEF-Strategie: Probiere primär Kimi (CLOUD_REVIEW_*). Bei non-200,
@@ -2869,10 +3043,28 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         force_review = force_review or planner_flags.get("force_review", False)
         bypass_worker = bypass_worker or planner_flags.get("bypass_worker", False)
 
-        # Bug-A-Fix: Iteration protokollieren - am Cap wird Planner ohne Tools
-        # gezwungen, den Plan auszugeben (Passiert IN _call_cloud_planner_agent).
+        # Loop-Detection: statt blinden Counter, letzte Tool-Requests tracken.
+        # Die Tool-Resultate (vorige Runde) sind in der History (letzter 'tool'-Eintrag).
+        # Wir extrahieren die vorigen tool_calls aus der Message-History.
+        prev_tool_calls = _extract_last_assistant_tool_calls(body.get("messages", []))
+        if prev_tool_calls:
+            sigs = session.setdefault("tool_signatures", [])
+            for tc in prev_tool_calls:
+                sigs.append(_tool_signature(tc))
+            # Fortschritts-Metrik: neue File-Refs hinzufügen
+            refs = _extract_tool_file_refs(prev_tool_calls)
+            files_set = session.setdefault("distinct_files", set())
+            if isinstance(files_set, list):  # defensive (json can't serialize set)
+                files_set = set(files_set)
+                session["distinct_files"] = files_set
+            for r in refs:
+                files_set.add(r)
+
         session["iterations"] = int(session.get("iterations", 0)) + 1
-        _log(f"  🔧 Planner-Iteration {session['iterations']}/{MAX_PLANNER_ITERATIONS}")
+        sig_count = len(session.get("tool_signatures") or [])
+        distinct_files = len(session.get("distinct_files") or [])
+        _log(f"  🔧 Planner-Runde {session['iterations']} (distinct tools={sig_count}, "
+             f"explored files/queries={distinct_files})")
 
         planner_result = await _call_cloud_planner_agent(client, body)
         results.append(planner_result)
@@ -3037,10 +3229,17 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         results.append(planner_result)
 
         if planner_result.get("tool_calls"):
-            # Kimi will Tools ausführen → an VS Code weiterleiten, Session speichern
-            _log(f"  🔧 Cloud-Planner will {len(planner_result.get('tool_calls',[]))} Tools → Session starten")
+            # Kimi will Tools ausführen → an VS Code weiterleiten, Session speichern.
+            # Initialisiere Loop-Detection-State für diese Session.
+            first_calls = planner_result.get("tool_calls", []) or []
+            first_sigs = [_tool_signature(tc) for tc in first_calls]
+            first_refs = _extract_tool_file_refs(first_calls)
+            _log(f"  🔧 Cloud-Planner will {len(first_calls)} Tools → Session starten "
+                 f"(initial signatures: {len(first_sigs)})")
             _PLANNER_SESSIONS[session_hash] = {
                 "state": "active", "ts": time.time(), "iterations": 1,
+                "tool_signatures": first_sigs,
+                "distinct_files": set(first_refs),
                 "pflags": {"force_review": force_review, "bypass_worker": bypass_worker},
             }
             await client.aclose()
