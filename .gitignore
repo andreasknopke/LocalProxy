@@ -24,6 +24,11 @@ test_results_*.jsonl
 data/plans/*
 !data/plans/.gitkeep
 
+# Debug-Dumps (runtime-persistiert, enthält keine Secrets, nur Outbound-Payloads)
+# Verzeichnis wird shipped (leer), Inhalt aber nicht committet:
+data/debug/*
+!data/debug/.gitkeep
+
 # venvs
 .venv/
 .venv-1/

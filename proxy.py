@@ -645,6 +645,164 @@ def _strip_kimi_reasoning(messages: List[Dict[str, Any]]) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# DEBUG-Infrastructure — Punchline: VS Code hosts and we need full visibility
+# ═══════════════════════════════════════════════════════════════════════════
+# Problem: In VS Code-Copilot-Tests sieht's lokal toll aus, in VSCode läuft
+# alles schief (lang, hängend, falsche Prompts). _log() zeigt nur Summaries,
+# aber die PAYLOADS und Tool-Continuations sind ein Blackbox.
+#
+# Lösung 1: Request-Dumps in data/debug/<req_id>__<phase>.json
+#   Pro Request/Phase wird der OUTBOUND-Payload (an Kimi/DeepSeek) als JSON
+#   gespeichert. So siehst du GENAU, was der Proxy rausschickt.
+#
+# Lösung 2: In-Memory Request-Buffer (letzte N Requests mit High-Level-Daten).
+#
+# Lösung 3: REST-Endpoint /debug/* für Remote-Inspection aus VSCode.
+#
+# Lösung 4: Active-call-tracking + Heartbeat ("Kimi hängt seit X").
+
+DEBUG_DIR: Path = Path(os.getenv("DEBUG_DIR", "./data/debug"))
+DEBUG_MAX_FILES: int = int(os.getenv("DEBUG_MAX_FILES", "200"))
+DEBUG_ENABLED: bool = os.getenv("DEBUG_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
+
+# In-Memory Ring-Buffer der letzten N Requests
+_DEBUG_RING: List[Dict[str, Any]] = []
+_DEBUG_RING_MAX: int = int(os.getenv("DEBUG_RING_MAX", "50"))
+
+# Aktuell laufende Planner-Calls (für "Kimi hängt seit X" Visibility)
+_ACTIVE_CALLS: Dict[str, Dict[str, Any]] = {}  # call_id -> metadata
+
+
+def _dump_debug_payload(req_id: str, phase: str, payload_to_dump: Dict[str, Any],
+                         extra: Optional[Dict[str, Any]] = None) -> None:
+    """Schreibt einen Snapshot des Outbound-Payloads als JSON ins DEBUG_DIR.
+
+    Phasen-Beispiele: planner_r1, planner_r2, worker, fallback, feedback_r1.
+    Dateinamen sind sortierbar nach Req-ID + Phase.
+    + Groß-Inhalte kappen, sonst explodiert das File.
+    """
+    if not DEBUG_ENABLED:
+        return
+    try:
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+    import copy as _copy
+    snapshot: Dict[str, Any] = {"dumped_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    try:
+        cloned = _copy.deepcopy(payload_to_dump)
+        msgs = cloned.get("messages") if isinstance(cloned, dict) else None
+        if isinstance(msgs, list):
+            summarized = []
+            for i, m in enumerate(msgs):
+                if not isinstance(m, dict):
+                    continue
+                content = m.get("content", "")
+                content_len = len(str(content)) if content is not None else 0
+                content_preview = str(content)[:2000] if content_len > 2000 else content
+                tcs = m.get("tool_calls")
+                summary = {
+                    "idx": i,
+                    "role": m.get("role"),
+                    "content_len": content_len,
+                    "content_preview": content_preview,
+                    "has_tool_calls": bool(tcs),
+                    "tool_calls_count": len(tcs) if isinstance(tcs, list) else 0,
+                }
+                if isinstance(tcs, list):
+                    summary["tool_call_names"] = [
+                        (t.get("function", {}).get("name") if isinstance(t, dict) else None)
+                        for t in tcs
+                    ]
+                if m.get("reasoning_content"):
+                    rc = m.get("reasoning_content")
+                    summary["reasoning_content_len"] = len(str(rc))
+                    summary["reasoning_content_preview"] = str(rc)[:500]
+                summarized.append(summary)
+            cloned["messages"] = summarized
+        snapshot["payload"] = cloned
+        if extra:
+            snapshot["extra"] = extra
+    except Exception as exc:
+        snapshot["_dump_error"] = str(exc)
+
+    safe_id = "".join(c for c in str(req_id) if c.isalnum() or c in "-_")[:20] or "x"
+    safe_phase = "".join(c for c in str(phase) if c.isalnum() or c in "-_")[:40] or "phase"
+    filename = f"{safe_id}_{safe_phase}.json"
+    try:
+        (DEBUG_DIR / filename).write_text(
+            json.dumps(snapshot, indent=2, default=str, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _cleanup_old_debug_files() -> None:
+    """Räumt alte Debug-Files auf, wenn DEBUG_MAX_FILES überschritten."""
+    if not DEBUG_DIR.exists():
+        return
+    try:
+        files = sorted(DEBUG_DIR.glob("*.json"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        if len(files) > DEBUG_MAX_FILES:
+            for f in files[DEBUG_MAX_FILES:]:
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _register_debug_request(req_id: str, info: Dict[str, Any]) -> None:
+    """Fügt einen Request in den In-Memory Ring-Buffer ein."""
+    global _DEBUG_RING
+    info = dict(info)
+    info["req_id"] = req_id
+    info["ts_iso"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    _DEBUG_RING.append(info)
+    if len(_DEBUG_RING) > _DEBUG_RING_MAX:
+        _DEBUG_RING = _DEBUG_RING[-_DEBUG_RING_MAX:]
+
+
+def _register_active_call(call_id: str, info: Dict[str, Any]) -> None:
+    """Trackt aktive Langläufer (Cloud-Planner-Calls) für Heartbeat/Visibility."""
+    info = dict(info)
+    info["started_at"] = time.time()
+    info["started_iso"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    _ACTIVE_CALLS[call_id] = info
+    asyncio.ensure_future(_active_call_heartbeat(call_id))
+
+
+async def _active_call_heartbeat(call_id: str) -> None:
+    """Loggt alle 30s, dass ein aktiver Call noch läuft."""
+    while call_id in _ACTIVE_CALLS:
+        await asyncio.sleep(30)
+        info = _ACTIVE_CALLS.get(call_id)
+        if not info:
+            return
+        elapsed = time.time() - info.get("started_at", time.time())
+        _log(f"  ⏳[{call_id}] aktiver Call seit {elapsed:.0f}s "
+             f"(agent_key={info.get('agent_key','?')}, "
+             f"model={info.get('model','?')}, "
+             f"phase={info.get('phase','?')})")
+
+
+def _finish_active_call(call_id: str, status: str = "done",
+                          extra: Optional[Dict[str, Any]] = None) -> None:
+    """Beendet einen aktiven Call (entfernt aus _ACTIVE_CALLS)."""
+    info = _ACTIVE_CALLS.pop(call_id, None)
+    if not info:
+        return
+    elapsed = time.time() - info.get("started_at", time.time())
+    _log(f"  ✓[{call_id}] Call beendet nach {elapsed:.0f}s ({status})")
+    summary = {"call_id": call_id, "elapsed_seconds": elapsed, "status": status, **info}
+    if extra:
+        summary.update(extra)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Hindsight Memory Netzwerke (4 logische Ebenen)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -2475,6 +2633,22 @@ async def _call_cloud_planner_agent(
 
     started_total = time.perf_counter()
     last_error = ""
+
+    # DEBUG: Snapshot des Outbound-Payloads speichern (vor Stufen-spezifischen Patches)
+    planner_call_id = f"planner_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    _dump_debug_payload(planner_call_id, "planner_pre_stage",
+                         payload,
+                         extra={"planner_chain": [s["name"] for s in planner_chain],
+                                "session_hash": sh,
+                                "messages_count": len(payload.get("messages", []))})
+    _register_debug_request(planner_call_id, {
+        "type": "planner_call_start",
+        "chain": [s["name"] for s in planner_chain],
+        "session_hash": sh,
+        "messages_count": len(payload.get("messages", [])),
+        "tools_count": len(payload.get("tools", [])),
+    })
+
     for stage_idx, stage in enumerate(planner_chain):
         stage_name = stage["name"]
         stage_label = f"[{stage_idx+1}/{len(planner_chain)} {stage_name}]"
@@ -2485,8 +2659,26 @@ async def _call_cloud_planner_agent(
         stage_payload["model"] = stage["model"]
         _patch_moonshot_payload(stage_payload)  # nur wirksam wenn model/url Moonshot ist
 
+        # DEBUG: Per-Stage-Payload dumpen
+        stage_call_id = f"{planner_call_id}_s{stage_idx+1}_{stage_name}"
+        _dump_debug_payload(stage_call_id, f"planner_stage_{stage_name}",
+                             stage_payload,
+                             extra={"stage": stage_name, "model": stage["model"],
+                                    "timeout": stage["timeout"]})
+
         headers = {"Authorization": f"Bearer {stage['api_key']}"}
         started = time.perf_counter()
+
+        # Active-Call-Tracking + Heartbeat (für "Kimi hängt" Visibility)
+        _register_active_call(stage_call_id, {
+            "agent_key": "cloud_planner_agent",
+            "model": stage["model"],
+            "phase": f"planner_stage_{stage_name}",
+            "stage_label": stage_label,
+            "url": stage["api_url"],
+            "timeout": stage["timeout"],
+        })
+
         try:
             response = await client.post(
                 stage["api_url"],
@@ -2495,6 +2687,10 @@ async def _call_cloud_planner_agent(
                 timeout=stage["timeout"],
             )
             duration = time.perf_counter() - started
+            _finish_active_call(stage_call_id, status="response", extra={
+                "duration_seconds": duration,
+                "http_status": response.status_code,
+            })
             if response.status_code == 200:
                 result = response.json()
                 message = _extract_choice_message(result)
@@ -2529,6 +2725,9 @@ async def _call_cloud_planner_agent(
         except Exception as exc:
             _log(f"  ✗ Cloud-Planner {stage_label} ERROR: {exc}")
             last_error = f"{type(exc).__name__}: {exc} ({stage_name})"
+            _finish_active_call(stage_call_id, status="error", extra={
+                "error": str(exc), "error_type": type(exc).__name__,
+            })
 
     _log(f"  ✗ Cloud-Planner: Alle Stufen fehlgeschlagen – letzter Fehler: {last_error}")
     return {
@@ -2857,6 +3056,19 @@ async def _call_vllm(
     total_chars = sum(len(str(m.get("content", ""))) for m in payload.get("messages", []))
     _log(f"  → Lokal/Free call agent_key={agent_key} model={model} "
          f"messages={msg_count} chars={total_chars} timeout={timeout_seconds:.0f}s")
+
+    # DEBUG: Worker-Payload dumpen (für Remote-Inspection)
+    worker_call_id = f"worker_{agent_key}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    _dump_debug_payload(worker_call_id, f"worker_{agent_key}", payload, extra={
+        "agent_key": agent_key, "model": model,
+        "timeout": timeout_seconds, "messages_count": msg_count,
+    })
+    _register_debug_request(worker_call_id, {
+        "type": "worker_call_start",
+        "agent_key": agent_key, "model": model,
+        "messages_count": msg_count, "chars": total_chars,
+        "timeout": timeout_seconds,
+    })
 
     # Moonshot/Kimi-Temperatur-Korrektur (Moonshot erlaubt nur 1.0)
     _patch_moonshot_payload(payload)
@@ -4143,6 +4355,125 @@ async def get_logs(request: Request, lines: int = 200):
         "total": len(all_lines),
         "file": LOG_FILE,
         "lines": last,
+    })
+
+
+# ── /debug/* ───────────────────────────────────────────────────────────────
+# Drei Rexource-Kategorien:
+#   * /debug/sessions  → aktive + letzte _PLANNER_SESSIONS (Iterations, hashes, last_tool_calls)
+#   * /debug/active    → aktuell laufende _ACTIVE_CALLS (für "hängt seit X"-Diagnose)
+#   * /debug/ring      → in-memory ring buffer der letzten N Requests
+#   * /debug/files     → listet alle dump-JSON-Files in data/debug/
+#   * /debug/file/<id> → konkreten Dump abrufen
+#   * /debug/cleanup   → räumt alte Files auf
+@app.get("/debug/sessions")
+async def debug_sessions(request: Request, limit: int = 20):
+    """In-Memory Planner-Sessions (iterations, hashes, seen_tool_calls)."""
+    sessions = []
+    # _PLANNER_SESSIONS ist globales dict aus dem agent block
+    try:
+        items = list(_PLANNER_SESSIONS.items())[-limit:] if limit > 0 else list(_PLANNER_SESSIONS.items())
+        for sh, data in items:
+            entry = {"session_hash": sh}
+            if isinstance(data, dict):
+                entry["iterations"] = data.get("iterations", 0)
+                entry["last_tool_calls"] = list(data.get("seen_tool_call_ids", []))[-10:]
+                entry["plan_path"] = data.get("plan_path")
+                entry["last_request_len"] = len(str(data.get("last_request_hash", "")))
+            sessions.append(entry)
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+    return JSONResponse(content={
+        "count": len(sessions),
+        "total_sessions": len(_PLANNER_SESSIONS),
+        "sessions": sessions,
+    })
+
+
+@app.get("/debug/active")
+async def debug_active(request: Request):
+    """Aktuell laufende Calls (cloud planner, worker). 'Kimi hängt'-Diagnose."""
+    now = time.time()
+    active = []
+    for call_id, info in _ACTIVE_CALLS.items():
+        entry = {"call_id": call_id, "elapsed_seconds": now - info.get("started_at", now)}
+        for k in ("agent_key", "model", "phase", "stage_label", "url", "timeout", "started_iso"):
+            if k in info:
+                entry[k] = info[k]
+        active.append(entry)
+    return JSONResponse(content={
+        "count": len(active),
+        "active_calls": active,
+        "ring_size": len(_ACTIVE_CALLS),
+    })
+
+
+@app.get("/debug/ring")
+async def debug_ring(request: Request, limit: int = 20):
+    """Letzte N In-Memory Request-Events (compact summary)."""
+    items = _DEBUG_RING[-limit:] if limit > 0 else list(_DEBUG_RING)
+    return JSONResponse(content={
+        "count": len(items),
+        "ring_capacity": _DEBUG_RING_MAX,
+        "ring_total": len(_DEBUG_RING),
+        "items": items,
+    })
+
+
+@app.get("/debug/files")
+async def debug_files(request: Request, limit: int = 50):
+    """Listet Debug-Dump-Files in data/debug/ auf."""
+    try:
+        files = []
+        if DEBUG_DIR.exists():
+            for entry in sorted(DEBUG_DIR.glob("*.json"), reverse=True)[:limit]:
+                stat = entry.stat()
+                files.append({
+                    "name": entry.name,
+                    "size": stat.st_size,
+                    "modified": stat.st_mtime,
+                    "modified_iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+                })
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+    return JSONResponse(content={
+        "count": len(files),
+        "debug_dir": str(DEBUG_DIR),
+        "config": {
+            "DEBUG_ENABLED": DEBUG_ENABLED,
+            "DEBUG_MAX_FILES": DEBUG_MAX_FILES,
+            "DEBUG_RING_MAX": _DEBUG_RING_MAX,
+        },
+        "files": files,
+    })
+
+
+@app.get("/debug/file/{file_id}")
+async def debug_file(file_id: str, request: Request):
+    """Liefert den Inhalt eines Debug-Dumps (file_id ohne .json-Ext)."""
+    safe = "".join(c for c in file_id if c.isalnum() or c in "-_")[:100]
+    if not safe or ".." in file_id or "/" in file_id or "\\" in file_id:
+        return JSONResponse(status_code=400, content={"error": "invalid file_id"})
+    target = DEBUG_DIR / f"{safe}.json"
+    if not target.exists():
+        return JSONResponse(status_code=404, content={"error": "file not found", "path": str(target)})
+    try:
+        content = target.read_text(encoding="utf-8")
+        data = json.loads(content) if content.strip().startswith("{") else {"raw": content}
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+    return JSONResponse(content={"file_id": safe, "path": str(target), "data": data})
+
+
+@app.post("/debug/cleanup")
+async def debug_cleanup(request: Request):
+    """Räumt alte Debug-Files auf (behält DEBUG_MAX_FILES)."""
+    before = len(list(DEBUG_DIR.glob("*.json"))) if DEBUG_DIR.exists() else 0
+    _cleanup_old_debug_files()
+    after = len(list(DEBUG_DIR.glob("*.json"))) if DEBUG_DIR.exists() else 0
+    return JSONResponse(content={
+        "before": before, "after": after, "removed": before - after,
+        "DEBUG_MAX_FILES": DEBUG_MAX_FILES,
     })
 
 
