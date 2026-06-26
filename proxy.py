@@ -138,6 +138,16 @@ HINDSIGHT_USE_QDRANT: bool = os.getenv(
 ).lower() in {"1", "true", "yes", "y", "on"}
 HINDSIGHT_DIR: Path = Path(os.getenv("HINDSIGHT_DIR", "./.hindsight_memory"))
 
+# ── Plans-Verzeichnis (Codespace-Copilot-Stil) ───────────────────────────
+# Pläne des Cloud-Planners werden als .md-Files persistiert:
+#   data/plans/Plan_<session_hash>.md
+# Vorteile:
+#   - Worker kann Plan via File-Inhalt lesen (stabil, kein JSON-Wrapping-Bruch)
+#   - Persistente Debug-Historie im Volume Mount
+#   - WebUI/API kann Plans showcase/downladen
+#   - Robust gegen "thinking content could not be passed"
+PLANS_DIR: Path = Path(os.getenv("PLANS_DIR", "./data/plans"))
+
 # ── Trigger-Wörter ─────────────────────────────────────────────────────────
 AGENT_TRIGGER_WORDS: Tuple[str, ...] = (
     "refactor", "refactore", "refactoring", "architektur", "architecture",
@@ -549,6 +559,88 @@ def _inject_reasoning_from_cache(messages: List[Dict[str, Any]]) -> None:
             if cached:
                 msg["reasoning_content"] = cached
                 break
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Plan-Persistenz (Codespace-Copilot-Stil)
+# ═══════════════════════════════════════════════════════════════════════════
+# Pläne werden unter data/plans/Plan_<hash>.md gespeichert.
+# Der Worker-Payload referenziert die Plan-Datei zusätzlich (Pointer + Inhalt),
+# sodass DeepSeek robust an den Plan kommt - egal, ob die JSON-Wrapping-Ebene
+# der Conversations-History aus Kimi-Tool-Runden das Wandern übersteht.
+
+def _save_plan_to_file(session_hash: str, plan: str, query: str = "") -> Path:
+    """Persistiert einen Plan als Markdown-Datei in PLANS_DIR.
+
+    Returns: Pfad zur geschriebenen Datei.
+    """
+    try:
+        PLANS_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        _log(f"  ⚠ PLANS_DIR.mkdir fehlgeschlagen ({exc}) – retour in-memory")
+        return None
+    safe_hash = "".join(c for c in str(session_hash) if c.isalnum() or c in "-_")[:20] or "unknown"
+    plan_path = PLANS_DIR / f"Plan_{safe_hash}.md"
+    # Header mit Task-Kurzbeschreibung für Debugging
+    task_short = (query or "").strip().split("\n")[0][:120]
+    header = (
+        f"# Plan\n\n"
+        f"- **Session**: `{safe_hash}`\n"
+        f"- **Task**: {task_short or '(unbenannt)'}\n"
+        f"- **Created**: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"- **Planner**: Cloud-Planner (Kimi K2.7)\n\n"
+        f"---\n\n"
+    )
+    try:
+        plan_path.write_text(header + plan, encoding="utf-8")
+        _log(f"  📄 Plan persistiert: {plan_path} ({len(plan)} chars)")
+        return plan_path
+    except Exception as exc:
+        _log(f"  ⚠ Plan-File-Write fehlgeschlagen ({exc}) – In-Monly")
+        return None
+
+
+def _load_plan_from_file(session_hash: str) -> Optional[str]:
+    """Liest den gespeicherten Plan für eine Session, falls vorhanden."""
+    safe_hash = "".join(c for c in str(session_hash) if c.isalnum() or c in "-_")[:20] or "unknown"
+    plan_path = PLANS_DIR / f"Plan_{safe_hash}.md"
+    if not plan_path.exists():
+        return None
+    try:
+        return plan_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        _log(f"  ⚠ Plan-File-Read fehlgeschlagen: {exc}")
+        return None
+
+
+def _strip_kimi_reasoning(messages: List[Dict[str, Any]]) -> int:
+    """Entfernt reasoning_content aus ALLEN Messages für Worker-Calls.
+
+    Hintergrund: Kimi (Cloud-Planner) liefert `reasoning_content`-Thinking.
+    VS Code gibt dieses Feld jedoch nicht zurück. DeepSeek (Worker) empfindet
+    fremdes reasoning_content in der History als Kontaminierung – was zu
+    'thinking content could not be passed' Style-Fehlern führt.
+
+    Strategie:
+      - Assistant-Messages MIT tool_calls → reasoning_content DRINLASSEN
+        (DeepSeek braucht das für Tool-Continuations via _inject_reasoning).
+      - Alle anderen Messages → reasoning_content entfernen
+        (insbesondere reine Plan-Finalisierung ohne tool_calls von Kimi).
+
+    Returns: Anzahl entfernter reasoning_content-Felder.
+    """
+    removed = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        if msg.get("tool_calls"):
+            continue  # Tool-aktive Assistant → reasoning drinlassen
+        if msg.get("reasoning_content"):
+            msg.pop("reasoning_content", None)
+            removed += 1
+    return removed
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1393,6 +1485,7 @@ def _build_worker_payload(
     memory_context: str,
     model_name: Optional[str] = None,
     max_tokens: Optional[int] = None,
+    plan_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Baut den Payload fuer den WORKER - ein FULLY TOOL-CAPABLE Sub-Agent.
@@ -1408,6 +1501,18 @@ def _build_worker_payload(
       "Implementiere den Plan. Keine(). Neue(). Ideen. Wenn der Plan Fehler
       hat, mache最小-korrektur und kommentiere. Keine Refactors, keine
       Zusatz-Features, keine neuen Dateien es sei denn der Plan verlangt es."
+
+    PLAN-FILE (Codespace-Copilot-Stil):
+      Neben der In-Prompt-Injection wird der Plan zusaetzlich als .md-File
+      persistiert (data/plans/Plan_<hash>.md). Der File-Pfad wird als
+      Pointer im System-Prompt veroeffentlicht - so kann der Worker auch
+      nach Runden von Tool-Calls den Plan nachlesen.
+
+    REASONING-CONTENT HYGIENE:
+      Kimi-urspruengliche Assistant-Messages mit `reasoning_content` (Thinking)
+      werden entfernt, ausser wenn tool_calls dranhaengen (dann braucht
+      DeepSeek das Thinking fuer Tool-Continuations). Vermeidet
+      'thinking content could not be passed'-Fehler beim Hand-off.
     """
     payload = copy.deepcopy(body)
     payload["model"] = model_name or body.get("model") or MODEL_NAME
@@ -1416,10 +1521,23 @@ def _build_worker_payload(
 
     messages = list(payload.get("messages", []))
 
+    # ══ reasoning_content von Kimi-Seite entfernen ════════════════════
+    removed = _strip_kimi_reasoning(messages)
+    if removed:
+        _log(f"  🧹 Worker-Payload: {removed} reasoning_content-Felder entfernt (Kimi-Thinking)")
+
     # ══ Plan-binding System-Prompt injecten ══════════════════════════
     # Wird an die ERSTE system-message angehaengt, falls vorhanden.
     # Sonst als neue system-message vorne eingefuegt.
     if plan:
+        # Optional: File-Pfad als zusaetzlicher Pointer (Codespace-Stil)
+        plan_file_hint = ""
+        if plan_path:
+            plan_file_hint = (
+                f"\n7. The plan is also persisted at **`{plan_path}`**. "
+                f"If this prompt feels truncated or you forgot a step, "
+                f"READ that file with your file-reading tool."
+            )
         plan_binding = (
             "\n\n[PLAN-BINDING CONTRACT - READ CAREFULLY]\n"
             "A strategic plan has been prepared by your senior planner. "
@@ -1431,6 +1549,7 @@ def _build_worker_payload(
             "5. Do NOT create new files unless the plan explicitly says 'CREATE <path>'.\n"
             "6. After finishing, output a '## Implementation Summary' with each step ✓/⚠/✗.\n"
             "The plan is included at the end of this prompt."
+            f"{plan_file_hint}"
         )
         if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
             existing = str(messages[0].get("content", ""))
@@ -2071,6 +2190,7 @@ async def _review_with_feedback_loop(
     force_review: bool,
     progress: List[str],
     results: List[Dict[str, Any]],
+    session_hash: Optional[str] = None,
 ) -> str:
     """Fuehrt Cloud-Review durch + Feedback-Loop bei NEEDS FIX.
 
@@ -2116,7 +2236,11 @@ async def _review_with_feedback_loop(
             f"♻️ Review fordert Fixes → Worker-Neuausführung.",
             {"round": rounds, "verdict": verdict},
         ))
-        feedback_payload = _build_worker_payload(body, plan, "")
+        # Plan-Path fuer Worker-Continue lookupen (Codespace-Stil)
+        _plan_path = None
+        if session_hash:
+            _plan_path = _PLANNER_SESSIONS.get(session_hash, {}).get("plan_path")
+        feedback_payload = _build_worker_payload(body, plan, "", plan_path=_plan_path)
         # CACHING-FREUNDLICHER Feedback-Payload:
         # Bisher wurde das REVIEW-FEEDBACK ans Ende der originalen User-Message geklebt
         # → das zerstört den Prefix-Cache (Original-Message-Ende ist zwischen
@@ -3083,9 +3207,12 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         plan = planner_result.get("content", "") if planner_result.get("status") == "ok" else ""
         if plan:
             _log(f"  📝 Cloud-Planner hat Plan erstellt ({len(plan)} chars)")
+            # Plan in dak-dat File persistieren (Codespace-Copilot-Stil)
+            plan_path = _save_plan_to_file(session_hash, plan, query=body.get("messages", [{}])[0].get("content", ""))
             _PLANNER_SESSIONS[session_hash] = {
                 "state": "done", "ts": time.time(),
                 "plan": plan, "pflags": planner_flags,
+                "plan_path": str(plan_path) if plan_path else None,
             }
             progress.append(_format_chat_progress_message(
                 "phase1_plan_ready",
@@ -3100,7 +3227,10 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
                 {"model": MODEL_NAME},
             ))
 
-            worker_payload = _build_worker_payload(body, plan, "")
+            worker_payload = _build_worker_payload(
+                body, plan, "",
+                plan_path=_PLANNER_SESSIONS.get(session_hash, {}).get("plan_path"),
+            )
             worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
             results.append(worker_result)
             worker_response = worker_result.get("content", "")
@@ -3125,6 +3255,7 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             verified_response = await _review_with_feedback_loop(
                 client, body, plan, query_clean, worker_response,
                 force_review, progress, results,
+                session_hash=session_hash,
             )
 
             del _PLANNER_SESSIONS[session_hash]
@@ -3167,7 +3298,16 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         force_review = force_review or planner_flags.get("force_review", False)
 
         if plan:
-            worker_payload = _build_worker_payload(body, plan, "")
+            # Falls kein Plan-Path in der alten Session stand, jetzt speichern
+            plan_path = session.get("plan_path")
+            if plan and not plan_path:
+                plan_path_obj = _save_plan_to_file(
+                    session_hash, plan,
+                    query=body.get("messages", [{}])[0].get("content", ""),
+                )
+                plan_path = str(plan_path_obj) if plan_path_obj else None
+                session["plan_path"] = plan_path
+            worker_payload = _build_worker_payload(body, plan, "", plan_path=plan_path)
             worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
         else:
             worker_payload = _build_direct_payload(body)
@@ -3253,6 +3393,13 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         plan = planner_result.get("content", "") if planner_result.get("status") == "ok" else ""
         if plan:
             _log(f"  📝 Cloud-Planner direkt: Plan ({len(plan)} chars)")
+            # Plan als Datei persistieren
+            plan_path = _save_plan_to_file(session_hash, plan, query=body.get("messages", [{}])[0].get("content", ""))
+            _PLANNER_SESSIONS[session_hash] = {
+                "state": "done", "ts": time.time(),
+                "plan": plan, "pflags": planner_flags,
+                "plan_path": str(plan_path) if plan_path else None,
+            }
             progress.append(_format_chat_progress_message(
                 "phase1_plan_ready",
                 f"🧠 Cloud-Planner: Plan in {planner_result.get('duration_seconds',0):.1f}s erstellt.",
@@ -3279,6 +3426,12 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         plan = planner_result.get("content", "") if plan_status == "ok" else ""
 
         if plan_status == "ok":
+            plan_path = _save_plan_to_file(session_hash, plan, query=body.get("messages", [{}])[0].get("content", ""))
+            _PLANNER_SESSIONS[session_hash] = {
+                "state": "done", "ts": time.time(),
+                "plan": plan,
+                "plan_path": str(plan_path) if plan_path else None,
+            }
             progress.append(_format_chat_progress_message(
                 "phase1_plan_ready",
                 f"Cloud-Planer: Caveman-Plan erstellt.",
@@ -3323,7 +3476,10 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             f"Worker ({MODEL_NAME}) führt Plan aus.",
             {"model": MODEL_NAME},
         ))
-        worker_payload = _build_worker_payload(body, plan, memory_context)
+        worker_payload = _build_worker_payload(
+            body, plan, memory_context,
+            plan_path=_PLANNER_SESSIONS.get(session_hash, {}).get("plan_path"),
+        )
         worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
         results.append(worker_result)
         worker_response = worker_result.get("content", "")
@@ -3348,6 +3504,7 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         verified_response = await _review_with_feedback_loop(
             client, body, plan, query_clean, worker_response,
             force_review, progress, results,
+            session_hash=session_hash,
         )
     else:
         verified_response, _ = await _verify_and_correct(client, query_clean, worker_response)
@@ -3903,7 +4060,49 @@ async def healthz(request: Request):
         "caveman_enabled": CAVEMAN_ENABLED,
         "verify_enabled": VERIFY_ENABLED,
         "mcp_enabled": MCP_ENABLED,
+        "plans_dir": str(PLANS_DIR),
     })
+
+
+# ── /plans ─────────────────────────────────────────────────────────────────
+# Codespace-Copilot-Stil: Pläne liegen als .md-Files vor und können hier
+# gelistet und abgerufen werden (für Debugging, WebUI-Anzeige, Downloads).
+
+@app.get("/plans")
+async def list_plans(request: Request):
+    """Listet alle gespeicherten Plan-Dateien auf."""
+    try:
+        files = []
+        if PLANS_DIR.exists():
+            for entry in sorted(PLANS_DIR.glob("Plan_*.md"), reverse=True):
+                stat = entry.stat()
+                files.append({
+                    "name": entry.name,
+                    "path": str(entry),
+                    "size": stat.st_size,
+                    "modified": stat.st_mtime,
+                })
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+    return JSONResponse(content={"count": len(files), "plans_dir": str(PLANS_DIR), "plans": files})
+
+
+@app.get("/plans/{plan_name}")
+async def get_plan(plan_name: str, request: Request):
+    """Liefert den Inhalt einer konkreten Plan-Datei."""
+    # Sicherheits-Check: nur Dateinamen, keine Pfad-Traversale
+    if "/" in plan_name or "\\" in plan_name or ".." in plan_name:
+        return JSONResponse(status_code=400, content={"error": "invalid plan_name"})
+    if not plan_name.startswith("Plan_") or not plan_name.endswith(".md"):
+        return JSONResponse(status_code=400, content={"error": "invalid plan_name pattern"})
+    plan_path = PLANS_DIR / plan_name
+    if not plan_path.exists():
+        return JSONResponse(status_code=404, content={"error": "plan not found"})
+    try:
+        content = plan_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+    return JSONResponse(content={"name": plan_name, "path": str(plan_path), "content": content})
 
 
 # ── /logs ──────────────────────────────────────────────────────────────────

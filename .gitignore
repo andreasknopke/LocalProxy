@@ -19,6 +19,11 @@ __pycache__/
 *.pyc
 test_results_*.jsonl
 
+# Plans (runtime-persistiert, Codespace-Copilot-Stil)
+# Verzeichnis wird shipped (leer), Inhalt aber nicht committet:
+data/plans/*
+!data/plans/.gitkeep
+
 # venvs
 .venv/
 .venv-1/
