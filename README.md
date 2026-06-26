@@ -391,12 +391,12 @@ docker run -d --name localproxy \
 Alle Umgebungsvariablen aus der [Konfigurationstabelle](#konfiguration) können in Coolify unter **Environment Variables** gesetzt werden.
 
 > **⚠️ Wichtig — Env-Vars vs. WebUI:**
-> **Beim ersten Start** werden die Env-Vars aus Coolify in `config.json` übernommen
-> und im WebUI angezeigt. **Speicherst du danach via WebUI**, hat `config.json` Vorrang
-> — auch wenn die Coolify-Env-Vars noch gesetzt sind.
+> **Beim ersten Start** werden die Coolify-Env-Vars in `config.json` übernommen
+> und im WebUI angezeigt. **Speicherst du danach via WebUI**, hat `config.json`
+> Vorrang — die Env-Vars in Coolify werden ignoriert.
 >
-> **Reset:** Wenn du wieder die Coolify-Env-Vars anwenden willst, lösche `config.json`
-> im Volume und starte den Container neu. Dann wird es neu aus den Env-Vars erzeugt.
+> **Reset:** Um wieder die Coolify-Env-Vars zu laden, lösche `config.json` im
+> Volume und starte den Container neu.
 >
 > **💾 Storage-Mount für Coolify:**
 > Damit WebUI-Änderungen dauerhaft sind, in Coolify unter **Storage** → **New mount**:

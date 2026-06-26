@@ -209,11 +209,15 @@ DISPLAY_NAMES: Dict[str, str] = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Config-Datei-Loader — Env-Vars haben IMMER Vorrang (wichtig für Coolify Docker)
+# Config-Datei-Loader — übernimmt Werte aus config.json (via webui._load_config)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _apply_config_file() -> None:
-    """Lädt config.json — Env-Vars überschreiben config.json (höchste Priorität)."""
+    """Übernimmt Werte aus config.json.
+    
+    webui._load_config() merged: Hardcoded-Defaults ← config.json ← Env-Vars (nur beim 1. Start).
+    Ab dem ersten WebUI-Save hat config.json Vorrang – auch vor Coolify-Env-Vars.
+    """
     if not _WEBUI_AVAILABLE:
         return
     try:
@@ -221,137 +225,93 @@ def _apply_config_file() -> None:
     except Exception:
         return
 
-    def _env_or(key: str, cfg_val: Any) -> Any:
-        """Env hat Vorrang vor config.json."""
-        return cfg_val  # Env wurde bereits in den Modul-Konstanten gelesen
-
     # Models
     global VLLM_API_URL, VLLM_MODELS_URL, VLLM_API_KEY, MODEL_NAME, FAST_MODEL_NAME
-    if not os.getenv("VLLM_API_URL"):
-        VLLM_API_URL = cfg.get("models", {}).get("vllm_api_url", VLLM_API_URL)
-    if not os.getenv("VLLM_MODELS_URL"):
-        VLLM_MODELS_URL = cfg.get("models", {}).get("vllm_models_url", VLLM_MODELS_URL)
-    # API-Keys: Env hat Vorrang (wichtig für Coolify Docker, wo config.json ephemeral ist)
+    VLLM_API_URL = cfg.get("models", {}).get("vllm_api_url", VLLM_API_URL)
+    VLLM_MODELS_URL = cfg.get("models", {}).get("vllm_models_url", VLLM_MODELS_URL)
     ak = cfg.get("models", {}).get("vllm_api_key", "")
-    if ak and not os.getenv("VLLM_API_KEY"):
+    if ak:
         VLLM_API_KEY = ak
-    if not os.getenv("MODEL_NAME"):
-        MODEL_NAME = cfg.get("models", {}).get("model_name", MODEL_NAME)
-    if not os.getenv("FAST_MODEL_NAME"):
-        FAST_MODEL_NAME = cfg.get("models", {}).get("fast_model_name", FAST_MODEL_NAME)
+    MODEL_NAME = cfg.get("models", {}).get("model_name", MODEL_NAME)
+    FAST_MODEL_NAME = cfg.get("models", {}).get("fast_model_name", FAST_MODEL_NAME)
 
     # Proxy
     global PROXY_PORT, PROXY_AUTH_ENABLED, PROXY_API_KEY, CHATTY_MODE
-    if not os.getenv("PROXY_PORT"):
-        PROXY_PORT = cfg.get("proxy", {}).get("port", PROXY_PORT)
-    if not os.getenv("PROXY_AUTH_ENABLED"):
-        PROXY_AUTH_ENABLED = cfg.get("proxy", {}).get("auth_enabled", PROXY_AUTH_ENABLED)
-    # Proxy-Auth: Env hat Vorrang (Coolify Docker)
+    PROXY_PORT = int(cfg.get("proxy", {}).get("port", PROXY_PORT))
+    PROXY_AUTH_ENABLED = bool(cfg.get("proxy", {}).get("auth_enabled", PROXY_AUTH_ENABLED))
     pk = cfg.get("proxy", {}).get("api_key", "")
-    if pk and not os.getenv("PROXY_API_KEY"):
+    if pk:
         PROXY_API_KEY = pk
-    if not os.getenv("CHATTY_MODE"):
-        CHATTY_MODE = cfg.get("proxy", {}).get("chatty_mode", CHATTY_MODE)
+    CHATTY_MODE = bool(cfg.get("proxy", {}).get("chatty_mode", CHATTY_MODE))
 
     # Cloud
     global CLOUD_REVIEW_ENABLED, CLOUD_REVIEW_API_URL, CLOUD_REVIEW_API_KEY
     global CLOUD_REVIEW_MODEL, CLOUD_REVIEW_MAX_TOKENS, CLOUD_REVIEW_TIMEOUT_SECONDS
-    if not os.getenv("CLOUD_REVIEW_ENABLED"):
-        CLOUD_REVIEW_ENABLED = cfg.get("cloud", {}).get("enabled", CLOUD_REVIEW_ENABLED)
-    if not os.getenv("CLOUD_REVIEW_API_URL"):
-        CLOUD_REVIEW_API_URL = cfg.get("cloud", {}).get("api_url", CLOUD_REVIEW_API_URL)
-    # Cloud API-Key: Env hat Vorrang (Coolify Docker)
+    CLOUD_REVIEW_ENABLED = bool(cfg.get("cloud", {}).get("enabled", CLOUD_REVIEW_ENABLED))
+    CLOUD_REVIEW_API_URL = cfg.get("cloud", {}).get("api_url", CLOUD_REVIEW_API_URL)
     ck = cfg.get("cloud", {}).get("api_key", "")
-    if ck and not os.getenv("CLOUD_REVIEW_API_KEY"):
+    if ck:
         CLOUD_REVIEW_API_KEY = ck
-    if not os.getenv("CLOUD_REVIEW_MODEL"):
-        CLOUD_REVIEW_MODEL = cfg.get("cloud", {}).get("model", CLOUD_REVIEW_MODEL)
-    if not os.getenv("CLOUD_REVIEW_MAX_TOKENS"):
-        CLOUD_REVIEW_MAX_TOKENS = cfg.get("cloud", {}).get("max_tokens", CLOUD_REVIEW_MAX_TOKENS)
-    if not os.getenv("CLOUD_REVIEW_TIMEOUT_SECONDS"):
-        CLOUD_REVIEW_TIMEOUT_SECONDS = cfg.get("cloud", {}).get("timeout_seconds", CLOUD_REVIEW_TIMEOUT_SECONDS)
+    CLOUD_REVIEW_MODEL = cfg.get("cloud", {}).get("model", CLOUD_REVIEW_MODEL)
+    CLOUD_REVIEW_MAX_TOKENS = int(cfg.get("cloud", {}).get("max_tokens", CLOUD_REVIEW_MAX_TOKENS))
+    CLOUD_REVIEW_TIMEOUT_SECONDS = float(cfg.get("cloud", {}).get("timeout_seconds", CLOUD_REVIEW_TIMEOUT_SECONDS))
 
     # LiteLLM
     global LITELLM_CLOUD_MODEL, LITELLM_CLOUD_API_KEY, LITELLM_CLOUD_API_URL
     global LITELLM_CLOUD_MAX_TOKENS, LITELLM_CLOUD_TIMEOUT_SECONDS
-    if not os.getenv("LITELLM_CLOUD_MODEL"):
-        LITELLM_CLOUD_MODEL = cfg.get("litellm", {}).get("model", LITELLM_CLOUD_MODEL)
-    # LiteLLM API-Key: Env hat Vorrang (Coolify Docker)
+    LITELLM_CLOUD_MODEL = cfg.get("litellm", {}).get("model", LITELLM_CLOUD_MODEL)
     lk = cfg.get("litellm", {}).get("api_key", "")
-    if lk and not os.getenv("LITELLM_CLOUD_API_KEY"):
+    if lk:
         LITELLM_CLOUD_API_KEY = lk
-    if not os.getenv("LITELLM_CLOUD_API_URL"):
-        LITELLM_CLOUD_API_URL = cfg.get("litellm", {}).get("api_url", LITELLM_CLOUD_API_URL)
-    if not os.getenv("LITELLM_CLOUD_MAX_TOKENS"):
-        LITELLM_CLOUD_MAX_TOKENS = cfg.get("litellm", {}).get("max_tokens", LITELLM_CLOUD_MAX_TOKENS)
-    if not os.getenv("LITELLM_CLOUD_TIMEOUT_SECONDS"):
-        LITELLM_CLOUD_TIMEOUT_SECONDS = cfg.get("litellm", {}).get("timeout_seconds", LITELLM_CLOUD_TIMEOUT_SECONDS)
+    LITELLM_CLOUD_API_URL = cfg.get("litellm", {}).get("api_url", LITELLM_CLOUD_API_URL)
+    LITELLM_CLOUD_MAX_TOKENS = int(cfg.get("litellm", {}).get("max_tokens", LITELLM_CLOUD_MAX_TOKENS))
+    LITELLM_CLOUD_TIMEOUT_SECONDS = float(cfg.get("litellm", {}).get("timeout_seconds", LITELLM_CLOUD_TIMEOUT_SECONDS))
 
     # Tokens
     global DEFAULT_DIRECT_MAX_TOKENS, DEFAULT_AGENT_MAX_TOKENS
     global SUB_AGENT_TIMEOUT_SECONDS, VERIFY_TIMEOUT_SECONDS
-    if not os.getenv("DIRECT_MAX_TOKENS"):
-        DEFAULT_DIRECT_MAX_TOKENS = cfg.get("tokens", {}).get("direct_max_tokens", DEFAULT_DIRECT_MAX_TOKENS)
-    if not os.getenv("SUB_AGENT_MAX_TOKENS"):
-        DEFAULT_AGENT_MAX_TOKENS = cfg.get("tokens", {}).get("agent_max_tokens", DEFAULT_AGENT_MAX_TOKENS)
-    if not os.getenv("SUB_AGENT_TIMEOUT_SECONDS"):
-        raw = cfg.get("tokens", {}).get("sub_agent_timeout_seconds", SUB_AGENT_TIMEOUT_SECONDS)
-        SUB_AGENT_TIMEOUT_SECONDS = max(float(raw), 120.0)  # mind. 120s wg. DFlash JIT
-        _log(f"  ⏱ SUB_AGENT_TIMEOUT_SECONDS = {SUB_AGENT_TIMEOUT_SECONDS:.0f}s (cfg raw={raw})")
-    if not os.getenv("VERIFY_TIMEOUT_SECONDS"):
-        VERIFY_TIMEOUT_SECONDS = cfg.get("tokens", {}).get("verify_timeout_seconds", VERIFY_TIMEOUT_SECONDS)
+    DEFAULT_DIRECT_MAX_TOKENS = int(cfg.get("tokens", {}).get("direct_max_tokens", DEFAULT_DIRECT_MAX_TOKENS))
+    DEFAULT_AGENT_MAX_TOKENS = int(cfg.get("tokens", {}).get("agent_max_tokens", DEFAULT_AGENT_MAX_TOKENS))
+    raw = cfg.get("tokens", {}).get("sub_agent_timeout_seconds", SUB_AGENT_TIMEOUT_SECONDS)
+    SUB_AGENT_TIMEOUT_SECONDS = max(float(raw), 120.0)
+    _log(f"  ⏱ SUB_AGENT_TIMEOUT_SECONDS = {SUB_AGENT_TIMEOUT_SECONDS:.0f}s (cfg raw={raw})")
+    VERIFY_TIMEOUT_SECONDS = float(cfg.get("tokens", {}).get("verify_timeout_seconds", VERIFY_TIMEOUT_SECONDS))
 
     # Caveman
     global CAVEMAN_ENABLED, CAVEMAN_MAX_TOKENS
-    if not os.getenv("CAVEMAN_ENABLED"):
-        CAVEMAN_ENABLED = cfg.get("caveman", {}).get("enabled", CAVEMAN_ENABLED)
-    if not os.getenv("CAVEMAN_MAX_TOKENS"):
-        CAVEMAN_MAX_TOKENS = cfg.get("tokens", {}).get("caveman_max_tokens", CAVEMAN_MAX_TOKENS)
+    CAVEMAN_ENABLED = bool(cfg.get("caveman", {}).get("enabled", CAVEMAN_ENABLED))
+    CAVEMAN_MAX_TOKENS = int(cfg.get("tokens", {}).get("caveman_max_tokens", CAVEMAN_MAX_TOKENS))
 
     # Hindsight
     global HINDSIGHT_ENABLED, QDRANT_URL, QDRANT_API_KEY, HINDSIGHT_COLLECTION
     global HINDSIGHT_EMBEDDING_DIM, HINDSIGHT_MAX_MEMORY_TOKENS, HINDSIGHT_MIN_SIMILARITY
     global HINDSIGHT_RETAIN_DELAY_SECONDS, HINDSIGHT_USE_QDRANT, HINDSIGHT_DIR
-    if not os.getenv("HINDSIGHT_ENABLED"):
-        HINDSIGHT_ENABLED = cfg.get("hindsight", {}).get("enabled", HINDSIGHT_ENABLED)
-    if not os.getenv("QDRANT_URL"):
-        QDRANT_URL = cfg.get("hindsight", {}).get("qdrant_url", QDRANT_URL)
-    # Qdrant API-Key: Env hat Vorrang (Coolify Docker)
+    HINDSIGHT_ENABLED = bool(cfg.get("hindsight", {}).get("enabled", HINDSIGHT_ENABLED))
+    QDRANT_URL = cfg.get("hindsight", {}).get("qdrant_url", QDRANT_URL)
     qk = cfg.get("hindsight", {}).get("qdrant_api_key", "")
-    if qk and not os.getenv("QDRANT_API_KEY"):
+    if qk:
         QDRANT_API_KEY = qk
-    if not os.getenv("HINDSIGHT_COLLECTION"):
-        HINDSIGHT_COLLECTION = cfg.get("hindsight", {}).get("collection", HINDSIGHT_COLLECTION)
-    if not os.getenv("HINDSIGHT_EMBEDDING_DIM"):
-        val = cfg.get("hindsight", {}).get("embedding_dim", HINDSIGHT_EMBEDDING_DIM)
-        HINDSIGHT_EMBEDDING_DIM = int(val) if not isinstance(val, int) else val
-    if not os.getenv("HINDSIGHT_MAX_MEMORY_TOKENS"):
-        val = cfg.get("hindsight", {}).get("max_memory_tokens", HINDSIGHT_MAX_MEMORY_TOKENS)
-        HINDSIGHT_MAX_MEMORY_TOKENS = int(val) if not isinstance(val, int) else val
-    if not os.getenv("HINDSIGHT_MIN_SIMILARITY"):
-        val = cfg.get("hindsight", {}).get("min_similarity", HINDSIGHT_MIN_SIMILARITY)
-        HINDSIGHT_MIN_SIMILARITY = float(val) if not isinstance(val, (int, float)) else val
-    if not os.getenv("HINDSIGHT_RETAIN_DELAY_SECONDS"):
-        val = cfg.get("hindsight", {}).get("retain_delay_seconds", HINDSIGHT_RETAIN_DELAY_SECONDS)
-        HINDSIGHT_RETAIN_DELAY_SECONDS = float(val) if not isinstance(val, (int, float)) else val
-    if not os.getenv("HINDSIGHT_USE_QDRANT"):
-        HINDSIGHT_USE_QDRANT = cfg.get("hindsight", {}).get("use_qdrant", HINDSIGHT_USE_QDRANT)
-    if not os.getenv("HINDSIGHT_DIR"):
-        HINDSIGHT_DIR = Path(cfg.get("hindsight", {}).get("dir", str(HINDSIGHT_DIR)))
+    HINDSIGHT_COLLECTION = cfg.get("hindsight", {}).get("collection", HINDSIGHT_COLLECTION)
+    val_ed = cfg.get("hindsight", {}).get("embedding_dim", HINDSIGHT_EMBEDDING_DIM)
+    HINDSIGHT_EMBEDDING_DIM = int(val_ed) if not isinstance(val_ed, int) else val_ed
+    val_mt = cfg.get("hindsight", {}).get("max_memory_tokens", HINDSIGHT_MAX_MEMORY_TOKENS)
+    HINDSIGHT_MAX_MEMORY_TOKENS = int(val_mt) if not isinstance(val_mt, int) else val_mt
+    val_ms = cfg.get("hindsight", {}).get("min_similarity", HINDSIGHT_MIN_SIMILARITY)
+    HINDSIGHT_MIN_SIMILARITY = float(val_ms) if not isinstance(val_ms, (int, float)) else val_ms
+    val_rd = cfg.get("hindsight", {}).get("retain_delay_seconds", HINDSIGHT_RETAIN_DELAY_SECONDS)
+    HINDSIGHT_RETAIN_DELAY_SECONDS = float(val_rd) if not isinstance(val_rd, (int, float)) else val_rd
+    HINDSIGHT_USE_QDRANT = bool(cfg.get("hindsight", {}).get("use_qdrant", HINDSIGHT_USE_QDRANT))
+    HINDSIGHT_DIR = Path(cfg.get("hindsight", {}).get("dir", str(HINDSIGHT_DIR)))
 
     # Verify
     global VERIFY_ENABLED, VERIFY_LINT_COMMAND, VERIFY_TEST_COMMAND
-    if not os.getenv("VERIFY_ENABLED"):
-        VERIFY_ENABLED = cfg.get("verify", {}).get("enabled", VERIFY_ENABLED)
-    if not os.getenv("VERIFY_LINT_COMMAND"):
-        VERIFY_LINT_COMMAND = cfg.get("verify", {}).get("lint_command", VERIFY_LINT_COMMAND)
-    if not os.getenv("VERIFY_TEST_COMMAND"):
-        VERIFY_TEST_COMMAND = cfg.get("verify", {}).get("test_command", VERIFY_TEST_COMMAND)
+    VERIFY_ENABLED = bool(cfg.get("verify", {}).get("enabled", VERIFY_ENABLED))
+    VERIFY_LINT_COMMAND = cfg.get("verify", {}).get("lint_command", VERIFY_LINT_COMMAND)
+    VERIFY_TEST_COMMAND = cfg.get("verify", {}).get("test_command", VERIFY_TEST_COMMAND)
 
     # MCP
     global MCP_ENABLED
-    if not os.getenv("MCP_ENABLED"):
-        MCP_ENABLED = cfg.get("mcp", {}).get("enabled", MCP_ENABLED)
+    MCP_ENABLED = bool(cfg.get("mcp", {}).get("enabled", MCP_ENABLED))
 
 
 _apply_config_file()
