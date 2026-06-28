@@ -258,6 +258,32 @@ def _tool_signature(tool_call: Dict[str, Any]) -> str:
     return f"{name}|{arg_hash}"
 
 
+def _tool_call_has_args(tool_call: Dict[str, Any]) -> bool:
+    """Prüft ob ein Tool-Call sinnvolle Argumente hat.
+
+    Kimi generiert manchmal Tool-Calls mit leeren/ungültigen Argumenten
+    (z.B. read_file ohne filePath, grep_search ohne query). Das sind
+    Model-Glitches, KEINE echten Loop-Indikatoren. Diese Funktion
+    erkennt solche invaliden Calls, damit sie aus der Loop-Erkennung
+    ausgeschlossen werden können.
+    """
+    func = tool_call.get("function") or {} if isinstance(tool_call, dict) else {}
+    args_raw = func.get("arguments", "")
+    try:
+        if isinstance(args_raw, str):
+            if not args_raw.strip():
+                return False
+            args_dict = json.loads(args_raw)
+        elif isinstance(args_raw, dict):
+            args_dict = args_raw
+        else:
+            return False
+    except Exception:
+        return False
+    # Leeres Dict nach JSON-Parsing → kein sinnvolles Argument
+    return bool(args_dict)
+
+
 def _extract_tool_file_refs(tool_calls: Optional[List[Dict[str, Any]]]) -> List[str]:
     """Extrahiert Datei-/Pfad-Referenzen aus Tool-Args als Fortschritts-Metrik.
 
@@ -3846,6 +3872,14 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         if new_calls:
             sigs = session.setdefault("tool_signatures", [])
             for tc in new_calls:
+                # Invalide Tool-Calls (leere Args) nicht tracken — das sind
+                # Model-Glitches (z.B. read_file ohne filePath) und KEINE
+                # echten Loop-Indikatoren. Sonst wird der Planner bei Runde 3
+                # fälschlich zum Plan-Output gezwungen.
+                if not _tool_call_has_args(tc):
+                    name = (tc.get("function") or {}).get("name", "?")
+                    _log(f"  ⚠ Malformed tool_call '{name}' ohne Args → nicht in Loop-Erkennung")
+                    continue
                 sigs.append(_tool_signature(tc))
             # Fortschritts-Metrik: neue File-Refs hinzufügen
             refs = _extract_tool_file_refs(new_calls)
