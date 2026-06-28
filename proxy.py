@@ -1835,7 +1835,58 @@ def _build_worker_payload(
 
     messages = list(payload.get("messages", []))
 
-    # ══ Tool-Result-Truncation (NEU): verhindert Token-Bombing ════════
+    # ══ PLAN-CENTRIC MESSAGE TRIAGE ═══════════════════════════════════
+    # Der Worker bekommt NUR:
+    #   1. System-Prompt (mit Tool-Definitionen)
+    #   2. Die originale User-Anfrage (erste User-Message)
+    #   3. Den Plan (als Binding + Context, siehe unten)
+    #   4. Continuation: letzter Tool-Call/Result-Zyklus (falls vorhanden)
+    #
+    # Der GESAMTE Planner-Verlauf (Kimi Tool-Calls, Zwischenergebnisse,
+    # Reasoning-Content) wird ENTFERNT. Das spart Tokens, entlastet das
+    # (oft lokale) Modell und macht den Plan zur dominierenden Instruktion.
+    system_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "system"]
+    first_user_idx = None
+    for i, m in enumerate(messages):
+        if isinstance(m, dict) and m.get("role") == "user":
+            content = m.get("content", "")
+            if isinstance(content, str) and content.strip():
+                first_user_idx = i
+                break
+            if isinstance(content, list) and content:
+                first_user_idx = i
+                break
+    has_tool_msgs = any(isinstance(m, dict) and m.get("role") == "tool" for m in messages)
+    if has_tool_msgs:
+        # Continuation: Worker-Tool-Call-Zyklus behalten.
+        # Suche die letzte assistant-message MIT tool_calls (Worker-Aufruf)
+        # und alles ab der davorliegenden Message (tool-result oder user).
+        last_worker_asst = None
+        for i in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[i], dict) and messages[i].get("role") == "assistant" and messages[i].get("tool_calls"):
+                last_worker_asst = i
+                break
+        new_msgs = list(system_msgs)
+        if first_user_idx is not None:
+            new_msgs.append(messages[first_user_idx])
+        if last_worker_asst is not None:
+            ctx_start = max(0, last_worker_asst - 1)
+            for j in range(ctx_start, len(messages)):
+                if j == first_user_idx:
+                    continue
+                new_msgs.append(messages[j])
+        messages = new_msgs
+        _log(f"  ✂ Worker-Payload: {len(messages)} Messages (Plan-Centric, Continuation)")
+    else:
+        # Erster Aufruf: nur System + User-Request
+        new_msgs = list(system_msgs)
+        if first_user_idx is not None:
+            new_msgs.append(messages[first_user_idx])
+        messages = new_msgs
+        original_count = len(body.get("messages", []))
+        _log(f"  ✂ Worker-Payload: {len(messages)} Messages (Plan-Centric, {original_count}→{len(messages)} stripped)")
+
+    # ══ Tool-Result-Truncation: verhindert Token-Bombing ══════════════
     # Wenn VS Code riesige Tool-Results (z.B. 111KB grep_hits) zurückschickt,
     # explodiert der Payload. Cap hart auf TOOL_RESULT_CAP chars pro Tool-Msg.
     _cap_tool_results_inplace(messages, "Worker")
