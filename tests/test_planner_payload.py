@@ -65,7 +65,7 @@ pytestmark = pytest.mark.skipif(not HAS_PROXY, reason=SKIP_REASON)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Test 1: tool_call_id-Konsistenz im Recap-Payload
+# Helper-Funktionen
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -97,103 +97,94 @@ def _make_session(iterations: int = 3, files: int = 3) -> dict:
     }
 
 
-def test_recap_payload_only_includes_tool_results_matching_last_assistant_tool_calls():
-    """Bug 1: Recap-Payload darf NUR tool_results für die tool_calls der
-    LETZTEN assistant-Message enthalten, sonst → 'tool_call_id not found'.
-    """
+# ═══════════════════════════════════════════════════════════════════════════
+# Test 1: Recap-Payload — KEIN assistant/tool-Durchreich mehr
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_recap_payload_has_no_assistant_or_tool_messages():
+    """NEUES VERHALTEN: Recap-Payload enthält NUR system + user messages.
+    Früher wurden assistant+tool_calls durchgereicht, was zu 'tool_call_id
+    not found' (400) und invaliden tool_calls führte. Jetzt nicht mehr."""
     body = {
         "messages": [
-            {"role": "system", "content": "sys"},
+            {"role": "system", "content": "Originaler System-Prompt mit Tool-Schemas"},
             {"role": "user", "content": "Bitte einen Plan erstellen für Feature X"},
-            # Erste Assistent-Runde (älter) mit 2 tool_calls
             {"role": "assistant", "content": "", "tool_calls": [
-                _make_tool_call("tc_old_1"),
-                _make_tool_call("tc_old_2"),
+                _make_tool_call("tc_1"),
+                _make_tool_call("tc_2"),
             ]},
-            _make_tool_result("tc_old_1", "result for old 1"),
-            _make_tool_result("tc_old_2", "result for old 2"),
-            # Letzte Assistent-Runde: 4 tool_calls, ABER wir fügen nur die
-            # letzen 2 tool_results hinzu — Müll!
-            {"role": "assistant", "content": "", "tool_calls": [
-                _make_tool_call("tc_new_1"),
-                _make_tool_call("tc_new_2"),
-                _make_tool_call("tc_new_3"),
-                _make_tool_call("tc_new_4"),
-            ]},
-            # Erwartet: Recap-Payload darf hier NUR tool_results anhängen,
-            # die zu {tc_new_1..4} gehören.angingefügte alte results müssen
-            # ignoriert werden.
-            _make_tool_result("tc_new_1", "r1"),
-            _make_tool_result("tc_new_2", "r2"),
-            _make_tool_result("tc_new_3", "r3"),
-            _make_tool_result("tc_new_4", "r4"),
+            _make_tool_result("tc_1", "result 1"),
+            _make_tool_result("tc_2", "result 2"),
         ]
     }
-
     payload = proxy._build_planner_tool_continuation_context(
         body=body,
         session=_make_session(),
         original_task="Plan erstellen für Feature X",
     )
-
     msgs = payload["messages"]
-    # Finde die letzte assistant-Message
-    last_asst_idx = max(i for i, m in enumerate(msgs) if m.get("role") == "assistant")
-    # Alle Messages danach müssen tool-Results sein — UND deren IDs müssen
-    # in den tool_calls der last-assistant stehen.
-    expected_ids = {tc["id"] for tc in msgs[last_asst_idx].get("tool_calls", [])}
-    for m in msgs[last_asst_idx + 1:]:
-        assert m["role"] == "tool", f"message after last assistant must be tool, got {m.get('role')}"
-        tc_id = m.get("tool_call_id")
-        assert tc_id in expected_ids, (
-            f"tool_call_id {tc_id!r} nicht in last-assistant-tool_calls {expected_ids}. "
-            f"DAS IST DER KIMI-400-BUG."
+    # Recap darf KEINE assistant/tool roles enthalten
+    for m in msgs:
+        assert m["role"] in ("system", "user"), (
+            f"Recap-Payload enthält unerwartete role={m['role']!r} — "
+            f"nur system/user erlaubt. Altes assistant/tool-pass-through wurde entfernt."
         )
+    # Aber original system prompt MUSS erhalten sein
+    system_msgs = [m for m in msgs if m["role"] == "system"]
+    assert len(system_msgs) == 1
+    assert "Originaler System-Prompt" in system_msgs[0]["content"]
+    assert "PLANNER AGENT MODE" in system_msgs[0]["content"]
 
 
-def test_recap_payload_never_forgets_tool_result_for_last_assistant_call():
-    """Bug 1 (Spiegel): Jede tool_call_id der letzten assistant-Message
-    MUSS einen matching tool_result haben. Sonst 400."""
+def test_recap_payload_includes_original_task_and_exploration_recap():
+    """Recap-Payload enthält (1) original task und (2) exploration recap.
+    Die exploration recap ist die einzige Informationsquelle über vorherige
+    tool_calls — kein direkter assistant/tool-pass-through mehr."""
+    body = {
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "Implementiere Feature Y"},
+            # Zwei Runden Assistant + Tool (exploration)
+            {"role": "assistant", "content": "", "tool_calls": [
+                _make_tool_call("a", "read_file", '{"filePath": "/foo.py"}'),
+            ]},
+            _make_tool_result("a", "def foo(): pass"),
+            {"role": "assistant", "content": "", "tool_calls": [
+                _make_tool_call("b", "grep_search", '{"query": "bar"}'),
+            ]},
+            _make_tool_result("b", "line 42: bar = 1"),
+        ]
+    }
+    payload = proxy._build_planner_tool_continuation_context(
+        body=body,
+        session=_make_session(),
+        original_task="Implementiere Feature Y",
+    )
+    msgs = payload["messages"]
+    texts = [str(m.get("content", "")) for m in msgs]
+
+    # Original-Task muss enthalten sein
+    assert any("Feature Y" in t for t in texts), "original task fehlt im Recap"
+
+    # Exploration Recap muss die tool_calls erwähnen
+    recap_texts = " ".join(texts)
+    assert "EXPLORATION RECAP" in recap_texts, "EXPLORATION RECAP fehlt"
+    assert "read_file" in recap_texts, "tool read_file fehlt in exploration recap"
+    assert "grep_search" in recap_texts, "tool grep_search fehlt in exploration recap"
+
+
+def test_recap_payload_never_contains_assistant_or_tool_even_with_reasoning():
+    """Auch wenn reasoning_content im Original war: Recap enthält KEINE
+    assistant-Message. reasoning_content wird NICHT durchgereicht (der
+    Recap-Payload ist ein Neustart, keine Continuation)."""
     body = {
         "messages": [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "task"},
             {"role": "assistant", "content": "", "tool_calls": [
                 _make_tool_call("a"),
-                _make_tool_call("b"),
-                _make_tool_call("c"),
-            ]},
-            _make_tool_result("a", "r-a"),
-            _make_tool_result("c", "r-c"),  # 'b' fehlt im Input
-        ]
-    }
-    payload = proxy._build_planner_tool_continuation_context(
-        body=body, session=_make_session(), original_task="task",
-    )
-    msgs = payload["messages"]
-    last_asst_idx = max(i for i, m in enumerate(msgs) if m.get("role") == "assistant")
-    last_asst_tc_ids = {tc["id"] for tc in msgs[last_asst_idx].get("tool_calls", [])}
-    provided_ids = {m.get("tool_call_id") for m in msgs[last_asst_idx + 1:] if m.get("role") == "tool"}
-    # 'b' kann nicht lieferbar sein (Input unvollständig) - aber dann muss
-    # der Recap-Payload 'b' aus den tool_calls der last-assistant entfernen!
-    orphan_ids = last_asst_tc_ids - provided_ids
-    assert not orphan_ids, (
-        f"tool_call_ids ohne matching result: {orphan_ids}. "
-        f"Recap-Payload muss orphan tool_calls DROPPEN statt result leer zu lassen."
-    )
-
-
-def test_recap_payload_preserves_reasoning_content_for_thinking_mode():
-    """Bug 2: DeepSeek V4 im thinking mode braucht reasoning_content auch
-    im Recap-Payload, sonst: 400 'reasoning_content must be passed back'.
-    """
-    body = {
-        "messages": [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": "task"},
-            {"role": "assistant", "content": "arbeite", "tool_calls": [
-                _make_tool_call("a"),
-            ], "reasoning_content": "< denken, denken, denken >"},
+            ], "reasoning_content": "< denken, denken >"},
             _make_tool_result("a", "result-a"),
         ]
     }
@@ -201,13 +192,16 @@ def test_recap_payload_preserves_reasoning_content_for_thinking_mode():
         body=body, session=_make_session(), original_task="task",
     )
     msgs = payload["messages"]
-    last_asst_idx = max(i for i, m in enumerate(msgs) if m.get("role") == "assistant")
-    last_asst = msgs[last_asst_idx]
-    assert "reasoning_content" in last_asst, (
-        "letzte assistant-Message im Recap-Payload hat KEIN reasoning_content — "
-        "DeepSeek-V4 thinking mode wirft 400."
+    assistant_msgs = [m for m in msgs if m["role"] == "assistant"]
+    assert len(assistant_msgs) == 0, (
+        f"Recap enthält {len(assistant_msgs)} assistant-Messages — "
+        f"tool_call-pass-through wurde entfernt."
     )
-    assert last_asst["reasoning_content"], "reasoning_content ist leer/None"
+    tool_msgs = [m for m in msgs if m["role"] == "tool"]
+    assert len(tool_msgs) == 0, (
+        f"Recap enthält {len(tool_msgs)} tool-Messages — "
+        f"tool_call-pass-through wurde entfernt."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

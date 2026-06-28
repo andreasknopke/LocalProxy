@@ -2759,19 +2759,23 @@ def _build_planner_tool_continuation_context(
     original_task: str,
     tools: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Baut einen KOMPRAKTIERTEN Planner-Payload für Runde N+1 (Tool-Cont.)
+    """Baut einen KOMPAKTEN Planner-Payload für Runde N+1 (Tool-Cont.)
 
     Anstatt dem Kimi die volle 200+ Message-History (inklusive 111KB
     grep-Treffern) vorzuwerfen, kriegt es einen fokussierten Payload:
 
-      [system] Planner-Contract
+      [system] Originaler VS-Code-Systemprompt + Planner-Instruktionen
       [user]   ORIGINAL_TASK
-      [user]   EXPLORATION RECAP + nudge "du hast genug gesehen → PLAN"
-      [assistant] (last assistant with tool_calls — die Anweisung von Kimi
-                                  wurde hierfür bereits von VS Code ausgeführt)
-      [tool..] (last 2 tool results, jeweils gekappt auf 1000 chars)
+      [user]   EXPLORATION RECAP (was bereits untersucht wurde) + nudge
 
-    Hinweis: 'tools'-Schemas werden mitgegeben (filtered, read-only).
+    Wichtig: KEIN tool_calls/tool_results-Durchreich mehr!
+    Früher wurde die letzte assistant-tool_calls + passende tool_results
+    kopiert, was zu 'tool_call_id not found' (400) und invaliden tool_calls
+    (filePath fehlt) führte. Jetzt startet Kimi in jeder Recap-Runde frisch
+    — es kann entweder weiter explorieren (valide tool_calls) oder den Plan
+    ausgeben.
+
+    'tools'-Schemas werden mitgegeben (filtered, read-only).
     """
     messages = body.get("messages", [])
     iterations = int(session.get("iterations", 0))
@@ -2829,74 +2833,19 @@ def _build_planner_tool_continuation_context(
             )
         new_messages.append({"role": "user", "content": recap + nudge})
 
-    # Letzte assistant.tool_calls-Message übernehmen (Kimi hatte diese in
-    # voriger Runde generiert, VS Code hat sie ausgeführt → jetzt sind die
-    # tool-results da). Das ist tools/passthrough-essential.
-    last_assistant_with_tools: Optional[Dict[str, Any]] = None
-    last_tool_results: List[Dict[str, Any]] = []
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            last_assistant_with_tools = msg  # immer letzte merken
-            # Neue assistant-Message → Tool-Result-Liste RESET.
-            # Nicht immer — siehe Finalisierung unten: wir nehmen nur die
-            # tool-Results, die NACH der letzten assistant-Message stehen.
-            last_tool_results = []
-        elif msg.get("role") == "tool":
-            last_tool_results.append(msg)
-
-    if last_assistant_with_tools:
-        # ── tool_call-id ↔ tool_result-id Konsistenz prüfen ─────────
-        # Bug: 'tool_call_id is not found' (HTTP 400 von Moonshot).
-        # Ursache: Last-assistant hat N tool_calls, aber der Recap-Payload
-        # hängt M≠N tool-results an (weil wir -2: oder tail nehmen). Lösung:
-        # Mapping tool_result ↔ tool_call_id, dann orphan-Tool-Calls droppen.
-        original_tool_calls = last_assistant_with_tools.get("tool_calls", []) or []
-        # Step 1: tool-Results nach tool_call_id indexieren.
-        results_by_id: Dict[str, Dict[str, Any]] = {}
-        for tr in last_tool_results:
-            tcid = tr.get("tool_call_id")
-            if tcid and tcid not in results_by_id:
-                results_by_id[tcid] = tr
-        # Step 2: Letzte max 2 IDs, geordnet wie tool_calls in Original.
-        # Wenn ein tool_call kein Result hat → DROP den tool_call aus
-        # new_messages, sonst kommt es zum 400-Fehler.
-        kept_tool_calls: List[Dict[str, Any]] = []
-        kept_results: List[Dict[str, Any]] = []
-        for tc in original_tool_calls:
-            tc_id = tc.get("id") if isinstance(tc, dict) else ""
-            if tc_id and tc_id in results_by_id:
-                kept_tool_calls.append(tc)
-                kept_results.append(results_by_id[tc_id])
-        if len(kept_tool_calls) < len(original_tool_calls):
-            dropped = len(original_tool_calls) - len(kept_tool_calls)
-            _log(f"  ⚠ Recap-Payload: {dropped} orphan tool_call(s) ohne Result gedroppt "
-                 f"(vermeiden 'tool_call_id not found' 400)")
-
-        # Step 3: clean assistant nur MIT matched-Tool-Calls aufbauen.
-        # Reasoning-Content PRESERVIEREN, falls vorhanden — DeepSeek-V4
-        # verlangt im thinking-mode reasoning_content bei Tool-Returns.
-        if kept_tool_calls:
-            clean_assistant: Dict[str, Any] = {
-                "role": "assistant",
-                "content": last_assistant_with_tools.get("content") or "",
-                "tool_calls": kept_tool_calls,
-            }
-            rc = last_assistant_with_tools.get("reasoning_content")
-            if rc:
-                clean_assistant["reasoning_content"] = rc
-            new_messages.append(clean_assistant)
-
-            # Step 4: ALLE tool-Results anhängen, in ORDNUNG wie ihre tool_calls.
-            # Jeder einzelne ist bereits auf 1000 chars gekappt. Kein -2: mehr,
-            # sonst mismatch tool_calls↔tool_results → Kimi 400.
-            for tr in kept_results:
-                body_tr = dict(tr)
-                content = body_tr.get("content", "")
-                if isinstance(content, str) and len(content) > 1000:
-                    body_tr["content"] = content[:1000] + "\n...[TRUNCATED]"
-                new_messages.append(body_tr)
+    # ══ KEIN tool_calls/tool_results-Durchreich mehr ═══════════════════
+    # Früher wurde die letzte assistant-tool_calls-Message + passende
+    # tool_results in den Recap-Payload kopiert. Das hat in der Praxis
+    # zu zwei Fehlern geführt:
+    #   1) tool_call_id mismatch (Kimi 400 'tool_call_id not found') weil
+    #      tool_results aus vorherigen Sessions die IDs überschreiben.
+    #   2) Kimi generiert im Recap-Modus invalide tool_calls (ohne filePath,
+    #      path, command) weil der kontextuelle Bezug fehlt.
+    #
+    # Neuer Ansatz: Recap enthält NUR System + Task + Exploration-Summary.
+    # Kimi startet in jeder Recap-Runde frisch: entweder es exploriert
+    # weiter (mit validen tool_calls) oder es gibt den Plan aus.
+    # Der _summarize_exploration()-Text sagt Kimi was es schon gesehen hat.
 
     new_payload = copy.deepcopy(body)
     new_payload["messages"] = new_messages
