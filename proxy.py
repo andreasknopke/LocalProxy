@@ -1658,6 +1658,14 @@ def _build_direct_payload(
     # ALLE Messages behalten – kein Compact!
     # Die System-Message (mit Tool-Definitionen) muss immer erhalten bleiben.
     payload["messages"] = list(payload.get("messages", []))
+    # Tool-Result-Truncation + image_url-Sanitizer für text-only Models.
+    # Spiegelung von _build_worker_payload — der Fallback-Pfad nach
+    # Planner-Failure nutzt _build_direct_payload statt _build_worker_payload.
+    messages = payload["messages"]
+    _cap_tool_results_inplace(messages, "DirectPayload")
+    effective_model = model_name or body.get("model") or MODEL_NAME
+    if _is_text_only_model(effective_model):
+        _sanitize_image_urls_inplace(messages, "DirectPayload")
     return _clean_payload(payload, keep_tools=True)
 
 
@@ -2769,9 +2777,19 @@ def _build_planner_tool_continuation_context(
     iterations = int(session.get("iterations", 0))
     distinct_files_count = len(session.get("distinct_files") or [])
 
-    # Planner-Contract-System (klar und trennscharf vom Worker).
-    planner_system = (
-        "You are a STRATEGIC PLANNING AGENT. You have access to VS Code tools. "
+    # ══ System-Prompt: originalen Kontext BEWAHREN + Planner-Instruktionen anhängen ══
+    # WICHTIG: Der originale System-Prompt enthält Tool-Schemas, JSON-Format-Vorgaben
+    # und <toolUseInstructions>. Ohne diese generiert Kimi invalide tool_calls
+    # (z.B. read_file ohne filePath → 400 von VS Code).
+    # Gleiche Strategie wie in Runde 1 (dort wird planner_system auch angehängt).
+    original_system = ""
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "system":
+            original_system = str(msg.get("content", ""))
+            break
+    planner_instructions = (
+        "\n\n[PLANNER AGENT MODE — appended by proxy]\n"
+        "You are now acting as a STRATEGIC PLANNING AGENT. You have access to VS Code tools. "
         "Your job: EXPLORE the workspace, UNDERSTAND the user's task, then "
         "PRODUCE AN EXECUTION PLAN in Markdown.\n\n"
         "Rules:\n"
@@ -2784,6 +2802,10 @@ def _build_planner_tool_continuation_context(
         "4. If a tool result is unhelpful (e.g. empty matches), DO NOT retry "
         "the same tool with the same args — change strategy or move on.\n"
     )
+    if original_system:
+        planner_system = original_system + planner_instructions
+    else:
+        planner_system = planner_instructions
 
     new_messages: List[Dict[str, Any]] = [
         {"role": "system", "content": planner_system},
@@ -2866,9 +2888,10 @@ def _build_planner_tool_continuation_context(
                 clean_assistant["reasoning_content"] = rc
             new_messages.append(clean_assistant)
 
-            # Step 4: max 2 letzte tool-Results anhängen, in ORDNUNG wie
-            # ihre tool_calls (Recap-Kontext kompakt halten, aber gültig).
-            for tr in kept_results[-2:]:
+            # Step 4: ALLE tool-Results anhängen, in ORDNUNG wie ihre tool_calls.
+            # Jeder einzelne ist bereits auf 1000 chars gekappt. Kein -2: mehr,
+            # sonst mismatch tool_calls↔tool_results → Kimi 400.
+            for tr in kept_results:
                 body_tr = dict(tr)
                 content = body_tr.get("content", "")
                 if isinstance(content, str) and len(content) > 1000:
@@ -3014,6 +3037,24 @@ async def _call_cloud_planner_agent(
             _log(f"  🛑 Planner LOOP erkannt ({loop_reason}, iter={iteration}) → erzwinge Plan-Output")
             payload.pop("tools", None)
             payload.pop("tool_choice", None)
+            # Auch tool_calls aus letzter assistant-Message entfernen, wenn
+            # nicht genug tool_results folgen (sonst 400 'tool_call_id not found').
+            # Und selbst wenn genug: ohne tools darf Kimi keine tool_calls
+            # generieren → entfernen, der Force-Text verbietet es explizit.
+            for i, msg in enumerate(cur_messages):
+                if isinstance(msg, dict) and msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    following_results = sum(
+                        1 for m in cur_messages[i+1:]
+                        if isinstance(m, dict) and m.get("role") == "tool"
+                    )
+                    tc_count = len(msg.get("tool_calls", []))
+                    if tc_count > following_results:
+                        _log(f"  🧹 Loop-Detection: {tc_count} tool_calls auf assistant entfernt "
+                             f"(nur {following_results}/tool results folgen — 400-Risiko)")
+                        msg.pop("tool_calls", None)
+                    # Auch bei match: Reasoning-Content entfernen, damit
+                    # Kimi nicht denkt es sei noch im Tool-Modus.
+                    msg.pop("reasoning_content", None)
             if cur_messages and isinstance(cur_messages[-1], dict) and cur_messages[-1].get("role") == "user":
                 force_msg = (
                     "\n\n[SYSTEM: Du scheinst in einer Schleife zu sein "
