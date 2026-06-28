@@ -1700,6 +1700,57 @@ def _cap_tool_results_inplace(messages: List[Dict[str, Any]], label: str = "Payl
     return capped_count
 
 
+# Models die als text-only gelten (kein multimodal Support → image_url 400).
+# Heuristisch: jeder Name, der 'deepseek' enthält. Falls Kimi o.ä. gemischt
+# wird, muss Liste erweitert werden.
+_TEXT_ONLY_MODEL_MARKERS = ("deepseek",)
+
+
+def _is_text_only_model(model_name: str) -> bool:
+    """True, wenn Model-Name auf einen text-only-Worker schließen lässt."""
+    if not model_name:
+        return False
+    name_lower = str(model_name).lower()
+    return any(marker in name_lower for marker in _TEXT_ONLY_MODEL_MARKERS)
+
+
+def _sanitize_image_urls_inplace(messages: List[Dict[str, Any]], label: str = "Payload") -> int:
+    """Entfernt 'image_url'-Parts aus multimodalem Content, weil text-only-
+    Models (wie DeepSeek V4) sonst HTTP 400 werfen ('unknown variant image_url').
+
+    Strategie:
+      - String-content: bleibt unverändert (kann nicht image_url enthalten).
+      - List-of-parts:
+          * 'image_url'-Parts werden GESTRIPPED.
+          * Wenn NUR image_url-Parts vorhanden → ersetze durch Fallback-Text,
+            damit die Message nicht inhaltslos wird.
+
+    Returns: Anzahl entfernte image_url-Parts.
+    """
+    removed = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        kept_parts: List[Dict[str, Any]] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                removed += 1
+                continue
+            kept_parts.append(part)
+        if removed and len(kept_parts) != len(content):
+            if not kept_parts:
+                # Content komplett leer nach Sanitize → Platzhalter setzen,
+                # sonst klagt die API ("content required").
+                kept_parts = [{"type": "text", "text": "[image content omitted: text-only model]"}]
+            msg["content"] = kept_parts
+    if removed:
+        _log(f"  🧼 {label}-Payload: {removed} image_url-Part(s) entfernt (text-only Model)")
+    return removed
+
+
 def _build_worker_payload(
     body: Dict[str, Any],
     plan: str,
@@ -1747,7 +1798,14 @@ def _build_worker_payload(
     # explodiert der Payload. Cap hart auf TOOL_RESULT_CAP chars pro Tool-Msg.
     _cap_tool_results_inplace(messages, "Worker")
 
-    # ══ reasoning_content von Kimi-Seite entfernen ════════════════════
+    # ══ image_url-Sanitizer für text-only Models ═════════════════════
+    # DeepSeek V4 wirft sonst 400 ('unknown variant image_url, expected text').
+    # Bedingte Anwendung: nur wenn das Ziel-Model text-only ist.
+    effective_model = model_name or body.get("model") or MODEL_NAME
+    if _is_text_only_model(effective_model):
+        _sanitize_image_urls_inplace(messages, "Worker")
+
+    # ══ reasoning_content von Kimi-Seite entfernen ═══════              
     removed = _strip_kimi_reasoning(messages)
     if removed:
         _log(f"  🧹 Worker-Payload: {removed} reasoning_content-Felder entfernt (Kimi-Thinking)")
@@ -2759,27 +2817,63 @@ def _build_planner_tool_continuation_context(
             continue
         if msg.get("role") == "assistant" and msg.get("tool_calls"):
             last_assistant_with_tools = msg  # immer letzte merken
+            # Neue assistant-Message → Tool-Result-Liste RESET.
+            # Nicht immer — siehe Finalisierung unten: wir nehmen nur die
+            # tool-Results, die NACH der letzten assistant-Message stehen.
+            last_tool_results = []
         elif msg.get("role") == "tool":
             last_tool_results.append(msg)
 
     if last_assistant_with_tools:
-        # content leeren (pure tool_calls), um Token-Bombing zu vermeiden
-        clean_assistant = {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": last_assistant_with_tools.get("tool_calls", []),
-        }
-        new_messages.append(clean_assistant)
+        # ── tool_call-id ↔ tool_result-id Konsistenz prüfen ─────────
+        # Bug: 'tool_call_id is not found' (HTTP 400 von Moonshot).
+        # Ursache: Last-assistant hat N tool_calls, aber der Recap-Payload
+        # hängt M≠N tool-results an (weil wir -2: oder tail nehmen). Lösung:
+        # Mapping tool_result ↔ tool_call_id, dann orphan-Tool-Calls droppen.
+        original_tool_calls = last_assistant_with_tools.get("tool_calls", []) or []
+        # Step 1: tool-Results nach tool_call_id indexieren.
+        results_by_id: Dict[str, Dict[str, Any]] = {}
+        for tr in last_tool_results:
+            tcid = tr.get("tool_call_id")
+            if tcid and tcid not in results_by_id:
+                results_by_id[tcid] = tr
+        # Step 2: Letzte max 2 IDs, geordnet wie tool_calls in Original.
+        # Wenn ein tool_call kein Result hat → DROP den tool_call aus
+        # new_messages, sonst kommt es zum 400-Fehler.
+        kept_tool_calls: List[Dict[str, Any]] = []
+        kept_results: List[Dict[str, Any]] = []
+        for tc in original_tool_calls:
+            tc_id = tc.get("id") if isinstance(tc, dict) else ""
+            if tc_id and tc_id in results_by_id:
+                kept_tool_calls.append(tc)
+                kept_results.append(results_by_id[tc_id])
+        if len(kept_tool_calls) < len(original_tool_calls):
+            dropped = len(original_tool_calls) - len(kept_tool_calls)
+            _log(f"  ⚠ Recap-Payload: {dropped} orphan tool_call(s) ohne Result gedroppt "
+                 f"(vermeiden 'tool_call_id not found' 400)")
 
-    # Letzte 2 tool-results anhängen, jeweils gekappt auf 1000 chars.
-    # WICHTIG: Original-tool_call_id beibehalten, sonst gibt's später
-    # mismatch wenn VS Code seine Antworten injiziert.
-    for tr in last_tool_results[-2:]:
-        body_tr = dict(tr)
-        content = body_tr.get("content", "")
-        if isinstance(content, str) and len(content) > 1000:
-            body_tr["content"] = content[:1000] + "\n...[TRUNCATED]"
-        new_messages.append(body_tr)
+        # Step 3: clean assistant nur MIT matched-Tool-Calls aufbauen.
+        # Reasoning-Content PRESERVIEREN, falls vorhanden — DeepSeek-V4
+        # verlangt im thinking-mode reasoning_content bei Tool-Returns.
+        if kept_tool_calls:
+            clean_assistant: Dict[str, Any] = {
+                "role": "assistant",
+                "content": last_assistant_with_tools.get("content") or "",
+                "tool_calls": kept_tool_calls,
+            }
+            rc = last_assistant_with_tools.get("reasoning_content")
+            if rc:
+                clean_assistant["reasoning_content"] = rc
+            new_messages.append(clean_assistant)
+
+            # Step 4: max 2 letzte tool-Results anhängen, in ORDNUNG wie
+            # ihre tool_calls (Recap-Kontext kompakt halten, aber gültig).
+            for tr in kept_results[-2:]:
+                body_tr = dict(tr)
+                content = body_tr.get("content", "")
+                if isinstance(content, str) and len(content) > 1000:
+                    body_tr["content"] = content[:1000] + "\n...[TRUNCATED]"
+                new_messages.append(body_tr)
 
     new_payload = copy.deepcopy(body)
     new_payload["messages"] = new_messages
