@@ -3469,11 +3469,18 @@ async def _call_cloud_as_worker(
         "temperature": 0.3,
         "stream": False,
     }
+    # reasoning_content von Kimi-Seite entfernen (DeepSeek 400 sonst)
+    removed_rc = _strip_kimi_reasoning(cloud_payload.get("messages", []))
+    if removed_rc:
+        _log(f"  🧹 Cloud-Fallback: {removed_rc} reasoning_content-Felder entfernt (Kimi-Thinking)")
     cloud_payload = _clean_payload(cloud_payload, keep_tools=False)
 
     # ── Versuch 1: LiteLLM (DeepSeek) ──────────────────────────────────
     if LITELLM_CLOUD_API_URL and LITELLM_CLOUD_API_KEY:
         cloud_payload["model"] = LITELLM_CLOUD_MODEL
+        # image_url entfernen (DeepSeek text-only)
+        if _is_text_only_model(LITELLM_CLOUD_MODEL):
+            _sanitize_image_urls_inplace(cloud_payload.get("messages", []), "Cloud-Fallback-LiteLLM")
         _patch_moonshot_payload(cloud_payload)
         headers = {"Authorization": f"Bearer {LITELLM_CLOUD_API_KEY}"}
         _log(f"  ☁️ Fallback-Versuch 1: LiteLLM model={LITELLM_CLOUD_MODEL}")
