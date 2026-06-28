@@ -3221,6 +3221,18 @@ async def _call_cloud_planner_agent(
                     # Reasoning-Content entfernen, damit Kimi nicht denkt
                     # es sei noch im Tool-Modus.
                     msg.pop("reasoning_content", None)
+                    # KRITISCH: Moonshot/Mimi wirft 400 "assistant must not be empty"
+                    # wenn content==""/None UND tool_calls entfernt wurden. Daher
+                    # synthetischen Kontext-Platzhalter einsetzen. Dies ist nur
+                    # string-fill um die API zu validieren - die_MESSAGE hat keine
+                    # Information weil das echte Workspace-Wissen in den
+                    # tool-Resultaten steckt, die wir gerade zu user gemacht haben.
+                    c = msg.get("content")
+                    if not (isinstance(c, str) and c.strip()):
+                        msg["content"] = (
+                            "[FRÜHERE TOOL-AUFRUFE ENTFERNT — Lies die folgenden "
+                            "Tool-Ergebnisse in den user-Nachrichten als Kontext.]"
+                        )
             # Nachdem ALLE tool_calls aus assistants entfernt wurden, haben
             # die tool-Rollen-Nachrichten verwaiste tool_call_ids, die von
             # der API mit 400 'tool_call_id not found' abgelehnt werden.
