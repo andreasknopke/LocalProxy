@@ -1696,6 +1696,10 @@ def _build_direct_payload(
     effective_model = model_name or body.get("model") or MODEL_NAME
     if _is_text_only_model(effective_model):
         _sanitize_image_urls_inplace(messages, "DirectPayload")
+    # reasoning_content von Kimi-Seite entfernen (DeepSeek 400 sonst)
+    removed_rc = _strip_kimi_reasoning(messages)
+    if removed_rc:
+        _log(f"  🧹 DirectPayload: {removed_rc} reasoning_content-Felder entfernt (Kimi-Thinking)")
     return _clean_payload(payload, keep_tools=True)
 
 
@@ -2963,6 +2967,29 @@ async def _call_cloud_planner_agent(
                  f"{len(truncated)} reduziert (Sliding Window={MAX_PLANNER_CONT_MESSAGES})")
             messages = truncated
 
+        # 🧹 Orphaned-Tool-Cleanup: Sliding Window kann tool-Messages
+        # ohne passenden assistant (mit tool_calls) hinterlassen.
+        # Solche verwaisten tool_call_ids führen zu 400 'tool_call_id not found'.
+        # Lösung: tool → user konvertieren (Content bleibt, tc_id fliegt raus).
+        valid_tc_ids = set()
+        for m in messages:
+            if isinstance(m, dict) and m.get("role") == "assistant":
+                tcs = m.get("tool_calls")
+                if isinstance(tcs, list):
+                    for tc in tcs:
+                        if isinstance(tc, dict) and tc.get("id"):
+                            valid_tc_ids.add(tc["id"])
+        orphaned = 0
+        for m in messages:
+            if isinstance(m, dict) and m.get("role") == "tool":
+                tc_id = m.get("tool_call_id", "")
+                if tc_id and tc_id not in valid_tc_ids:
+                    m["role"] = "user"
+                    m.pop("tool_call_id", None)
+                    orphaned += 1
+        if orphaned:
+            _log(f"  🧹 Planner-Cont: {orphaned} verwaiste tool→user konvertiert (tc_id nicht in Window)")
+
         # Tool-Results kappen (gleiche Logik wie Runde 1)
         _cap_tool_results_inplace(messages, "Planner-Cont")
         # Planner-Instructions an System-Prompt anhängen
@@ -3156,6 +3183,10 @@ async def _call_cloud_planner_agent(
         stage_payload = copy.deepcopy(payload)
         stage_payload["model"] = stage["model"]
         _patch_moonshot_payload(stage_payload)  # nur wirksam wenn model/url Moonshot ist
+        # image_url-Sanitizer für text-only Models (DeepSeek V4).
+        # Moonshot/Kimi akzeptiert image_url, DeepSeek wirft 400.
+        if _is_text_only_model(stage["model"]):
+            _sanitize_image_urls_inplace(stage_payload.get("messages", []), f"Planner-{stage_name}")
 
         # DEBUG: Per-Stage-Payload dumpen
         stage_call_id = f"{planner_call_id}_s{stage_idx+1}_{stage_name}"
