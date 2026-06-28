@@ -1846,16 +1846,14 @@ def _build_worker_payload(
     # Reasoning-Content) wird ENTFERNT. Das spart Tokens, entlastet das
     # (oft lokale) Modell und macht den Plan zur dominierenden Instruktion.
     system_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "system"]
-    first_user_idx = None
+    user_indices = []
     for i, m in enumerate(messages):
         if isinstance(m, dict) and m.get("role") == "user":
             content = m.get("content", "")
             if isinstance(content, str) and content.strip():
-                first_user_idx = i
-                break
-            if isinstance(content, list) and content:
-                first_user_idx = i
-                break
+                user_indices.append(i)
+            elif isinstance(content, list) and content:
+                user_indices.append(i)
     has_tool_msgs = any(isinstance(m, dict) and m.get("role") == "tool" for m in messages)
     if has_tool_msgs:
         # Continuation: Worker-Tool-Call-Zyklus behalten.
@@ -1867,21 +1865,52 @@ def _build_worker_payload(
                 last_worker_asst = i
                 break
         new_msgs = list(system_msgs)
-        if first_user_idx is not None:
-            new_msgs.append(messages[first_user_idx])
+        # ALLE User-Messages behalten (Aufgabenbeschreibung + Kontext)
+        user_idx_set = set(user_indices)
+        for ui in user_indices:
+            new_msgs.append(messages[ui])
         if last_worker_asst is not None:
             ctx_start = max(0, last_worker_asst - 1)
             for j in range(ctx_start, len(messages)):
-                if j == first_user_idx:
-                    continue
+                if j in user_idx_set:
+                    continue  # bereits oben eingefügt
                 new_msgs.append(messages[j])
         messages = new_msgs
         _log(f"  ✂ Worker-Payload: {len(messages)} Messages (Plan-Centric, Continuation)")
+
+        # ══ Tool-Error-Loop-Detection ═══════════════════════════════════
+        # Wenn alle Tool-Results der letzten Runde Fehler sind (ERROR),
+        # ersetze sie durch eine kompakte Zusammenfassung. Sonst dreht
+        # DeepSeek sich im Kreis: Fehler sehen → gleichen Call erneut → Fehler.
+        tool_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "tool"]
+        error_tool_msgs = [m for m in tool_msgs if "error" in _message_text(m).lower()]
+        if tool_msgs and len(error_tool_msgs) == len(tool_msgs):
+            # ALLE Tool-Results sind Fehler → ersetzen durch eine User-Message
+            _log(f"  ⚠ Alle {len(tool_msgs)} Tool-Results sind Fehler → Error-Loop-Prävention")
+            # Entferne alle tool- und assistant-messages ab der letzten user-msg
+            # und füge stattdessen eine klare Anweisung ein
+            last_user_idx = None
+            for i in range(len(messages) - 1, -1, -1):
+                if isinstance(messages[i], dict) and messages[i].get("role") == "user":
+                    last_user_idx = i
+                    break
+            error_summary = "; ".join(set(_message_text(m)[:100] for m in tool_msgs))
+            messages = messages[:last_user_idx + 1] if last_user_idx is not None else messages[:1]
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"[SYSTEM: The previous tool calls all failed with validation errors: {error_summary}]\n"
+                    "[SYSTEM: Check the tool definitions in the system prompt for REQUIRED parameters. "
+                    "All required parameters must be provided as valid JSON. "
+                    "Try a different approach or use different tools.]"
+                ),
+            })
+            _log(f"  🛡️ Tool-Error-Loop gebrochen: {len(tool_msgs)} Fehler durch Instruktion ersetzt")
     else:
-        # Erster Aufruf: nur System + User-Request
+        # Erster Aufruf: System + ALLE User-Messages
         new_msgs = list(system_msgs)
-        if first_user_idx is not None:
-            new_msgs.append(messages[first_user_idx])
+        for ui in user_indices:
+            new_msgs.append(messages[ui])
         messages = new_msgs
         original_count = len(body.get("messages", []))
         _log(f"  ✂ Worker-Payload: {len(messages)} Messages (Plan-Centric, {original_count}→{len(messages)} stripped)")
@@ -4422,6 +4451,16 @@ async def _stream_events(request: Request, body: Dict[str, Any]) -> AsyncIterato
             reasoning_content = rc
         if tool_calls and reasoning_content:
             break
+
+    # Tool-Calls normalisieren (arguments als JSON-String sicherstellen)
+    # DeepSeek liefert arguments manchmal als Dict statt JSON-String,
+    # was VS Code beim Parsen der SSE-Chunks nicht verarbeiten kann
+    # → "must have required property 'filePath'" obwohl filePath da ist.
+    if tool_calls:
+        normalized = _normalize_tool_calls(tool_calls)
+        if normalized:
+            tool_calls = normalized
+            _log(f"  🔄 Worker-Tool-Calls normalisiert ({len(tool_calls)} calls)")
 
     # Prüfen auf DSML-Tool-Calls im Text (auch ohne structured tool_calls)
     text_content = streamed.get("combined_response_text", "")
