@@ -351,17 +351,21 @@ def _detect_planner_loop(session: Dict[str, Any]) -> Optional[str]:
         if len(recent_sigs) <= 2:
             return f"stagnation: {len(recent_sigs)} distinct tools in last 6 rounds"
 
-    # ── Exploration-only-Loop (NEW, 2024): viele Runden, viele Files
-    #    erkundet, aber KEIN Plan-Output bisher. Das ist das klassische
-    #    Kimi-Kreisen: tiefer Eintauchen in Files, ohne jemals zur
-    #    Konklusion zu kommen. Forciere Plan-Output.
-    if iterations >= 8 and len(distinct_files) >= 5:
-        # Hat Kimi jemals "Plan" in Content geschrieben? → dann ist es kein
-        # Endless-Loop sondern tiefere Exploration.
-        contents = session.get("assistant_contents") or []
-        if not any("## plan:" in str(c).lower()[:200] for c in contents[-4:]):
-            return (f"exploration-only-loop: {iterations} rounds, "
-                    f"{len(distinct_files)} distinct files, no plan yet")
+    # ── Exploration-only-Loop: viele Runden, aber keine neuen Files/Queries
+    #    mehr entdeckt. Das ist das klassische Kimi-Kreisen: immer tiefer
+    #    in denselben Dateien graben, ohne zur Konklusion zu kommen.
+    #    Forciere Plan-Output NUR wenn die Exploration stagniert.
+    #    Threshold = PLANNER_DISTINCT_WARN_AFTER (18) + Stagnation,
+    #    denn davor greift _should_warn_planner (12) mit sanftem Nudge.
+    if iterations >= PLANNER_DISTINCT_WARN_AFTER and len(distinct_files) >= 5:
+        # Stagnation: In den letzten Runden keine neuen Dateien/Queries
+        # entdeckt. Wenn distinct_files ≈ iterations, ist Kimi noch
+        # produktiv und sollte weiter explorieren dürfen.
+        if len(distinct_files) < iterations - 3:  # 3+ Runden ohne neuen Content
+            contents = session.get("assistant_contents") or []
+            if not any("## plan:" in str(c).lower()[:200] for c in contents[-4:]):
+                return (f"exploration-only-loop: {iterations} rounds, "
+                        f"{len(distinct_files)} distinct files, no plan yet")
 
     # ── Panik-Tripwire: ARBITRARY HARD-CAP nur noch reiner Safety-Net
     if iterations >= MAX_PLANNER_ITERATIONS:
@@ -3051,6 +3055,19 @@ async def _call_cloud_planner_agent(
                     # Reasoning-Content entfernen, damit Kimi nicht denkt
                     # es sei noch im Tool-Modus.
                     msg.pop("reasoning_content", None)
+            # Nachdem ALLE tool_calls aus assistants entfernt wurden, haben
+            # die tool-Rollen-Nachrichten verwaiste tool_call_ids, die von
+            # der API mit 400 'tool_call_id not found' abgelehnt werden.
+            # Lösung: tool → user konvertieren (Content bleibt erhalten,
+            # tc_id wird entfernt, keine Abhängigkeit mehr).
+            orphaned = 0
+            for msg in cur_messages:
+                if isinstance(msg, dict) and msg.get("role") == "tool":
+                    msg["role"] = "user"
+                    msg.pop("tool_call_id", None)
+                    orphaned += 1
+            if orphaned:
+                _log(f"  🧹 Loop-Detection: {orphaned} tool-Nachrichten → user konvertiert (tc_id entfernt)")
             if cur_messages and isinstance(cur_messages[-1], dict) and cur_messages[-1].get("role") == "user":
                 force_msg = (
                     "\n\n[SYSTEM: Du scheinst in einer Schleife zu sein "
@@ -3955,7 +3972,10 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             if worker_result.get("tool_calls") or _contains_tool_calls(worker_response):
                 _log("  🔧 Worker enthält Tool-Calls → Durchreiche an Client")
                 await client.aclose()
-                del _PLANNER_SESSIONS[session_hash]
+                # Session NICHT löschen – "done" bleibt erhalten, damit der
+                # nächste Request (tool_cont) den Plan-Kontext wiederfindet
+                # und der Worker weiterarbeiten kann. Sonst startet VS Code
+                # eine brandneue Planner-Session ohne Plan-Kontext.
                 _hindsight.retain(body, worker_response)
                 return {
                     "combined_response_text": worker_response,
@@ -4033,7 +4053,10 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         results.append(worker_result)
         worker_response = worker_result.get("content", "")
 
-        del _PLANNER_SESSIONS[session_hash]
+        # Wenn der Worker Tool-Calls zurückgibt, Session behalten, damit
+        # der nächste Request (tool_cont) den Plan-Kontext wiederfindet.
+        if not (worker_result.get("tool_calls") or _contains_tool_calls(worker_response)):
+            del _PLANNER_SESSIONS[session_hash]
         await client.aclose()
         _hindsight.retain(body, worker_response)
         return {
