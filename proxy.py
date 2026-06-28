@@ -215,6 +215,13 @@ PLANNER_REPEAT_HARD_STOP = 3      # Bei N identischen (name,args)-Wiederholungen
                                   # (3 statt 2: read(x)→read(x) kann legitim sein; 3x = echter Loop)
 PLANNER_WARN_AFTER = 12           # Ab Iteration M: sanfter System-Hinweis "bald plan ausgeben"
 PLANNER_DISTINCT_WARN_AFTER = 18  # Ab Iteration M mit kaum Fortschritt: stärkere Warnung
+# Bug-Malformed-Loop: Wenn Kimi gebuggte Tool-Calls ohne Args rausschickt
+# (z.B. parallele read_file-Batches ohne filePath) und das in N aufeinander-
+# folgenden Runden passiert, ist der Planner offiziell im Loop — Every tool
+# call ergibt einen VS Code Error, aber die Loop-Detection hat die bisher
+# explizit ignoriert → Kimi kreiste ewig ohne zum Plan zu kommen.
+# Threshold = 3: 3x Malformed in Folge = eindeutig verklemmt, nicht Glitch.
+PLANNER_MALFORMED_HARD_STOP = 3
 
 def _get_planner_session_hash(messages: Sequence[Dict[str, Any]]) -> str:
     """Hash aus der ersten User-Message (ohne Flags) für Session-Tracking."""
@@ -323,7 +330,19 @@ def _detect_planner_loop(session: Dict[str, Any]) -> Optional[str]:
     """
     sigs = session.get("tool_signatures") or []
     if not sigs:
-        return None
+        # Sonderfall: keine validen Signaturen, dafür viele malformed Rounds
+        # → Kimi versendet Tool-Calls ohne Args und VS Code blockt alles ab.
+        malformed_runs = int(session.get("consecutive_malformed_rounds", 0))
+        if malformed_runs >= PLANNER_MALFORMED_HARD_STOP:
+            return f"malformed-loop: {malformed_runs} rounds/all-tool-calls-args-missing"
+
+    # ── Malformed-Loop: N aufeinanderfolgende Runden in denen ALLE Tool-Calls
+    #    invalide Args hatten (Kimi-Parallel-Batch-Bug). Das ist KEINE
+    #    legitime Exploration - jeder Call erzeugt einen VS Code Error und
+    #    Kimi wiederholt im nächsten Round dieselben immaculat Calls.
+    malformed_runs = int(session.get("consecutive_malformed_rounds", 0))
+    if malformed_runs >= PLANNER_MALFORMED_HARD_STOP:
+        return f"malformed-loop: {malformed_runs} consecutive rounds with bad args"
 
     # ── Hard-Stop: 'PLANNER_REPEAT_HARD_STOP' identische Signaturen am Stück
     #    Klassischer Loop: 'No matches' → gleiches grep nochmal → ...
@@ -4040,16 +4059,45 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             if tc_id:
                 seen_ids.add(tc_id)
             new_calls.append(tc)
+        # Bug-Malformed-Loop-Detection:
+        # VORHER wurden invalide Tool-Calls (leere Args) komplett ignoriert.
+        # Wenn Kimi aber Runde für Runde nur noch buggy Calls produziert (z.B.
+        # parallele read_file-Batches ohne filePath), hatte jeder Team-Call einen
+        # VS Code Error zur Folge → Kimi hat das ignoriert und neue invalide
+        # Calls erzeugt → endloses Kreisen ohne jemals den Plan zu erzeugen.
+        # LÖSUNG: Zähle consecutive_malformed_rounds. Eine Runde gilt als
+        # "all-malformed" wenn ALLE neuen Tool-Calls in dieser Runde keine
+        # sinnvollen Args haben. Sobald PLANNER_MALFORMED_HARD_STOP (3) erreicht
+        # sind, triggert _detect_planner_loop und erzwingt Plan-Output.
+        if not new_calls:
+            # Keine neuen Tool-Calls in diesem Round (sehr selten - i.d.R.
+            # wenn Kimi ohne tool_calls antwortet). Counter unverändert.
+            malformed_round_counter = int(session.get("consecutive_malformed_rounds", 0))
+        else:
+            malformed_count = sum(1 for tc in new_calls if not _tool_call_has_args(tc))
+            if malformed_count == len(new_calls):
+                # Alle Calls in dieser Runde invalide → Counter hochzählen
+                malformed_round_counter = int(session.get("consecutive_malformed_rounds", 0)) + 1
+                session["consecutive_malformed_rounds"] = malformed_round_counter
+                _log(f"  ⚠ Runde {session.get('iterations',0)+1}: {malformed_count}/{len(new_calls)} "
+                     f"Tool-Calls ohne Args (consecutive_malformed={malformed_round_counter}/"
+                     f"{PLANNER_MALFORMED_HARD_STOP})")
+            else:
+                # Zumindest ein Call hatte Args → Loop gebrochen
+                if int(session.get("consecutive_malformed_rounds", 0)) > 0:
+                    _log(f"  ✓ Malformed-Streak gebrochen "
+                         f"({session.get('consecutive_malformed_rounds',0)} → 0)")
+                session["consecutive_malformed_rounds"] = 0
+                malformed_round_counter = 0
+
         if new_calls:
             sigs = session.setdefault("tool_signatures", [])
             for tc in new_calls:
-                # Invalide Tool-Calls (leere Args) nicht tracken — das sind
-                # Model-Glitches (z.B. read_file ohne filePath) und KEINE
-                # echten Loop-Indikatoren. Sonst wird der Planner bei Runde 3
-                # fälschlich zum Plan-Output gezwungen.
+                # Invalide Tool-Calls nicht in Signaturen tracken — sie haben
+                # keine Args und erzeugen alle dieselbe Signatur, was die
+                # 'exact-repeat'-Detection verfälschen würde. Stattdessen
+                # oben über consecutive_malformed_rounds getrackt.
                 if not _tool_call_has_args(tc):
-                    name = (tc.get("function") or {}).get("name", "?")
-                    _log(f"  ⚠ Malformed tool_call '{name}' ohne Args → nicht in Loop-Erkennung")
                     continue
                 sigs.append(_tool_signature(tc))
             # Fortschritts-Metrik: neue File-Refs hinzufügen
