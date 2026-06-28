@@ -1835,91 +1835,102 @@ def _build_worker_payload(
 
     messages = list(payload.get("messages", []))
 
-    # ══ PLAN-CENTRIC MESSAGE TRIAGE ═══════════════════════════════════
-    # Der Worker bekommt NUR:
-    #   1. System-Prompt (mit Tool-Definitionen)
-    #   2. Die originale User-Anfrage (erste User-Message)
-    #   3. Den Plan (als Binding + Context, siehe unten)
-    #   4. Continuation: letzter Tool-Call/Result-Zyklus (falls vorhanden)
+    # ══ PLAN-ISOLAT MESSAGE TRIAGE ═══════════════════════════════════
+    # Konzept: "Senior-Planner delegiert an Junior-Worker" – der manuelle
+    # Workflow des Users: Frontier-Modell plant mit vollem Kontext, dann
+    # delegiert an anderes Modell NUR den Plan (kein Kontext).
     #
-    # Der GESAMTE Planner-Verlauf (Kimi Tool-Calls, Zwischenergebnisse,
-    # Reasoning-Content) wird ENTFERNT. Das spart Tokens, entlastet das
-    # (oft lokale) Modell und macht den Plan zur dominierenden Instruktion.
+    # Der Worker (DeepSeek) bekommt NUR:
+    #   1. System-Message (Tool-Definitionen, Calling-Format) – original
+    #   2. Die ORIGINAL User-Aufgabenbeschreibung (erste substantielle User-Msg)
+    #   3. Den fertigen Plan (binding contract + Kontext, unten injectiert)
+    #   4. Bei Continuation: NUR den letzten Worker-Tool-Zyklus
+    #
+    # Der GESAMTE Planner-Verlauf (Kimi Tool-Calls, read_file-Ergebnisse,
+    # Reasoning-Content,compactierte Caveman-Kontexte) wird ENTFERNT.
+    # Der Worker MUSS eigene read_file/grep_call machen, um Code zu sehen –
+    # exakt wie im manuellen Workflow. So wird DeepSeek nicht durch fremden
+    # Tool-Cruft verwirrt und hat einen sauberen, winzigen Kontext.
     system_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "system"]
-    user_indices = []
-    for i, m in enumerate(messages):
-        if isinstance(m, dict) and m.get("role") == "user":
-            content = m.get("content", "")
-            if isinstance(content, str) and content.strip():
-                user_indices.append(i)
-            elif isinstance(content, list) and content:
-                user_indices.append(i)
+
+    # Original-User-Task isolieren: ERSTE User-Message mit substantiellem Content.
+    # Überspringt VSCode-injected System-User-Msgs ("[SYSTEM:", Error-Injections).
+    original_user_msg = None
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        content = m.get("content", "")
+        if isinstance(content, str):
+            stripped = content.strip()
+            if not stripped:
+                continue
+            # Skip re-injected system/error messages
+            if stripped.startswith("[SYSTEM:") or stripped.startswith("[HINDSIGHT"):
+                continue
+            original_user_msg = copy.deepcopy(m)
+            break
+        elif isinstance(content, list) and content:
+            original_user_msg = copy.deepcopy(m)
+            break
+
     has_tool_msgs = any(isinstance(m, dict) and m.get("role") == "tool" for m in messages)
+
+    # Baue Payload: System + Original-User (+ Continuation falls vorhanden)
+    new_msgs = list(system_msgs)
+    if original_user_msg is not None:
+        new_msgs.append(original_user_msg)
+
     if has_tool_msgs:
-        # Continuation: Worker-Tool-Call-Zyklus behalten.
-        # Suche die letzte assistant-message MIT tool_calls (Worker-Aufruf)
-        # und alles ab der davorliegenden Message (tool-result oder user).
+        # Continuation: NUR den letzten assistant(tool_calls) → tool results
+        # Zyklus behalten. Frühere Runden (Planner-Cruft, alte Worker-Calls)
+        # werden ENTFERNT – der Worker braucht nur, was er selbst zuletzt sah.
         last_worker_asst = None
         for i in range(len(messages) - 1, -1, -1):
             if isinstance(messages[i], dict) and messages[i].get("role") == "assistant" and messages[i].get("tool_calls"):
                 last_worker_asst = i
                 break
-        new_msgs = list(system_msgs)
-        # ALLE User-Messages behalten (Aufgabenbeschreibung + Kontext)
-        user_idx_set = set(user_indices)
-        for ui in user_indices:
-            new_msgs.append(messages[ui])
         if last_worker_asst is not None:
-            # Starte BEIM letzten Assistant(tool_calls), nicht davor.
-            # ctx_start = last_worker_asst - 1 wuerde die Message VOR dem
-            # Assistant mitnehmen – wenn das ein tool-Result aus einer
-            # vorherigen Runde (z.B. Planner) ist, kommt es ohne
-            # vorhergehendes assistant(tool_calls) in den Payload → 400
-            # "tool messages must follow tool_calls".
-            ctx_start = max(0, last_worker_asst)
-            for j in range(ctx_start, len(messages)):
-                if j in user_idx_set:
-                    continue  # bereits oben eingefügt
-                new_msgs.append(messages[j])
-        messages = new_msgs
-        _log(f"  ✂ Worker-Payload: {len(messages)} Messages (Plan-Centric, Continuation)")
-
-        # ══ Tool-Error-Loop-Detection ═══════════════════════════════════
-        # Wenn alle Tool-Results der letzten Runde Fehler sind (ERROR),
-        # ersetze sie durch eine kompakte Zusammenfassung. Sonst dreht
-        # DeepSeek sich im Kreis: Fehler sehen → gleichen Call erneut → Fehler.
-        tool_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "tool"]
-        error_tool_msgs = [m for m in tool_msgs if "error" in _message_text(m).lower()]
-        if tool_msgs and len(error_tool_msgs) == len(tool_msgs):
-            # ALLE Tool-Results sind Fehler → ersetzen durch eine User-Message
-            _log(f"  ⚠ Alle {len(tool_msgs)} Tool-Results sind Fehler → Error-Loop-Prävention")
-            # Entferne alle tool- und assistant-messages ab der letzten user-msg
-            # und füge stattdessen eine klare Anweisung ein
-            last_user_idx = None
-            for i in range(len(messages) - 1, -1, -1):
-                if isinstance(messages[i], dict) and messages[i].get("role") == "user":
-                    last_user_idx = i
-                    break
-            error_summary = "; ".join(set(_message_text(m)[:100] for m in tool_msgs))
-            messages = messages[:last_user_idx + 1] if last_user_idx is not None else messages[:1]
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"[SYSTEM: The previous tool calls all failed with validation errors: {error_summary}]\n"
-                    "[SYSTEM: Check the tool definitions in the system prompt for REQUIRED parameters. "
-                    "All required parameters must be provided as valid JSON. "
-                    "Try a different approach or use different tools.]"
-                ),
-            })
-            _log(f"  🛡️ Tool-Error-Loop gebrochen: {len(tool_msgs)} Fehler durch Instruktion ersetzt")
+            # Starte GENAU beim letzten Worker-Call – alles davor ist Cruft
+            for j in range(last_worker_asst, len(messages)):
+                msg = messages[j]
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role")
+                if role == "system":
+                    continue  # schon oben
+                new_msgs.append(copy.deepcopy(msg))
+        _log(f"  ✂ Worker-Payload (Plan-Isolat, Continuation): {len(new_msgs)} Messages "
+             f"(Original {len(messages)} → {len(new_msgs)}, Planner-Verlauf entfernt)")
     else:
-        # Erster Aufruf: System + ALLE User-Messages
-        new_msgs = list(system_msgs)
-        for ui in user_indices:
-            new_msgs.append(messages[ui])
-        messages = new_msgs
-        original_count = len(body.get("messages", []))
-        _log(f"  ✂ Worker-Payload: {len(messages)} Messages (Plan-Centric, {original_count}→{len(messages)} stripped)")
+        _log(f"  ✂ Worker-Payload (Plan-Isolat, First-Call): {len(new_msgs)} Messages "
+             f"(Original {len(messages)} → {len(new_msgs)}, Planner-Verlauf entfernt)")
+
+    messages = new_msgs
+
+    # ══ Tool-Error-Loop-Detection ═══════════════════════════════════
+    # Wenn in der Continuation ALLE Tool-Results Fehler sind, ersetze den
+    # Zyklus durch eine User-Instruktion. Sonst dreht DeepSeek sich im Kreis.
+    tool_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "tool"]
+    error_tool_msgs = [m for m in tool_msgs if "error" in _message_text(m).lower()]
+    if tool_msgs and len(error_tool_msgs) == len(tool_msgs):
+        _log(f"  ⚠ Alle {len(tool_msgs)} Tool-Results sind Fehler → Error-Loop-Prävention")
+        # Schneide NACH der letzten user-msg ab, ersetze Tool-Zyklus durch Instruktion
+        last_user_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[i], dict) and messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+        error_summary = "; ".join(set(_message_text(m)[:120] for m in tool_msgs))
+        messages = messages[:last_user_idx + 1] if last_user_idx is not None else messages[:1]
+        messages.append({
+            "role": "user",
+            "content": (
+                f"[SYSTEM: Your last {len(tool_msgs)} tool calls all failed validation: {error_summary}]\n"
+                "[SYSTEM: Re-read the tool definitions in the system prompt. "
+                "Required parameters MUST be valid JSON. Try a different tool or simpler arguments.]"
+            ),
+        })
+        _log(f"  🛡️ Tool-Error-Loop gebrochen: {len(tool_msgs)} Fehler durch Instruktion ersetzt")
 
     # ══ Tool-Result-Truncation: verhindert Token-Bombing ══════════════
     # Wenn VS Code riesige Tool-Results (z.B. 111KB grep_hits) zurückschickt,
@@ -1939,28 +1950,30 @@ def _build_worker_payload(
         _log(f"  🧹 Worker-Payload: {removed} reasoning_content-Felder entfernt (Kimi-Thinking)")
 
     # ══ Plan-binding System-Prompt injecten ══════════════════════════
-    # Wird an die ERSTE system-message angehaengt, falls vorhanden.
-    # Sonst als neue system-message vorne eingefuegt.
+    # Plan-Isolat-Design: Der Worker hat KEINEN Code-Kontext. Er muss die
+    # Dateien SELBST lesen. Das System-Prompt wird um zwei Verträge ergänzt:
+    #   A) "Plan-Binding Contract": Was er tun soll (Plan exektuieren)
+    #   B) "Self-Read Mandate": Was er WISSEN muss (Dateien selbst lesen)
     if plan:
-        # Optional: File-Pfad als zusaetzlicher Pointer (Codespace-Stil)
         plan_file_hint = ""
         if plan_path:
             plan_file_hint = (
-                f"\n7. The plan is also persisted at **`{plan_path}`**. "
-                f"If this prompt feels truncated or you forgot a step, "
-                f"READ that file with your file-reading tool."
+                f"\n8. The plan is also persisted at **`{plan_path}`**. "
+                f"READ that file first if you need the full plan."
             )
         plan_binding = (
-            "\n\n[PLAN-BINDING CONTRACT - READ CAREFULLY]\n"
-            "A strategic plan has been prepared by your senior planner. "
-            "You MUST implement it STRICTLY. Rules:\n"
-            "1. Execute each step of the plan IN ORDER.\n"
-            "2. DO NOT refactor, add features, or 'improve' anything not in the plan.\n"
-            "3. If a step is ambiguous, implement the SIMPLEST interpretation.\n"
-            "4. If a step is impossible (wrong file/line): SKIP it, mark '# SKIPPED: <reason>'.\n"
-            "5. Do NOT create new files unless the plan explicitly says 'CREATE <path>'.\n"
-            "6. After finishing, output a '## Implementation Summary' with each step ✓/⚠/✗.\n"
-            "The plan is included at the end of this prompt."
+            "\n\n[PLAN-BINDING CONTRACT — READ CAREFULLY]\n"
+            "A senior planner has prepared a strategic plan for you. Your job: IMPLEMENT IT.\n"
+            "IMPORTANT: You have NO code context. The planner's tool results have been removed.\n"
+            "You MUST read the relevant files yourself before editing.\n"
+            "Rules:\n"
+            "1. Read the CLOUD EXECUTION PLAN at the bottom of this conversation FIRST.\n"
+            "2. Before any edit, read the target file with your file-reading tool.\n"
+            "3. Execute each plan step IN ORDER.\n"
+            "4. DO NOT refactor, add features, or 'improve' anything not in the plan.\n"
+            "5. If a step references the wrong file/line: read to find the real location, then proceed.\n"
+            "6. Do NOT create new files unless the plan explicitly says 'CREATE <path>'.\n"
+            "7. After finishing, output '## Implementation Summary' with each step ✓/⚠/✗."
             f"{plan_file_hint}"
         )
         if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
@@ -1969,24 +1982,26 @@ def _build_worker_payload(
         else:
             messages.insert(0, {"role": "system", "content": plan_binding.strip()})
 
-    # Nur Kontext ANHAENGEN, ohne die originale Struktur zu beschädigen
+    # Plan + Memory als eigene User-Message anhängen (Plan-Isolat-Layout):
+    # pierced after the original User-Task message. So sieht DeepSeek klar:
+    #   System + Tools
+    #   User-Task (original)
+    #   -> Plan (binding)
     context_blocks = []
     if memory_context:
-        context_blocks.append(f"[HINDSIGHT MEMORY]\n{memory_context}")
+        context_blocks.append(f"[HINDSIGHT MEMORY -主动 relevant context from prior sessions]\n{memory_context}")
     if plan:
-        context_blocks.append(f"[CLOUD EXECUTION PLAN - FOLLOW EXACTLY]\n{plan}")
+        context_blocks.append(
+            "[CLOUD EXECUTION PLAN — FOLLOW EXACTLY]\n"
+            "This plan was authored by a senior planner who had full codebase access.\n"
+            "You do not need to re-plan. Read it, then execute it step by step.\n"
+            "Use your own read_file/grep tools to see the code before each edit.\n\n"
+            f"{plan}"
+        )
     context_str = "\n\n".join(context_blocks)
 
-    # Plan + Memory an die letzte User-Message anhaengen
     if context_str:
-        if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
-            user_content = messages[-1]["content"]
-            if isinstance(user_content, str):
-                messages[-1]["content"] = f"{user_content}\n\n{context_str}"
-            elif isinstance(user_content, list):
-                messages[-1]["content"] = user_content + [{"type": "text", "text": context_str}]
-        else:
-            messages.append({"role": "user", "content": context_str})
+        messages.append({"role": "user", "content": context_str})
 
     # ALLE Messages behalten - kein Compact! Das System-Prompt mit Tool-Defs bleibt erhalten.
     payload["messages"] = messages
