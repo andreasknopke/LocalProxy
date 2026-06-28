@@ -2944,6 +2944,25 @@ async def _call_cloud_planner_agent(
         payload["stream"] = False
 
         messages = list(payload.get("messages", []))
+
+        # 🗜 Message-Window: Verhindert dass Kimi mit 150+ Nachrichten
+        # überflutet wird (hängt sich sonst auf). Behalte System-Prompt +
+        # die letzten MAX_PLANNER_CONT_MESSAGES-1 Nachrichten (Sliding Window).
+        # Die letzten Nachrichten sind die aktuellsten Tool-Interaktionen,
+        # die Kimi für den nächsten Schritt braucht.
+        MAX_PLANNER_CONT_MESSAGES = 50
+        if len(messages) > MAX_PLANNER_CONT_MESSAGES:
+            system_msg = None
+            if messages and messages[0].get("role") == "system":
+                system_msg = messages[0]
+            keep_count = MAX_PLANNER_CONT_MESSAGES - (1 if system_msg else 0)
+            truncated = messages[-keep_count:]
+            if system_msg:
+                truncated = [system_msg] + truncated
+            _log(f"  🗜 Planner-Cont: Messages von {len(messages)} auf "
+                 f"{len(truncated)} reduziert (Sliding Window={MAX_PLANNER_CONT_MESSAGES})")
+            messages = truncated
+
         # Tool-Results kappen (gleiche Logik wie Runde 1)
         _cap_tool_results_inplace(messages, "Planner-Cont")
         # Planner-Instructions an System-Prompt anhängen
