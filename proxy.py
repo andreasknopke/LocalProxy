@@ -1870,7 +1870,13 @@ def _build_worker_payload(
         for ui in user_indices:
             new_msgs.append(messages[ui])
         if last_worker_asst is not None:
-            ctx_start = max(0, last_worker_asst - 1)
+            # Starte BEIM letzten Assistant(tool_calls), nicht davor.
+            # ctx_start = last_worker_asst - 1 wuerde die Message VOR dem
+            # Assistant mitnehmen – wenn das ein tool-Result aus einer
+            # vorherigen Runde (z.B. Planner) ist, kommt es ohne
+            # vorhergehendes assistant(tool_calls) in den Payload → 400
+            # "tool messages must follow tool_calls".
+            ctx_start = max(0, last_worker_asst)
             for j in range(ctx_start, len(messages)):
                 if j in user_idx_set:
                     continue  # bereits oben eingefügt
