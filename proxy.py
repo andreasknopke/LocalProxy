@@ -2898,19 +2898,44 @@ async def _call_cloud_planner_agent(
     )
 
     if is_tool_continuation:
-        # ══ RUNDE N+ Recap-Payload ══
-        original_task = _extract_original_task(body_messages)
-        if not original_task:
-            # Fallback: gesamte letzte user-message
-            original_task = _last_user_text(body_messages) or "(no task identified)"
-        _log(f"  🎯 Planner-Recap-Modus (round {body_session.get('iterations')}): "
-             f"task='{original_task[:80]}...'")
-        payload = _build_planner_tool_continuation_context(
-            body=body,
-            session=body_session,
-            original_task=original_task,
-            tools=None,  # wird später gefiltert
+        # ══ RUNDE N+: Volle History (nur tool_results gekappt) ══
+        # FRÜHER: Recap-Payload (system + task + exploration summary).
+        #   Das hat Kimi verwirrt -> invalide tool_calls (filePath fehlt).
+        # JETZT: Gleicher Ansatz wie Runde 1 -> volle Message-History behalten,
+        #   tool_results auf 8000 chars kappen, planner instructions ans system.
+        #   Kimi sieht ALLE vorherigen tool_calls + results und kann
+        #   daraus lernen was schon passiert ist.
+        _log(f"  🎯 Planner-Cont-Modus (round {body_session.get('iterations')}): "
+             f"volle History, {len(body_messages)} messages")
+        payload = copy.deepcopy(body)
+        payload["model"] = CLOUD_REVIEW_MODEL
+        payload["max_tokens"] = min(CAVEMAN_MAX_TOKENS, 65536)
+        payload["temperature"] = 0.2
+        payload["stream"] = False
+
+        messages = list(payload.get("messages", []))
+        # Tool-Results kappen (gleiche Logik wie Runde 1)
+        _cap_tool_results_inplace(messages, "Planner-Cont")
+        # Planner-Instructions an System-Prompt anhängen
+        planner_system = (
+            "You are a STRATEGIC PLANNING AGENT. You have FULL access to VS Code tools: "
+            "read_file, search_code, list_dir, run_terminal, and all other tools. "
+            "Your job: EXPLORE the workspace thoroughly, understand the codebase, "
+            "then produce a DETAILED EXECUTION PLAN in Markdown. "
+            "THE PLAN (your final output, no tools):\n"
+            "- 10-20 concrete steps\n"
+            "- Each step: WHAT file, WHAT change, WHY\n"
+            "- Reference specific file paths and line numbers\n"
+            "- CRITICAL: Use EXTREME CAVEMAN COMPRESSION. Terse symbols, no prose.\n"
+            "- Format: `## Plan: <title>`, numbered list, symbols -> ! ? FIX TODO RISK\n"
+            "- Max 4000 chars total. Every word must earn its place.\n"
+            "- DO NOT write code. The worker will implement.\n"
         )
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = str(messages[0].get("content", "")) + "\n\n" + planner_system
+        else:
+            messages.insert(0, {"role": "system", "content": planner_system})
+        payload["messages"] = messages
     else:
         # ══ RUNDE 1: Klassischer Payload ══
         # Payload mit VOLLEN VS Code Tools bauen
