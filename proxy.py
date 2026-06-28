@@ -3037,23 +3037,19 @@ async def _call_cloud_planner_agent(
             _log(f"  🛑 Planner LOOP erkannt ({loop_reason}, iter={iteration}) → erzwinge Plan-Output")
             payload.pop("tools", None)
             payload.pop("tool_choice", None)
-            # Auch tool_calls aus letzter assistant-Message entfernen, wenn
-            # nicht genug tool_results folgen (sonst 400 'tool_call_id not found').
-            # Und selbst wenn genug: ohne tools darf Kimi keine tool_calls
-            # generieren → entfernen, der Force-Text verbietet es explizit.
-            for i, msg in enumerate(cur_messages):
-                if isinstance(msg, dict) and msg.get("role") == "assistant" and msg.get("tool_calls"):
-                    following_results = sum(
-                        1 for m in cur_messages[i+1:]
-                        if isinstance(m, dict) and m.get("role") == "tool"
-                    )
-                    tc_count = len(msg.get("tool_calls", []))
-                    if tc_count > following_results:
-                        _log(f"  🧹 Loop-Detection: {tc_count} tool_calls auf assistant entfernt "
-                             f"(nur {following_results}/tool results folgen — 400-Risiko)")
+            # Alle tool_calls aus assistant-Messages entfernen — ohne tools
+            # im payload darf Kimi keine tool_calls generieren, und die API
+            # lehnt Requests ab wenn assistant mit tool_calls nicht von
+            # tool_results gefolgt wird (400 'tool_call_id not found').
+            # FRÜHER: nur bei tc_count > following_results entfernt — aber
+            # auch wenn genug results folgen, crasht die API ohne tools.
+            for msg in cur_messages:
+                if isinstance(msg, dict) and msg.get("role") == "assistant":
+                    if msg.get("tool_calls"):
+                        _log(f"  🧹 Loop-Detection: {len(msg['tool_calls'])} tool_calls auf assistant entfernt")
                         msg.pop("tool_calls", None)
-                    # Auch bei match: Reasoning-Content entfernen, damit
-                    # Kimi nicht denkt es sei noch im Tool-Modus.
+                    # Reasoning-Content entfernen, damit Kimi nicht denkt
+                    # es sei noch im Tool-Modus.
                     msg.pop("reasoning_content", None)
             if cur_messages and isinstance(cur_messages[-1], dict) and cur_messages[-1].get("role") == "user":
                 force_msg = (
