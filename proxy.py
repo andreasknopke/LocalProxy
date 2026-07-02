@@ -786,6 +786,23 @@ def _dump_debug_payload(req_id: str, phase: str, payload_to_dump: Dict[str, Any]
                         (t.get("function", {}).get("name") if isinstance(t, dict) else None)
                         for t in tcs
                     ]
+                    # NEU: tool_call-args mit speichern (cap bei 300 chars/call)
+                    # OHNE das würde der Root-Cause von Args-Verlust im Stream-
+                    # Pipeline unsichtbar bleiben.
+                    tcs_args = []
+                    for t in tcs:
+                        if not isinstance(t, dict):
+                            tcs_args.append(None)
+                            continue
+                        fn = t.get("function", {}) if isinstance(t.get("function"), dict) else {}
+                        a = fn.get("arguments", "")
+                        tcs_args.append({
+                            "id": str(t.get("id", ""))[:30],
+                            "name": fn.get("name", ""),
+                            "args_len": len(str(a)) if a is not None else 0,
+                            "args_preview": str(a)[:300] if a is not None else None,
+                        })
+                    summary["tool_call_details"] = tcs_args
                 if m.get("reasoning_content"):
                     rc = m.get("reasoning_content")
                     summary["reasoning_content_len"] = len(str(rc))
@@ -4555,36 +4572,43 @@ async def _stream_events(request: Request, body: Dict[str, Any]) -> AsyncIterato
         # ── STRUKTURIERTE TOOL_CALLS STREAMING (OpenAI-Format) ──
         # Bei Tool-Calls KEINE Summary anhängen (würde Format brechen)
         stream_id = f"chatcmpl-spark-{uuid.uuid4().hex}"
-        
-        # 1. KOMBINIERTER Role+Header-Chunk (OpenAI-Standard):
-        #    role + content=null + tool_calls[{id, type, function:{name, arguments:""}}]
-        #    reasoning_content MUSS im ersten Delta sein.
+
+        # ROBUST STREAMING PATTERN (FIX für VS Code MCP-Client Bug):
+        # VS Code's OpenAI-compat-Client akkumuliert arguments-deltas nicht
+        # zuverlässig über separate Chunks hinweg. Argumente gingen in R2
+        # verloren → VS Code executed tools mit leeren args →
+        # "must have required property 'filePath'" Errors → infinite Loop.
+        #
+        # FIX: Kompletten tool_call (ID + Name + Args) in EINEM Chunk
+        # senden. Header-empty-args + separate args-delta vermeiden.
+
         first_tcs = []
         for i, tc in enumerate(tool_calls):
             func = tc.get("function", {})
+            args = func.get("arguments", "")
+            # Args sicher als String (defensive)
+            if not isinstance(args, str):
+                try:
+                    args = json.dumps(args, ensure_ascii=False)
+                except Exception:
+                    args = str(args)
             first_tcs.append({
                 "index": i,
                 "id": tc.get("id", f"call_{uuid.uuid4().hex}"),
                 "type": "function",
                 "function": {
                     "name": func.get("name", ""),
-                    "arguments": "",
+                    "arguments": args,   # VOLLSTÄNDIGE Args direkt im Header!
                 },
             })
+        # 1. (einziger) Tool-Call-Chunk: role + content=null + tool_calls[full]
+        #    reasoning_content im selben Chunk (falls vorhanden)
         yield _format_openai_stream_chunk(
             model, include_role=True, tool_calls=first_tcs,
             reasoning_content=reasoning_content, chunk_id=stream_id,
         )
 
-        # 2. Arguments für jeden Tool-Call als separater Chunk
-        for i, tc in enumerate(tool_calls):
-            args = tc.get("function", {}).get("arguments", "")
-            if args:
-                yield _format_openai_stream_chunk(model, tool_calls=[
-                    {"index": i, "function": {"arguments": args}},
-                ], chunk_id=stream_id)
-
-        # 3. Finaler Chunk mit finish_reason='tool_calls' (leeres delta)
+        # 2. Finaler Chunk mit finish_reason='tool_calls' (leeres delta)
         yield _format_openai_stream_chunk(model, finish_reason="tool_calls", chunk_id=stream_id)
     else:
         # ── NORMALES TEXT-STREAMING ──
