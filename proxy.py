@@ -5100,22 +5100,31 @@ async def get_plan(plan_name: str, request: Request):
     return JSONResponse(content={"name": plan_name, "path": str(plan_path), "content": content})
 
 
-# ── /logs ──────────────────────────────────────────────────────────────────
-@app.get("/logs")
-async def get_logs(request: Request, lines: int = 200):
-    """Gibt die letzten Log-Zeilen zurück. Ohne Auth (WebUI-Aufruf ohne Bearer-Token)."""
+# ── /logs (auch als /v1/logs für Coolify nginx) ────────────────────────────
+async def _get_logs_handler(lines: int = 200):
+    """Shared handler: Gibt die letzten Log-Zeilen zurück."""
     try:
         with open(LOG_FILE, "r", encoding="utf-8") as f:
             all_lines = f.readlines()
     except (FileNotFoundError, OSError):
         all_lines = []
     last = all_lines[-lines:] if lines > 0 else all_lines
-    return JSONResponse(content={
+    return {
         "count": len(last),
         "total": len(all_lines),
         "file": LOG_FILE,
         "lines": last,
-    })
+    }
+
+@app.get("/logs")
+async def get_logs(request: Request, lines: int = 200):
+    """Ohne Auth (WebUI-Aufruf ohne Bearer-Token)."""
+    return JSONResponse(content=await _get_logs_handler(lines))
+
+@app.get("/v1/logs")
+async def get_v1_logs(request: Request, lines: int = 200):
+    """Coolify-nginx-kompatibler /v1/logs Endpoint."""
+    return JSONResponse(content=await _get_logs_handler(lines))
 
 
 # ── /debug/* ───────────────────────────────────────────────────────────────
