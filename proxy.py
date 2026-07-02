@@ -5016,7 +5016,10 @@ async def chat_completions(request: Request):
 
 # ── /v1/models ─────────────────────────────────────────────────────────────
 @app.get("/v1/models")
-async def list_models(request: Request):
+async def list_models(request: Request, logs: int = 0):
+    # /v1/models?logs=N → Logs zurückgeben (ohne Auth, für Debugging)
+    if logs > 0:
+        return JSONResponse(content=await _get_logs_handler(lines=logs))
     await _auth_or_raise(request)
     models = [
         {"id": MODEL_NAME, "object": "model", "owned_by": "local-free"},
