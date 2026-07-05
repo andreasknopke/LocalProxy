@@ -1998,24 +1998,20 @@ def _build_worker_payload(
         _log(f"  🧹 Worker-Payload: {removed} reasoning_content-Felder entfernt")
 
     # ══ Plan-binding System-Prompt injecten ══════════════════════════
-    # Plan direkt IM System-Prompt — nicht als letzte Message.
-    # Wenn der Plan als letzte Message kommt, ignoriert das Modell ihn oft
-    # und greift auf Hindsight/User-Memory zurück (z.B. alte FlappyBird-Fragen).
     if plan:
         plan_binding = (
-            "\n\n=== YOUR ASSIGNMENT ===\n"
-            "The user's task is described above. Below is the EXECUTION PLAN\n"
-            "created by a senior planner who already researched the codebase.\n"
-            "You are the WORKER. Your ONLY job: execute this plan step by step.\n"
-            "DO NOT ask clarifying questions. DO NOT re-plan. DO NOT explore.\n"
-            "The plan IS your instruction. Execute it. NOW.\n\n"
-            "=== PLAN START ===\n"
-            f"{plan}\n"
-            "=== PLAN END ===\n\n"
-            "RULES:\n"
-            "1. Read target files before editing.\n"
-            "2. Execute steps IN ORDER.\n"
-            "3. After finishing: '## Implementation Summary' with each step ✓/⚠/✗.\n"
+            "\n\n[PLAN-BINDING CONTRACT — READ CAREFULLY]\n"
+            "A senior planner has prepared a strategic plan for you. Your job: IMPLEMENT IT.\n"
+            "IMPORTANT: You have NO code context. The planner's tool results have been removed.\n"
+            "You MUST read the relevant files yourself before editing.\n"
+            "Rules:\n"
+            "1. Read the CLOUD EXECUTION PLAN at the bottom of this conversation FIRST.\n"
+            "2. Before any edit, read the target file with your file-reading tool.\n"
+            "3. Execute each plan step IN ORDER.\n"
+            "4. DO NOT refactor, add features, or 'improve' anything not in the plan.\n"
+            "5. If a step references the wrong file/line: read to find the real location, then proceed.\n"
+            "6. Do NOT create new files unless the plan explicitly says 'CREATE <path>'.\n"
+            "7. After finishing, output '## Implementation Summary' with each step ✓/⚠/✗."
         )
         if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
             existing = str(messages[0].get("content", ""))
@@ -2023,14 +2019,32 @@ def _build_worker_payload(
         else:
             messages.insert(0, {"role": "system", "content": plan_binding.strip()})
 
-    # Hindsight als letzte User-Message, klar getrennt vom Plan
+    # Plan + Memory als eigene User-Messages (Plan-Isolat-Layout)
+    context_blocks = []
+    if plan:
+        context_blocks.append(
+            "[CLOUD EXECUTION PLAN — FOLLOW EXACTLY]\n"
+            "This plan was authored by a senior planner who had full codebase access.\n"
+            "You do not need to re-plan. Read it, then execute it step by step.\n"
+            "Use your own read_file/grep tools to see the code before each edit.\n\n"
+            f"{plan}"
+        )
     if memory_context:
-        messages.append({"role": "user", "content":
-            "⚠️ The following is LEARNED CONTEXT from PRIOR coding sessions.\n"
-            "It is NOT your current task. Your task and plan are in the\n"
-            "system prompt above. Use this ONLY for reference patterns.\n\n"
+        context_blocks.append(
+            "---\n"
+            "⚠️ BACKGROUND KNOWLEDGE — NOT YOUR CURRENT TASK ⚠️\n"
+            "The following is LEARNED CONTEXT from PRIOR coding sessions.\n"
+            "It may contain patterns, fixes, and conventions relevant to the\n"
+            "current task. Use it for REFERENCE only.\n"
+            "YOUR CURRENT TASK is described in the user message ABOVE this one.\n"
+            "The PLAN you must execute is above this section.\n"
+            "---\n"
             f"{memory_context}"
-        })
+        )
+    context_str = "\n\n".join(context_blocks)
+
+    if context_str:
+        messages.append({"role": "user", "content": context_str})
 
     # ALLE Messages behalten - kein Compact! Das System-Prompt mit Tool-Defs bleibt erhalten.
     payload["messages"] = messages
@@ -4189,10 +4203,12 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         # ══ Plan-Erkennung: Kimi hat fertig, auch wenn noch tool_calls (memory) anstehen ══
         pc = planner_result.get("content", "")
         if _content_contains_plan(pc) and len(pc) > 200:
-            _log(f"  🎉 Plan im Content erkannt ({len(pc)} chars) → Session done")
+            _log(f"  🎉 Plan im Content erkannt ({len(pc)} chars) → Session done, Plan persistiert")
+            plan_path = _save_plan_to_file(session_hash, pc, query=body.get("messages", [{}])[0].get("content", ""))
             _PLANNER_SESSIONS[session_hash] = {
                 "state": "done", "ts": time.time(),
                 "plan": pc, "pflags": planner_flags,
+                "plan_path": str(plan_path) if plan_path else None,
             }
 
         if planner_result.get("tool_calls"):
@@ -4378,15 +4394,19 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
 
         # ══ Plan-Erkennung: Kimi hat fertig, auch wenn noch tool_calls (memory) anstehen ══
         pc = planner_result.get("content", "")
-        if _content_contains_plan(pc) and len(pc) > 200:
-            _log(f"  🎉 Plan im Content erkannt ({len(pc)} chars) → Session done")
+        plan_detected = _content_contains_plan(pc) and len(pc) > 200
+        if plan_detected:
+            _log(f"  🎉 Plan im Content erkannt ({len(pc)} chars) → Session done, Plan persistiert")
+            plan_path = _save_plan_to_file(session_hash, pc, query=body.get("messages", [{}])[0].get("content", ""))
             _PLANNER_SESSIONS[session_hash] = {
                 "state": "done", "ts": time.time(),
                 "plan": pc, "pflags": {"force_review": force_review, "bypass_worker": bypass_worker},
+                "plan_path": str(plan_path) if plan_path else None,
             }
 
-        if planner_result.get("tool_calls"):
+        if planner_result.get("tool_calls") and not plan_detected:
             # Kimi will Tools ausführen → an VS Code weiterleiten, Session speichern.
+            # ABER NUR wenn KEIN Plan erkannt wurde (sonst ist session schon "done")
             # Initialisiere Loop-Detection-State für diese Session.
             first_calls = planner_result.get("tool_calls", []) or []
             first_sigs = [_tool_signature(tc) for tc in first_calls]
