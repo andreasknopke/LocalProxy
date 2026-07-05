@@ -3129,18 +3129,16 @@ async def _call_cloud_planner_agent(
         _cap_tool_results_inplace(messages, "Planner-Cont")
         # Planner-Instructions an System-Prompt anhängen
         planner_system = (
-            "You are a STRATEGIC PLANNING AGENT. You have FULL access to VS Code tools: "
-            "read_file, search_code, list_dir, run_terminal, and all other tools. "
-            "Your job: EXPLORE the workspace thoroughly, understand the codebase, "
-            "then produce a DETAILED EXECUTION PLAN in Markdown. "
-            "THE PLAN (your final output, no tools):\n"
+            "You are a PLANNING AGENT with LIMITED read-only tools. "
+            "Use them ONLY to check specific details you need for your plan. "
+            "Your goal: produce a DETAILED EXECUTION PLAN in Markdown.\n\n"
+            "THE PLAN (your final output, no more tool calls):\n"
             "- 10-20 concrete steps\n"
             "- Each step: WHAT file, WHAT change, WHY\n"
             "- Reference specific file paths and line numbers\n"
-            "- CRITICAL: Use EXTREME CAVEMAN COMPRESSION. Terse symbols, no prose.\n"
-            "- Format: `## Plan: <title>`, numbered list, symbols -> ! ? FIX TODO RISK\n"
-            "- Max 4000 chars total. Every word must earn its place.\n"
-            "- DO NOT write code. The worker will implement.\n"
+            "- Caveman compression: terse symbols, no prose\n"
+            "- Format: `## Plan: <title>`, numbered list\n"
+            "- Max 4000 chars. Do NOT write code. Worker implements.\n"
         )
         if messages and messages[0].get("role") == "system":
             messages[0]["content"] = str(messages[0].get("content", "")) + "\n\n" + planner_system
@@ -3148,35 +3146,35 @@ async def _call_cloud_planner_agent(
             messages.insert(0, {"role": "system", "content": planner_system})
         payload["messages"] = messages
     else:
-        # ══ RUNDE 1: Klassischer Payload ══
-        # Payload mit VOLLEN VS Code Tools bauen
+        # ══ RUNDE 1: Plan schreiben (Copilot-Stil) ══
+        # Keine Tools, kein Explore. Der Planner bekommt Task + Workspace-Kontext
+        # aus dem System-Prompt und schreibt direkt einen Plan.
+        # Wie Copilot Plan-Mode: Task → Plan. Der Worker führt dann aus.
         payload = copy.deepcopy(body)
         payload["model"] = CLOUD_REVIEW_MODEL
         payload["max_tokens"] = min(CAVEMAN_MAX_TOKENS, 65536)
         payload["temperature"] = 0.2
         payload["stream"] = False
 
-        # System-Prompt: Planner-Agent mit Caveman-Output
         planner_system = (
-            "You are a STRATEGIC PLANNING AGENT. You have FULL access to VS Code tools: "
-            "read_file, search_code, list_dir, run_terminal, and all other tools. "
-            "Your job: EXPLORE the workspace thoroughly, understand the codebase, "
-            "then produce a DETAILED EXECUTION PLAN in Markdown. "
-            "THE PLAN (your final output, no tools):\n"
-            "- 10-20 concrete steps\n"
+            "You are a PLANNING AGENT. You do NOT have tools and must NOT call any. "
+            "Your ONLY job: read the user's task and the workspace context below, "
+            "then write a DETAILED EXECUTION PLAN in Markdown. "
+            "A Worker agent with tools will execute your plan afterwards.\n\n"
+            "PLAN FORMAT:\n"
+            "- `## Plan: <descriptive title>`\n"
+            "- 10-20 numbered steps\n"
             "- Each step: WHAT file, WHAT change, WHY\n"
-            "- Reference specific file paths and line numbers\n"
-            "- CRITICAL: Use EXTREME CAVEMAN COMPRESSION. Terse symbols, no prose.\n"
-            "- Format: `## Plan: <title>`, numbered list, symbols -> ! ? FIX TODO RISK\n"
-            "- Max 4000 chars total. Every word must earn its place.\n"
-            "- DO NOT write code. The worker will implement.\n"
+            "- Reference file paths from the workspace context\n"
+            "- Use Caveman compression: terse symbols, no prose\n"
+            "- Max 4000 chars. No code — the worker writes code.\n"
         )
-        # Original System-Prompt mit Tool-Defs MIT ANHÄNGEN (Kimi braucht die Tool-Schemas)
+        # System-Prompt behalten (enthält wertvollen Workspace-Kontext)
         messages = list(payload.get("messages", []))
-        # Tool-Result-Truncation (gleiche Logik wie _build_worker_payload)
         _cap_tool_results_inplace(messages, "Planner-R1")
         if messages and messages[0].get("role") == "system":
-            messages[0]["content"] = str(messages[0].get("content", "")) + "\n\n" + planner_system
+            sys_content = str(messages[0].get("content", ""))
+            messages[0]["content"] = sys_content + "\n\n" + planner_system
         else:
             messages.insert(0, {"role": "system", "content": planner_system})
         payload["messages"] = messages
@@ -3194,9 +3192,16 @@ async def _call_cloud_planner_agent(
     _patch_moonshot_payload(payload)
 
     # ══ Bug-B-Fix: Tools filtern + Iteration-Cap ═════════════════════
-    # 1) READ-ONLY Subset verfuettern - verhindert dass Kimi mit allen
-    #    47 Tools Durcheinander anrichtet und falsche Arg-Formate baut.
-    if "tools" in payload:
+    # Runde 1 (kein Tool-Continuation): KEINE Tools — Planner soll Plan schreiben,
+    # nicht explorieren. Wie Copilot: Plan-Mode = Task → Plan, Agent-Mode = Worker + Tools.
+    # Runde N+ (Tool-Continuation): READ-ONLY Tools für Codebase-Recherche.
+    if not is_tool_continuation:
+        # Erster Planner-Call → Tools komplett entfernen (Copilot-Stil)
+        if "tools" in payload:
+            _log("  📝 Planner-Runde-1: Tools entfernt (Plan schreiben, nicht explorieren)")
+            payload.pop("tools", None)
+            payload.pop("tool_choice", None)
+    elif "tools" in payload:
         filtered = _filter_planner_tools(payload.get("tools"))
         if filtered and len(filtered) < len(payload["tools"]):
             _log(f"  🔧 Planner-Tools gefiltert: {len(payload['tools'])} → {len(filtered)} (read-only)")
@@ -3399,7 +3404,7 @@ async def _call_cloud_planner_agent(
             _log(f"  ⚠ Cloud-Planner {stage_label} STATUS {response.status_code}: {response.text[:300]}")
             last_error = f"HTTP {response.status_code} ({stage_name})"
         except Exception as exc:
-            _log(f"  ✗ Cloud-Planner {stage_label} ERROR: {exc}")
+            _log(f"  ✗ Cloud-Planner {stage_label} ERROR: {type(exc).__name__}: {exc}")
             last_error = f"{type(exc).__name__}: {exc} ({stage_name})"
             _finish_active_call(stage_call_id, status="error", extra={
                 "error": str(exc), "error_type": type(exc).__name__,
