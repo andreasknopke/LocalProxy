@@ -126,7 +126,7 @@ CAVEMAN_MAX_TOKENS: int = int(os.getenv("CAVEMAN_MAX_TOKENS", "8192"))
 # Verhindert Token-Bombing, wenn VS Code riesige Tool-Results (z.B. 111KB grep
 # auf level_data.json) an den Proxy returniert. Tool-Messages im Payload werden
 # nach TOOL_RESULT_CAP chars hart abgeschnitten (+ TRUNCATED marker).
-TOOL_RESULT_CAP: int = int(os.getenv("TOOL_RESULT_CAP", "32000"))
+TOOL_RESULT_CAP: int = int(os.getenv("TOOL_RESULT_CAP", "0"))  # 0 = deaktiviert
 
 # ── Hindsight / Qdrant ─────────────────────────────────────────────────────
 HINDSIGHT_ENABLED: bool = os.getenv("HINDSIGHT_ENABLED", "true").lower() in {"1", "true", "yes", "y", "on"}
@@ -1735,7 +1735,7 @@ def _build_direct_payload(
     # Spiegelung von _build_worker_payload — der Fallback-Pfad nach
     # Planner-Failure nutzt _build_direct_payload statt _build_worker_payload.
     messages = payload["messages"]
-    _cap_tool_results_inplace(messages, "DirectPayload")
+    _cap_tool_results_inplace(messages, "DirectPayload", max_chars=0)
     effective_model = model_name or body.get("model") or MODEL_NAME
     if _is_text_only_model(effective_model):
         _sanitize_image_urls_inplace(messages, "DirectPayload")
@@ -1978,7 +1978,7 @@ def _build_worker_payload(
     # ══ Tool-Result-Truncation: verhindert Token-Bombing ══════════════
     # Wenn VS Code riesige Tool-Results (z.B. 111KB grep_hits) zurückschickt,
     # explodiert der Payload. Cap hart auf TOOL_RESULT_CAP chars pro Tool-Msg.
-    _cap_tool_results_inplace(messages, "Worker")
+    _cap_tool_results_inplace(messages, "Worker", max_chars=0)
 
     # ══ image_url-Sanitizer für text-only Models ═════════════════════
     # DeepSeek V4 wirft sonst 400 ('unknown variant image_url, expected text').
