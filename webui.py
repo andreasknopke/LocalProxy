@@ -11,6 +11,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import time
 import uuid
 from pathlib import Path
@@ -1133,6 +1134,44 @@ document.querySelectorAll('nav button').forEach(btn => {
 # API Endpoints
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _reload_proxy_config() -> None:
+    """Aktualisiert die In-Memory-Globals des Proxy aus config.json (ohne Neustart)."""
+    try:
+        from proxy import _apply_config_file
+        _apply_config_file()
+        _log("🔄 Proxy-Config aus config.json neu geladen (in-process)")
+    except Exception as e:
+        _log(f"⚠️  Proxy-Config-Reload fehlgeschlagen: {e}")
+
+def _trigger_restart() -> None:
+    """Startet den Proxy-Prozess neu.
+    
+    Versucht zuerst systemctl (bare-metal), fällt zurück auf SIGTERM (Docker/Coolify).
+    """
+    _log("🔄 Neustart angefordert via WebUI")
+    import threading as _th
+    import subprocess as _sp
+
+    def _do_restart():
+        time.sleep(0.5)
+        # Versuche systemctl (bare-metal Linux)
+        try:
+            result = _sp.run(["systemctl", "restart", "localproxy"], capture_output=True, timeout=5)
+            if result.returncode == 0:
+                _log("✅ systemctl restart localproxy ausgeführt")
+                return
+            _log(f"⚠️  systemctl restart fehlgeschlagen (rc={result.returncode}), versuche SIGTERM...")
+        except Exception as e:
+            _log(f"⚠️  systemctl nicht verfügbar ({e}), versuche SIGTERM...")
+
+        # Fallback: SIGTERM → Docker/Process-Manager startet neu
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+        except Exception as e:
+            _log(f"❌ SIGTERM fehlgeschlagen: {e}")
+
+    _th.Thread(target=_do_restart, daemon=True).start()
+
 def create_webui_app() -> FastAPI:
     """Erstellt eine FastAPI-Sub-App mit dem Webinterface."""
 
@@ -1236,6 +1275,8 @@ def create_webui_app() -> FastAPI:
 
         _save_config(current)
         _log("💾 Config gespeichert")
+        # In-Memory-Globals sofort aktualisieren (auch ohne Neustart wirksam)
+        _reload_proxy_config()
         return JSONResponse(content={"status": "ok", "message": "Config saved"})
 
     @webapp.get("/api/status")
@@ -1265,16 +1306,8 @@ def create_webui_app() -> FastAPI:
 
     @webapp.post("/api/restart")
     async def restart_proxy():
-        """Startet den Proxy-Service neu (systemctl restart localproxy)."""
-        _log("🔄 Neustart angefordert via WebUI")
-        # Hintergrund-Restart mit kurzer Verzögerung, damit die Antwort noch rausgeht
-        import threading as _th
-        def _do_restart():
-            import time as _t
-            _t.sleep(0.5)
-            import subprocess as _sp
-            _sp.run(["systemctl", "restart", "localproxy"], capture_output=True)
-        _th.Thread(target=_do_restart, daemon=True).start()
+        """Startet den Proxy-Service neu (systemctl oder SIGTERM)."""
+        _trigger_restart()
         return JSONResponse(content={"status": "ok", "message": "Restarting..."})
 
     @webapp.post("/api/memory/clear")
@@ -1364,15 +1397,9 @@ def create_webui_app() -> FastAPI:
 
         _save_config(cfg)
         _log(f"📥 Profil geladen: {safe_name} — starte neu...")
-
-        # Neustart triggern (gleicher Mechanismus wie /api/restart)
-        import threading as _th
-        def _do_restart():
-            import time as _t
-            _t.sleep(0.5)
-            import subprocess as _sp
-            _sp.run(["systemctl", "restart", "localproxy"], capture_output=True)
-        _th.Thread(target=_do_restart, daemon=True).start()
+        # In-Memory-Globals sofort aktualisieren, dann Prozess-neustart
+        _reload_proxy_config()
+        _trigger_restart()
         return JSONResponse(content={"status": "ok", "message": f"Profil '{safe_name}' geladen — Neustart läuft"})
 
     @webapp.delete("/api/profiles/{name}")
