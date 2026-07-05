@@ -237,6 +237,14 @@ def _cleanup_old_planner_sessions(max_age_seconds: float = 600) -> None:
     for h in stale:
         del _PLANNER_SESSIONS[h]
 
+PLAN_MARKERS = ("## Plan:", "## plan:", "# Plan:", "# plan:", "## CLOUD EXECUTION PLAN")
+
+def _content_contains_plan(content: str) -> bool:
+    """Prüft ob ein Text einen Plan enthält (Kimi hat fertig geplant)."""
+    if not content or not isinstance(content, str):
+        return False
+    return any(m in content for m in PLAN_MARKERS)
+
 
 # ── Loop-Detection-Helpers (Signature-basiert) ───────────────────────────
 def _tool_signature(tool_call: Dict[str, Any]) -> str:
@@ -4104,41 +4112,6 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         force_review = force_review or planner_flags.get("force_review", False)
         bypass_worker = bypass_worker or planner_flags.get("bypass_worker", False)
 
-        # ══ Plan-Extraktion aus memory-Tool-Result ════════════════════
-        # Nachdem der Planner seinen Plan via 'memory' Tool persistiert hat,
-        # brauchen wir keinen weiteren Planner-Call – direkt zum Worker.
-        plan_from_memory = None
-        for m in reversed(body.get("messages", [])):
-            if isinstance(m, dict) and m.get("role") == "tool":
-                content = _message_text(m)
-                if content and ("## Plan:" in content or "## plan:" in content.lower()):
-                    plan_from_memory = content
-                    break
-        if plan_from_memory and len(plan_from_memory) > 200:
-            _log(f"  🎉 Plan aus memory-Tool extrahiert ({len(plan_from_memory)} chars) → Worker starten")
-            _PLANNER_SESSIONS[session_hash] = {
-                "state": "done", "ts": time.time(),
-                "plan": plan_from_memory, "pflags": planner_flags,
-            }
-            worker_payload = _build_worker_payload(body, plan_from_memory, "")
-            worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
-            results.append(worker_result)
-            worker_response = worker_result.get("content", "")
-            if worker_result.get("tool_calls") or _contains_tool_calls(worker_response):
-                _log("  🔧 Worker enthält Tool-Calls → Durchreiche an Client")
-                await client.aclose()
-                return {
-                    "combined_response_text": worker_response,
-                    "results": results,
-                    "duration_seconds": time.perf_counter() - start_time,
-                }
-            await client.aclose()
-            return {
-                "combined_response_text": worker_response,
-                "results": results,
-                "duration_seconds": time.perf_counter() - start_time,
-            }
-
         # Loop-Detection: statt blinden Counter, letzte Tool-Requests tracken.
         # Die Tool-Resultate (vorige Runde) sind in der History (letzter 'tool'-Eintrag).
         # Wir extrahieren die vorigen tool_calls aus der Message-History.
@@ -4236,6 +4209,15 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         planner_result = await _call_cloud_planner_agent(client, body)
         results.append(planner_result)
 
+        # ══ Plan-Erkennung: Kimi hat fertig, auch wenn noch tool_calls (memory) anstehen ══
+        pc = planner_result.get("content", "")
+        if _content_contains_plan(pc) and len(pc) > 200:
+            _log(f"  🎉 Plan im Content erkannt ({len(pc)} chars) → Session done")
+            _PLANNER_SESSIONS[session_hash] = {
+                "state": "done", "ts": time.time(),
+                "plan": pc, "pflags": planner_flags,
+            }
+
         if planner_result.get("tool_calls"):
             # Kimi will weitere Tools → Tool-Calls an VS Code weiterleiten
             _log("  🔧 Cloud-Planner-Agent fordert weitere Tools → Durchreiche an VS Code")
@@ -4247,7 +4229,7 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             }
 
         # Kimi hat fertig → Plan extrahieren
-        plan = planner_result.get("content", "") if planner_result.get("status") == "ok" else ""
+        plan = pc if planner_result.get("status") == "ok" else ""
         if plan:
             _log(f"  📝 Cloud-Planner hat Plan erstellt ({len(plan)} chars)")
             # Plan in dak-dat File persistieren (Codespace-Copilot-Stil)
@@ -4416,6 +4398,15 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
 
         planner_result = await _call_cloud_planner_agent(client, body, "", results)  # Kein Hindsight im Planner — sauberer Plan-Kontext
         results.append(planner_result)
+
+        # ══ Plan-Erkennung: Kimi hat fertig, auch wenn noch tool_calls (memory) anstehen ══
+        pc = planner_result.get("content", "")
+        if _content_contains_plan(pc) and len(pc) > 200:
+            _log(f"  🎉 Plan im Content erkannt ({len(pc)} chars) → Session done")
+            _PLANNER_SESSIONS[session_hash] = {
+                "state": "done", "ts": time.time(),
+                "plan": pc, "pflags": {"force_review": force_review, "bypass_worker": bypass_worker},
+            }
 
         if planner_result.get("tool_calls"):
             # Kimi will Tools ausführen → an VS Code weiterleiten, Session speichern.
