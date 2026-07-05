@@ -3137,24 +3137,55 @@ async def _call_cloud_planner_agent(
 
         messages = list(payload.get("messages", []))
 
-        # Sliding Window
-        MAX_PLANNER_CONT_MESSAGES = 50
-        if len(messages) > MAX_PLANNER_CONT_MESSAGES:
-            system_msg = None
-            if messages and messages[0].get("role") == "system":
-                system_msg = messages[0]
-            keep_count = MAX_PLANNER_CONT_MESSAGES - (1 if system_msg else 0)
-            truncated = messages[-keep_count:]
+        # ══ Clean Sliding Window: System + letzter assistant→tool Zyklus ══
+        # Problem: Altes Sliding Window ließ verwaiste tool-Nachrichten stehen
+        # (assistant mit tool_calls rausgeschnitten, tool-Antworten blieben).
+        # Lösung: Nur System + letzten vollständigen assistant→tool Zyklus behalten.
+        system_msg = messages[0] if messages and messages[0].get("role") == "system" else None
+        MAX_PLANNER_WINDOW = 30
+
+        # Finde letzten assistant mit tool_calls
+        last_asst_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            m = messages[i]
+            if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls"):
+                last_asst_idx = i
+                break
+
+        if last_asst_idx is not None and len(messages) > MAX_PLANNER_WINDOW:
+            keep_from = max(0, last_asst_idx - 10)
+            truncated = messages[keep_from:]
+            if system_msg and keep_from > 0:
+                truncated = [system_msg] + truncated
+            if len(truncated) > MAX_PLANNER_WINDOW:
+                truncated = truncated[-MAX_PLANNER_WINDOW:]
+                if system_msg and truncated[0].get("role") != "system":
+                    truncated = [system_msg] + truncated[-MAX_PLANNER_WINDOW + 1:]
+            if truncated and truncated[0].get("role") == "system":
+                truncated[0]["content"] = str(truncated[0].get("content", "")) + "\n\n" + planner_mode_instructions
+            _log(f"  🗜 Planner-Cont: {len(messages)} → {len(truncated)} (letzter Zyklus + Kontext)")
+            messages = truncated
+        elif len(messages) > MAX_PLANNER_WINDOW:
             if system_msg:
-                truncated[0] = {"role": "system", "content": str(system_msg.get("content", "")) + "\n\n" + planner_mode_instructions}
-            _log(f"  🗜 Planner-Cont: {len(messages)} → {len(truncated)} (Window={MAX_PLANNER_CONT_MESSAGES})")
+                truncated = [system_msg] + messages[-(MAX_PLANNER_WINDOW - 1):]
+            else:
+                truncated = messages[-MAX_PLANNER_WINDOW:]
+            _log(f"  🗜 Planner-Cont: {len(messages)} → {len(truncated)} (Window={MAX_PLANNER_WINDOW})")
             messages = truncated
         else:
-            # Inject plan-mode instructions into existing system message
             if messages and messages[0].get("role") == "system":
                 messages[0]["content"] = str(messages[0].get("content", "")) + "\n\n" + planner_mode_instructions
 
-        # Orphaned-Tool-Cleanup
+        # reasoning_content strippen — sonst crasht DeepSeek (Kimi-Eigenart)
+        removed = 0
+        for m in messages:
+            if isinstance(m, dict) and "reasoning_content" in m:
+                del m["reasoning_content"]
+                removed += 1
+        if removed:
+            _log(f"  🧹 Planner-Cont: {removed} reasoning_content entfernt")
+
+        # Orphaned-Tool-Cleanup: tool→user wenn assistant(tool_calls) fehlt
         valid_tc_ids = set()
         for m in messages:
             if isinstance(m, dict) and m.get("role") == "assistant":
