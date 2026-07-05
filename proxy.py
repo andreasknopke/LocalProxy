@@ -1930,6 +1930,7 @@ def _extract_planner_file_contents(messages: List[Dict[str, Any]]) -> Dict[str, 
             fp = args.get("filePath") or args.get("path") or ""
             if fp:
                 read_tc_ids[tc_id] = fp
+    _log(f"  🔍 _extract_planner: {len(read_tc_ids)} read_file tc_ids in {len(messages)} msgs")
     if not read_tc_ids:
         return {}
 
@@ -1944,6 +1945,7 @@ def _extract_planner_file_contents(messages: List[Dict[str, Any]]) -> Dict[str, 
         content = m.get("content", "")
         if isinstance(content, str) and content.strip():
             file_contents[fp] = content
+    _log(f"  🔍 _extract_planner: {len(file_contents)} file contents extracted")
     return file_contents
 
 
@@ -1977,6 +1979,30 @@ def _parse_plan_file_paths(plan: str) -> List[str]:
     return paths
 
 
+def _embed_files_into_plan(plan: str, planner_messages: List[Dict[str, Any]]) -> str:
+    """Hängt alle vom Planner gelesenen Dateiinhalte direkt an den Plan an.
+    Der Worker sieht die Files dann als Teil des Plans im System-Prompt.
+    """
+    files = _extract_planner_file_contents(planner_messages)
+    if not files:
+        return plan
+    parts = [plan, "", "---", "## PLANNER FILE CONTENTS", ""]
+    for fp, content in files.items():
+        parts.append(f"### `{fp}`")
+        parts.append("```")
+        # Kürze Dateien auf ~4000 Zeichen für Payload-Größe
+        truncated = content
+        if len(content) > 4000:
+            truncated = content[:4000] + f"\n...(truncated, {len(content)} chars total)"
+        parts.append(truncated)
+        parts.append("```")
+        parts.append("")
+    result = "\n".join(parts)
+    _log(f"  📎 Files in Plan eingebettet: {len(files)} Dateien "
+         f"({sum(len(v) for v in files.values())} chars → {len(result)} chars mit Plan)")
+    return result
+
+
 def _build_worker_payload(
     body: Dict[str, Any],
     plan: str,
@@ -1985,7 +2011,6 @@ def _build_worker_payload(
     max_tokens: Optional[int] = None,
     plan_path: Optional[str] = None,
     is_first_worker_call: bool = False,
-    preloaded_files: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Gemini/Aider Clean-Slate Worker-Payload.
 
@@ -1996,8 +2021,9 @@ def _build_worker_payload(
       4. Pre-Loaded Files (nur Round 1 — vom Caller übergeben)
       5. Worker-Cluster (Continuation — eigene Tool-Results)
 
-    Erste Runde: read_file + edit tools → Worker verifiziert Dateien
-    Folge-Runden: nur edit tools → Worker MUSS editieren
+    _build_worker_payload() wird trotzdem aufgerufen (für System-Message-Extraktion,
+    Tool-Filter, Cleanup) — aber preloaded_files/planner_files entfällt komplett.
+    Der Worker hat die Files im System-Prompt durch den Plan selbst.
     """
     payload = copy.deepcopy(body)
     payload["model"] = model_name or body.get("model") or MODEL_NAME
@@ -2030,25 +2056,18 @@ def _build_worker_payload(
     if user_task:
         new_msgs.append(user_task)
 
-    # ══ Pre-Loaded Files: JEDEN Round aus Session-Cache ═══════
-    # preloaded_files vom Caller (aus Session) haben immer Vorrang.
-    # Fallback: aus Messages extrahieren (wenn im gleichen Request).
-    # Auf ALLEN Runden injizieren — nicht nur First-Call.
-    # Label: "PLANNER VERSION — your edits may have changed this."
-    if plan and (preloaded_files or not is_continuation):
-        sources = preloaded_files or _extract_planner_file_contents(messages)
-        if sources:
-            for fp, content in sources.items():
+    # ══ Pre-Loaded Files: NUR beim ersten Worker-Call aus Messages ═══
+    # Bei Continuation sind die Files IM PLAN (durch _embed_files_into_plan)
+    if plan and not is_continuation:
+        pre_loaded = _extract_planner_file_contents(messages)
+        if pre_loaded:
+            for fp, content in pre_loaded.items():
                 block = (
-                    f"[PRE-LOADED FILE: {fp} — PLANNER VERSION]\n"
-                    f"⚠️ This was read BEFORE your edits. Your previous changes may\n"
-                    f"have modified this file. Use as REFERENCE only.\n"
+                    f"[PRE-LOADED FILE: {fp}]\n"
                     f"---FILE-START---\n{content}\n---FILE-END---"
                 )
                 new_msgs.append({"role": "user", "content": block})
-            _log(f"  📎 Preloaded: {len(sources)} Dateien "
-                 f"(source={'session' if preloaded_files else 'messages'}, "
-                 f"{sum(len(v) for v in sources.values())} chars)")
+            _log(f"  📎 Preloaded (from messages): {len(pre_loaded)} Dateien")
 
     # Worker-Cluster: bei Continuation die letzten N behalten
     if is_continuation:
@@ -4388,18 +4407,13 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         pc = planner_result.get("content", "")
         if _content_contains_plan(pc) and len(pc) > 200:
             _log(f"  🎉 Plan im Content erkannt ({len(pc)} chars) → Session done, Plan persistiert")
+            # Files IN den Plan einbetten — nächster Request hat sie dann im System-Prompt
+            pc = _embed_files_into_plan(pc, body.get("messages", []))
             plan_path = _save_plan_to_file(session_hash, pc, query=body.get("messages", [{}])[0].get("content", ""))
-            # Planner's read_file-Ergebnisse JETZT extrahieren und cachen –
-            # im nächsten Request (session_state=done) ist der Planner-Body
-            # nicht mehr verfügbar.
-            planner_files = _extract_planner_file_contents(body.get("messages", []))
-            _log(f"  📎 Planner-Files gecached: {len(planner_files)} Dateien "
-                 f"({sum(len(v) for v in planner_files.values())} chars)")
             _PLANNER_SESSIONS[session_hash] = {
                 "state": "done", "ts": time.time(), "worker_rounds": 0,
                 "plan": pc, "pflags": planner_flags,
                 "plan_path": str(plan_path) if plan_path else None,
-                "planner_files": planner_files,
             }
 
         if planner_result.get("tool_calls"):
@@ -4416,13 +4430,13 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         plan = pc if planner_result.get("status") == "ok" else ""
         if plan:
             _log(f"  📝 Cloud-Planner hat Plan erstellt ({len(plan)} chars)")
-            # Plan in dak-dat File persistieren (Codespace-Copilot-Stil)
+            # Files in den Plan einbetten — Worker hat sie dann direkt im System-Prompt
+            plan = _embed_files_into_plan(plan, body.get("messages", []))
             plan_path = _save_plan_to_file(session_hash, plan, query=body.get("messages", [{}])[0].get("content", ""))
             _PLANNER_SESSIONS[session_hash] = {
                 "state": "done", "ts": time.time(), "worker_rounds": 0,
                 "plan": plan, "pflags": planner_flags,
                 "plan_path": str(plan_path) if plan_path else None,
-                "planner_files": _extract_planner_file_contents(body.get("messages", [])),
             }
             progress.append(_format_chat_progress_message(
                 "phase1_plan_ready",
@@ -4506,13 +4520,14 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             }
 
     elif session and session.get("state") == "done":
-        # ── Plan ready, Worker soll ausführen (nächste User-Nachricht ohne Tool-Cont) ──
         plan = session.get("plan", "")
-        planner_flags = session.get("pflags", {})
-        force_review = force_review or planner_flags.get("force_review", False)
-
-        if plan:
-            # Falls kein Plan-Path in der alten Session stand, jetzt speichern
+        # Alten Plan (ohne File-Inhalte) invalidieren
+        if plan and "## PLANNER FILE CONTENTS" not in plan:
+            _log("  🗑 Alter Plan (vor _embed_files_into_plan) → invalidiert, Planner-Neustart")
+            del _PLANNER_SESSIONS[session_hash]
+            # Fall-through zum Standard-Pfad unten (Planner wird neu gestartet)
+        else:
+            # ✅ Valider Plan MIT Files → Worker ausführen
             plan_path = session.get("plan_path")
             if plan and not plan_path:
                 plan_path_obj = _save_plan_to_file(
@@ -4523,28 +4538,24 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
                 session["plan_path"] = plan_path
             worker_round = int(session.get("worker_rounds", 0))
             worker_payload = _build_worker_payload(body, plan, "", plan_path=plan_path,
-                                                    is_first_worker_call=(worker_round == 0),
-                                                    preloaded_files=session.get("planner_files"))
+                                                    is_first_worker_call=(worker_round == 0))
             session["worker_rounds"] = worker_round + 1
             worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
-        else:
-            worker_payload = _build_direct_payload(body)
-            worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
 
-        results.append(worker_result)
-        worker_response = worker_result.get("content", "")
+            results.append(worker_result)
+            worker_response = worker_result.get("content", "")
 
-        # Wenn der Worker Tool-Calls zurückgibt, Session behalten, damit
-        # der nächste Request (tool_cont) den Plan-Kontext wiederfindet.
-        if not (worker_result.get("tool_calls") or _contains_tool_calls(worker_response)):
-            del _PLANNER_SESSIONS[session_hash]
-        await client.aclose()
-        _hindsight.retain(body, worker_response)
-        return {
-            "combined_response_text": worker_response,
-            "results": results,
-            "duration_seconds": time.perf_counter() - start_time,
-        }
+            # Wenn der Worker Tool-Calls zurückgibt, Session behalten, damit
+            # der nächste Request (tool_cont) den Plan-Kontext wiederfindet.
+            if not (worker_result.get("tool_calls") or _contains_tool_calls(worker_response)):
+                del _PLANNER_SESSIONS[session_hash]
+            await client.aclose()
+            _hindsight.retain(body, worker_response)
+            return {
+                "combined_response_text": worker_response,
+                "results": results,
+                "duration_seconds": time.perf_counter() - start_time,
+            }
 
     # ═══════════════════════════════════════════════════════════════════
     # STANDARD / FORCE-PLANNING: Erster Request
@@ -4594,14 +4605,12 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         plan_detected = _content_contains_plan(pc) and len(pc) > 200
         if plan_detected:
             _log(f"  🎉 Plan im Content erkannt ({len(pc)} chars) → Session done, Plan persistiert")
+            pc = _embed_files_into_plan(pc, body.get("messages", []))
             plan_path = _save_plan_to_file(session_hash, pc, query=body.get("messages", [{}])[0].get("content", ""))
-            planner_files = _extract_planner_file_contents(body.get("messages", []))
-            _log(f"  📎 Planner-Files gecached: {len(planner_files)} Dateien")
             _PLANNER_SESSIONS[session_hash] = {
                 "state": "done", "ts": time.time(), "worker_rounds": 0,
                 "plan": pc, "pflags": {"force_review": force_review, "bypass_worker": bypass_worker},
                 "plan_path": str(plan_path) if plan_path else None,
-                "planner_files": planner_files,
             }
 
         if planner_result.get("tool_calls") and not plan_detected:
@@ -4633,13 +4642,12 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         plan = planner_result.get("content", "") if planner_result.get("status") == "ok" else ""
         if plan:
             _log(f"  📝 Cloud-Planner direkt: Plan ({len(plan)} chars)")
-            # Plan als Datei persistieren
+            plan = _embed_files_into_plan(plan, body.get("messages", []))
             plan_path = _save_plan_to_file(session_hash, plan, query=body.get("messages", [{}])[0].get("content", ""))
             _PLANNER_SESSIONS[session_hash] = {
                 "state": "done", "ts": time.time(), "worker_rounds": 0,
                 "plan": plan, "pflags": planner_flags,
                 "plan_path": str(plan_path) if plan_path else None,
-                "planner_files": _extract_planner_file_contents(body.get("messages", [])),
             }
             progress.append(_format_chat_progress_message(
                 "phase1_plan_ready",
@@ -4667,12 +4675,12 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         plan = planner_result.get("content", "") if plan_status == "ok" else ""
 
         if plan_status == "ok":
+            plan = _embed_files_into_plan(plan, body.get("messages", []))
             plan_path = _save_plan_to_file(session_hash, plan, query=body.get("messages", [{}])[0].get("content", ""))
             _PLANNER_SESSIONS[session_hash] = {
                 "state": "done", "ts": time.time(), "worker_rounds": 0,
                 "plan": plan,
                 "plan_path": str(plan_path) if plan_path else None,
-                "planner_files": _extract_planner_file_contents(body.get("messages", [])),
             }
             progress.append(_format_chat_progress_message(
                 "phase1_plan_ready",
@@ -5457,6 +5465,9 @@ async def debug_sessions(request: Request, limit: int = 20):
                 entry["iterations"] = data.get("iterations", 0)
                 entry["last_tool_calls"] = list(data.get("seen_tool_call_ids", []))[-10:]
                 entry["plan_path"] = data.get("plan_path")
+                entry["worker_rounds"] = data.get("worker_rounds", 0)
+                pf = data.get("planner_files", {})
+                entry["planner_files_count"] = len(pf) if pf else 0
                 entry["last_request_len"] = len(str(data.get("last_request_hash", "")))
             sessions.append(entry)
     except Exception as exc:
