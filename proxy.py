@@ -1997,8 +1997,45 @@ def _build_worker_payload(
     if removed:
         _log(f"  🧹 Worker-Payload: {removed} reasoning_content-Felder entfernt")
 
-    # ══ Plan-binding System-Prompt injecten ══════════════════════════
-    if plan:
+    # ══ Loop-Detection: Wiederholte Reads desselben Files? ════════════
+    # Bei Tool-Continuation prüfen, ob der Worker gerade immer wieder
+    # dieselben Files liest (read_file/grep_call mit identischen Args).
+    # Das ist das Symptom der "Plan-Schleife": DeepSeek startet in jeder
+    # neuen Runde von vorn, weil es denkt, der Plan sei neu.
+    is_continuation = has_tool_msgs
+    read_repeat_count = 0
+    if is_continuation:
+        read_call_files = []
+        for m in messages:
+            if not isinstance(m, dict) or m.get("role") != "assistant":
+                continue
+            for tc in (m.get("tool_calls") or []):
+                if not isinstance(tc, dict):
+                    continue
+                fn = (tc.get("function") or {}).get("name", "")
+                if fn not in ("read_file", "grep_search", "file_search", "list_dir"):
+                    continue
+                try:
+                    args = json.loads((tc.get("function") or {}).get("arguments", "{}") or "{}")
+                except Exception:
+                    args = {}
+                sig_key = (fn, str(args.get("filePath") or args.get("path") or
+                                   args.get("query") or args.get("pattern") or ""))
+                read_call_files.append(sig_key)
+        if read_call_files:
+            uniq = set(read_call_files)
+            read_repeat_count = len(read_call_files) - len(uniq)
+            if read_repeat_count >= 2:
+                _log(f"  ⚠ Worker-Read-Loop erkannt: {read_repeat_count} wiederholte Reads "
+                     f"(von {len(read_call_files)} Read-Calls) → Kompakt-Instruktion injizieren")
+
+    # ══ Plan-binding System-Prompt injecten (NUR beim FIRST-CALL) ════
+    # Bei Continuation hat der Worker bereits Tool-Calls gemacht und der
+    # Plan-Binding-Vertrag steht schon im Original-System-Message (der beim
+    # ersten Worker-Call hinzugefügt wurde und via VS-Code-Tool-Loop
+    # durchgereicht wird). Wir injizieren den Vertrag NICHT erneut — sonst
+    # denkt der Worker fälschlich "neuer Auftrag" und fängt von vorn an.
+    if plan and not is_continuation:
         plan_binding = (
             "\n\n[PLAN-BINDING CONTRACT — READ CAREFULLY]\n"
             "A senior planner has prepared a strategic plan for you. Your job: IMPLEMENT IT.\n"
@@ -2019,9 +2056,14 @@ def _build_worker_payload(
         else:
             messages.insert(0, {"role": "system", "content": plan_binding.strip()})
 
-    # Plan + Memory als eigene User-Messages (Plan-Isolat-Layout)
+    # ══ Plan + Memory als User-Messages ══════════════════════════════
+    # BEIM FIRST-CALL: voller Plan als abschließende User-Message → Worker
+    #   weiss, was er tun soll, und startet mit read_file.
+    # BEI CONTINUATION: KEINE Re-Injection des vollen Plans! Sonst Schleife.
+    #   Nur ein kurzer Reminder, wo der Plan liegt, und ein Loop-Breaker
+    #   wenn der Worker wiederholt dieselben Files liest.
     context_blocks = []
-    if plan:
+    if plan and not is_continuation:
         context_blocks.append(
             "[CLOUD EXECUTION PLAN — FOLLOW EXACTLY]\n"
             "This plan was authored by a senior planner who had full codebase access.\n"
@@ -2029,18 +2071,40 @@ def _build_worker_payload(
             "Use your own read_file/grep tools to see the code before each edit.\n\n"
             f"{plan}"
         )
-    if memory_context:
-        context_blocks.append(
-            "---\n"
-            "⚠️ BACKGROUND KNOWLEDGE — NOT YOUR CURRENT TASK ⚠️\n"
-            "The following is LEARNED CONTEXT from PRIOR coding sessions.\n"
-            "It may contain patterns, fixes, and conventions relevant to the\n"
-            "current task. Use it for REFERENCE only.\n"
-            "YOUR CURRENT TASK is described in the user message ABOVE this one.\n"
-            "The PLAN you must execute is above this section.\n"
-            "---\n"
-            f"{memory_context}"
+        if memory_context:
+            context_blocks.append(
+                "---\n"
+                "⚠️ BACKGROUND KNOWLEDGE — NOT YOUR CURRENT TASK ⚠️\n"
+                "The following is LEARNED CONTEXT from PRIOR coding sessions.\n"
+                "It may contain patterns, fixes, and conventions relevant to the\n"
+                "current task. Use it for REFERENCE only.\n"
+                "YOUR CURRENT TASK is described in the user message ABOVE this one.\n"
+                "The PLAN you must execute is above this section.\n"
+                "---\n"
+                f"{memory_context}"
+            )
+    elif is_continuation:
+        plan_hint = (
+            "[CONTINUATION REMINDER — DO NOT RE-READ FILES YOU ALREADY READ]\n"
+            "You are mid-execution of the CLOUD EXECUTION PLAN."
         )
+        if plan_path:
+            plan_hint += f" Full plan persisted at: `{plan_path}` (read it ONLY if you lost context)."
+        if read_repeat_count >= 2:
+            plan_hint += (
+                "\n\n⚠ LOOP ALERT: You have read the same files multiple times. "
+                "STOP re-reading. The file contents are ALREADY in your previous "
+                "tool results above.\n"
+                "Pick the NEXT plan step you have NOT started yet and EXECUTE "
+                "the edit now using replace_string_in_file / multi_replace_string_in_file.\n"
+                "DO NOT start over. The plan has NOT changed."
+            )
+        else:
+            plan_hint += (
+                " Continue with the NEXT unedited step. Use the file contents "
+                "already in your context. DO NOT re-read files unnecessarily."
+            )
+        context_blocks.append(plan_hint)
     context_str = "\n\n".join(context_blocks)
 
     if context_str:
