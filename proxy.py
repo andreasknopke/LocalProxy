@@ -1840,16 +1840,10 @@ def _sanitize_image_urls_inplace(messages: List[Dict[str, Any]], label: str = "P
 
 
 def _extract_planner_file_contents(messages: List[Dict[str, Any]]) -> Dict[str, str]:
-    """Aider-Äquivalent zu get_chat_files_messages(): Scannt die Planner-
-    Conversation nach read_file-Ergebnissen und extrahiert sie als Datei-
-    Inhalt-Map. Diese werden dem Worker als Pre-Loaded-Kontext injiziert,
-    sodass er NICHT selbst read_file aufrufen muss (verhindert die
-    klassische "Worker liest immer wieder dieselben Files"-Schleife).
-    
+    """Extrahiert alle read_file-Ergebnisse aus der Planner-Conversation.
     Returns: {filePath: content, ...}
     """
-    # 1. Sammle alle tool_call_ids von assistant-Nachrichten mit read_file
-    read_tc_ids: Dict[str, str] = {}  # tc_id → filePath
+    read_tc_ids: Dict[str, str] = {}
     for m in messages:
         if not isinstance(m, dict) or m.get("role") != "assistant":
             continue
@@ -1869,11 +1863,9 @@ def _extract_planner_file_contents(messages: List[Dict[str, Any]]) -> Dict[str, 
             fp = args.get("filePath") or args.get("path") or ""
             if fp:
                 read_tc_ids[tc_id] = fp
-
     if not read_tc_ids:
         return {}
 
-    # 2. Finde die tool-result messages mit passenden tool_call_ids
     file_contents: Dict[str, str] = {}
     for m in messages:
         if not isinstance(m, dict) or m.get("role") != "tool":
@@ -1884,10 +1876,38 @@ def _extract_planner_file_contents(messages: List[Dict[str, Any]]) -> Dict[str, 
         fp = read_tc_ids[tc_id]
         content = m.get("content", "")
         if isinstance(content, str) and content.strip():
-            # Nimm den neuesten Read pro File (letzter gewinnt)
             file_contents[fp] = content
-
     return file_contents
+
+
+def _parse_plan_file_paths(plan: str) -> List[str]:
+    """Parst Dateipfade aus der '**Relevant files**' oder '**Relevant files**'  
+    Sektion des Plans. Erkennt:
+      - `path/to/file.ts` — Beschreibung
+      - `path/to/*.ts` — Beschreibung (Glob-Style)
+    Returns Liste normalisierter Pfade (Globs werden nicht expandiert,
+    nur als Marker genutzt).
+    """
+    paths: List[str] = []
+    in_section = False
+    for line in plan.split("\n"):
+        stripped = line.strip()
+        if stripped.lower().startswith("**relevant files**") or stripped.lower().startswith("**relevante dateien**"):
+            in_section = True
+            continue
+        if in_section:
+            if stripped.startswith("**") and stripped.endswith("**"):
+                break  # nächste Sektion
+            if stripped.startswith("##"):
+                break
+            # Match: `- path/to/file.ext` or `- `path/to/file.ext``
+            m = re.match(r"-\s+`?([^`\s]+)`?\s", stripped)
+            if m:
+                fp = m.group(1)
+                if fp.endswith("*") or fp.endswith("*.ts") or fp.endswith("*.js"):
+                    continue  # Glob, nicht expandierbar
+                paths.append(fp)
+    return paths
 
 
 def _build_worker_payload(
@@ -1978,18 +1998,21 @@ def _build_worker_payload(
         new_msgs.append(original_user_msg)
 
     # ══ PRE-LOADED FILES (Aider's get_chat_files_messages) ═══════
-    # NUR beim FIRST-CALL injizieren. Bei Continuation NICHT — der
-    # Worker würde Kimis veraltete Dateiversionen sehen und Duplikat-
-    # Edits machen (z.B. 3x resize? in common.ts). Stattdessen kriegt
-    # der Worker bei Continuation seine eigenen Tool-Results aus den
-    # vorherigen Runden (unten, via letzte N Worker-Cluster).
+    # NUR beim FIRST-CALL: Kimi's read_file-Ergebnisse als vollständige
+    # Dateiinhalte injizieren. Zusätzlich: Dateipfade aus der
+    # "**Relevant files**" Sektion des Plans parsen und für nicht
+    # pre-geloadete Files eine explizite "Diese N Files fehlen noch"
+    # Liste zeigen — der Worker liest dann GEZIELT nur die fehlenden.
+    files_to_read = []  # Pfade die der Worker lesen MUSS
     if plan and not has_tool_msgs:
         pre_loaded_files = _extract_planner_file_contents(messages)
+        plan_file_paths = _parse_plan_file_paths(plan)
+
         if pre_loaded_files:
             injected = 0
             for fp, content in pre_loaded_files.items():
                 block = (
-                    f"[PRE-LOADED FILE: {fp} — FULL CONTENT, TRUST THIS]\n"
+                    f"[PRE-LOADED FILE: {fp} — FULL CONTENT]\n"
                     f"---FILE-START---\n"
                     f"{content}\n"
                     f"---FILE-END---"
@@ -1998,6 +2021,16 @@ def _build_worker_payload(
                 injected += 1
             _log(f"  📎 Preloaded: {injected} Dateien "
                  f"({sum(len(v) for v in pre_loaded_files.values())} chars total)")
+
+        # Finde Dateien aus dem Plan, die NICHT pre-geloadet wurden
+        for fp in plan_file_paths:
+            if fp not in pre_loaded_files:
+                # Normalisiere — Kimi nutzt manchmal absolute, manchmal relative Pfade
+                normalized = fp.replace("\\", "/")
+                found = any(normalized in k.replace("\\", "/") or k.replace("\\", "/").endswith(normalized)
+                           for k in pre_loaded_files)
+                if not found:
+                    files_to_read.append(fp)
 
     if has_tool_msgs:
         # Continuation: die letzten 3 Worker-Cluster behalten.
@@ -2114,25 +2147,23 @@ def _build_worker_payload(
     # Auftrag" war falsch — der CONTINUATION REMINDER sagt "mid-execution".
     if plan:
         plan_binding = (
-            "\n\n[PLAN-BINDING CONTRACT — READ CAREFULLY]\n"
-            "A senior planner has prepared a strategic plan for you. Your job: IMPLEMENT IT.\n"
-            "IMPORTANT: Code context is PRE-LOADED in [PRE-LOADED FILE] messages above.\n"
-            "You do NOT need to read files — the code is already in your context.\n"
+            "\n\n[PLAN-BINDING CONTRACT]\n"
+            "A senior planner has prepared a strategic plan. Your job: IMPLEMENT IT.\n"
+            "\n"
+            "File policy:\n"
+            "- [PRE-LOADED FILE] blocks above = FULL content. Do NOT re-read.\n"
+            "- \"📋 FILES YOU MUST READ\" list below = read ONCE each, then edit.\n"
+            "- Everything else = irrelevant, ignore.\n"
+            "\n"
             "Rules:\n"
-            "1. Your PRIMARY output is FILE EDITS, not reads. Max 3 reads per round.\n"
-            "2. Edit files directly — their contents are in [PRE-LOADED FILE] blocks above.\n"
-            "   Only read a file if it was NOT pre-loaded AND critical for the next edit.\n"
+            "1. Your output must contain FILE EDITS. Read only files from the 📋 list.\n"
             "2. Execute each plan step IN ORDER.\n"
             "3. DO NOT refactor, add features, or 'improve' anything not in the plan.\n"
-            "4. If a step references the wrong file/line: read to find the real location, then proceed.\n"
+            "4. If a step references the wrong file/line: adapt.\n"
             "5. Do NOT create new files unless the plan explicitly says 'CREATE <path>'.\n"
             "6. After finishing, output '## Implementation Summary' with each step ✓/⚠/✗.\n"
             "\n"
-            "⛔ CRITICAL: You are an EXECUTOR, not an explorer. The planner already explored.\n"
-            "Your job is to EDIT files. Every round without an edit is a failed round.\n"
-            "Read ONLY what you need for the IMMEDIATE next edit, then EDIT.\n"
-            "\n"
-            "═══ THE PLAN (always visible in every round) ═══\n"
+            "═══ THE PLAN ═══\n"
             f"{plan}\n"
             "═══ END PLAN ═══"
         )
@@ -2152,12 +2183,25 @@ def _build_worker_payload(
     #   wenn der Worker wiederholt dieselben Files liest.
     context_blocks = []
     if plan and not is_continuation:
-        context_blocks.append(
+        msg_parts = [
             "[CLOUD EXECUTION PLAN — SEE SYSTEM PROMPT ABOVE]\n"
             "The full plan is in your system prompt ('═══ THE PLAN ═══').\n"
-            "Files are PRE-LOADED above. Start editing NOW.\n"
-            "READ-BUDGET: max 3 reads, then you MUST edit."
-        )
+            "Pre-loaded files above contain their FULL contents — do NOT re-read them."
+        ]
+        if files_to_read:
+            file_list = "\n".join(f"  - `{fp}`" for fp in files_to_read)
+            msg_parts.append(
+                f"\n\n📋 FILES YOU MUST READ (not pre-loaded, read ONCE each):\n"
+                f"{file_list}\n\n"
+                f"Read ONLY these {len(files_to_read)} files. Then EDIT. "
+                f"Do NOT read memory, do NOT read the plan file, do NOT read pre-loaded files."
+            )
+        else:
+            msg_parts.append(
+                "\n\nALL files referenced in the plan are pre-loaded above. "
+                "You have everything you need. Start editing Step 1 NOW."
+            )
+        context_blocks.append("".join(msg_parts))
         if memory_context:
             context_blocks.append(
                 "---\n"
