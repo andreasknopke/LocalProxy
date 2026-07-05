@@ -209,10 +209,10 @@ _PLANNER_SESSIONS: Dict[str, Dict[str, Any]] = {}
 #      wenn Kimi völlig außer Kontrolle gerät.
 #
 # Detector-Historie wird beim Start jeder neuen Planner-Session zurückgesetzt.
-MAX_PLANNER_ITERATIONS = 15       # Aider-Äquivalent: Architect hat begrenzten Kontext.
-                                  # Mit dem <exploration_budget> von 5–8 Reads + ein paar
-                                  # Clarifying/Grep-Calls sind 15 Runden großzügig.
-                                  # Danach: harte Plan-Ausgabe (kein weiteres Tool-Ping-Pong).
+MAX_PLANNER_ITERATIONS = 8        # Hard cap: nach 8 Runden MUSS der Plan raus.
+                                  # Planner hat <exploration_budget> von 5-8 reads,
+                                  # plus 1-2 vscode_askQuestions + 1 Recap-Runde.
+                                  # Mehr braucht kein guter Plan.
 PLANNER_REPEAT_HARD_STOP = 3      # Bei N identischen (name,args)-Wiederholungen in Folge → Plan erzwingen
                                   # (3 statt 2: read(x)→read(x) kann legitim sein; 3x = echter Loop)
 PLANNER_WARN_AFTER = 12           # Ab Iteration M: sanfter System-Hinweis "bald plan ausgeben"
@@ -3178,18 +3178,20 @@ def _build_planner_tool_continuation_context(
             break
     planner_instructions = (
         "\n\n[PLANNER AGENT MODE — appended by proxy]\n"
-        "You are now acting as a STRATEGIC PLANNING AGENT. You have access to VS Code tools. "
-        "Your job: EXPLORE the workspace, UNDERSTAND the user's task, then "
-        "PRODUCE AN EXECUTION PLAN in Markdown.\n\n"
-        "Rules:\n"
-        "1. EXPLORE while you need more info (read_file, grep_search, list_dir).\n"
-        "2. STOP exploring as soon as you have enough context.\n"
-        "3. Then OUTPUT a Plan: format `## Plan: <title>` + numbered steps.\n"
-        "   - 10-20 concrete steps, each with file path + WHAT to change + WHY.\n"
-        "   - Max 4000 chars total. Use terse caveman compression.\n"
-        "   - DO NOT write the code. The worker implements it.\n"
-        "4. If a tool result is unhelpful (e.g. empty matches), DO NOT retry "
-        "the same tool with the same args — change strategy or move on.\n"
+        "READ CAREFULLY. You are now at iteration {iter}. This is your LAST chance to explore.\n"
+        "\n"
+        "HARD RULES:\n"
+        "1. You have already read {files} files and used {tools} distinct tools.\n"
+        "2. MAX 2 more read_file/grep calls this round. After that: OUTPUT THE PLAN.\n"
+        "3. DO NOT re-read files you already read (see EXPLORATION RECAP below).\n"
+        "4. DO NOT ask more questions via vscode_askQuestions. Decide based on what you have.\n"
+        "5. Your NEXT response MUST contain '## Plan: <title>'. No exceptions.\n"
+        "\n"
+        "Format: ## Plan: <2-6 words>\\n**Steps**\\n1. ...\\n**Relevant files**\\n- `path`\\n"
+    ).format(
+        iter=iterations,
+        files=distinct_files_count,
+        tools=len(session.get("distinct_files") or []),
     )
     if original_system:
         planner_system = original_system + planner_instructions
@@ -3205,17 +3207,10 @@ def _build_planner_tool_continuation_context(
     recap = _summarize_exploration(messages, max_items=25)
     if recap:
         # Nudge nach ausreichender Exploration, Härte steigt mit iterations
-        nudge = ""
-        if iterations >= 8 and distinct_files_count >= 5:
-            nudge = (
-                "\n\n⚠️ You have done many rounds of exploration. The workspace is sufficiently "
-                "understood now. STOP calling tools. OUTPUT THE PLAN NOW."
-            )
-        elif iterations >= 4:
-            nudge = (
-                "\n\nℹ️ You have explored enough. If you have enough context, output the plan. "
-                "Only call another tool if truly necessary."
-            )
+        nudge = (
+            "\n\n⛔ YOU HAVE READ ENOUGH. Your NEXT message MUST be the Plan.\n"
+            "DO NOT call any tools. OUTPUT '## Plan: <title>' NOW."
+        )
         new_messages.append({"role": "user", "content": recap + nudge})
 
     # ══ KEIN tool_calls/tool_results-Durchreich mehr ═══════════════════
