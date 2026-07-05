@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import time
 import uuid
@@ -23,6 +24,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 # ═══════════════════════════════════════════════════════════════════════════
 
 CONFIG_PATH = Path(os.getenv("LOCALPROXY_CONFIG", "data/config.json"))
+PROFILES_DIR = CONFIG_PATH.parent / "profiles"
 LOG_FILE = os.getenv("LOG_FILE", str(Path(__file__).parent / "proxy.log"))
 
 
@@ -459,6 +461,7 @@ pre { background: var(--surface2); padding: 12px; border-radius: var(--radius); 
   <button data-tab="hindsight">🧠 Hindsight</button>
   <button data-tab="verify">✅ Verifikation</button>
   <button data-tab="logs">📋 Log</button>
+  <button data-tab="profiles">💾 Profile</button>
 </nav>
 <main>
   <!-- Models -->
@@ -723,6 +726,30 @@ pre { background: var(--surface2); padding: 12px; border-radius: var(--radius); 
       <pre id="log-viewer" style="background:var(--bg);border:1px solid var(--border);max-height:60vh;overflow-y:auto;font-size:0.75rem;line-height:1.6;white-space:pre-wrap;word-break:break-all">Wird geladen...</pre>
     </div>
   </section>
+
+  <!-- Profiles -->
+  <section id="tab-profiles">
+    <div class="card">
+      <h3><span class="icon">💾</span> Setup als Profil sichern</h3>
+      <p style="font-size:0.85rem;color:var(--text2);margin-bottom:12px">
+        Sichert die <em>komplette</em> Konfiguration inkl. aller API-Keys als benanntes Profil.
+        So kannst du schnell zwischen verschiedenen Setups wechseln.
+      </p>
+      <div style="display:flex;gap:8px;align-items:flex-end">
+        <div class="form-group" style="flex:1;margin-bottom:0">
+          <label>Profil-Name</label>
+          <input type="text" id="profile-name" placeholder="z.B. produktiv-lokal, staging-cloud, deepseek-offen">
+        </div>
+        <button class="btn btn-primary" onclick="saveProfile()" style="height:38px">💾 Jetzt sichern</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3><span class="icon">📂</span> Gespeicherte Profile</h3>
+      <div id="profile-list" style="font-size:0.85rem;color:var(--text2)">
+        Wird geladen...
+      </div>
+    </div>
+  </section>
 </main>
 
 <script>
@@ -946,6 +973,114 @@ function startLogPolling() {
   logTimer = setInterval(refreshLogs, 3000);
 }
 
+// ── Profile Management ────────────────────────────────────────────────
+
+async function loadProfiles() {
+  const list = document.getElementById('profile-list');
+  if (!list) return;
+  try {
+    const r = await apiFetch('/webui/api/profiles');
+    const data = await r.json();
+    if (!data.profiles || data.profiles.length === 0) {
+      list.innerHTML = '<p style="color:var(--text2)">Keine Profile gespeichert. Sichere dein aktuelles Setup mit einem Namen.</p>';
+      return;
+    }
+    list.innerHTML = data.profiles.map(p => {
+      const date = new Date(p.modified * 1000).toLocaleString('de-DE');
+      let info = '';
+      if (p.error) {
+        info = '<span style="color:var(--danger)">⚠️ Fehlerhaft</span>';
+      } else {
+        info = '🤖 ' + escapeHtml(p.model_name || '?');
+        if (p.cloud) info += ' &nbsp;☁️ ' + escapeHtml(p.cloud);
+        if (p.chatty) info += ' &nbsp;💬 Chatty';
+      }
+      return `<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:var(--surface2);border-radius:6px;margin-bottom:8px;border:1px solid var(--border)">
+        <div>
+          <strong style="color:var(--text)">${escapeHtml(p.name)}</strong>
+          <div style="font-size:0.75rem;color:var(--text2);margin-top:2px">${info} &nbsp;·&nbsp; ${date} &nbsp;·&nbsp; ${(p.size_bytes/1024).toFixed(1)} KB</div>
+        </div>
+        <div style="display:flex;gap:6px;flex-shrink:0;margin-left:12px">
+          <button class="btn btn-primary" onclick="loadProfile('${escapeHtml(p.name)}')" style="font-size:0.75rem;padding:4px 12px">📥 Laden</button>
+          <button class="btn btn-danger" onclick="deleteProfile('${escapeHtml(p.name)}')" style="font-size:0.75rem;padding:4px 12px">🗑️</button>
+        </div>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    list.innerHTML = '<p style="color:var(--danger)">Fehler: ' + escapeHtml(e.message) + '</p>';
+  }
+}
+
+async function saveProfile() {
+  const input = document.getElementById('profile-name');
+  const name = input.value.trim();
+  if (!name) { toast('Bitte Profil-Name eingeben', 'error'); return; }
+  try {
+    const r = await apiFetch('/webui/api/profiles/save', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({name})
+    });
+    if (r.ok) {
+      toast('📦 Profil "' + name + '" gespeichert', 'success');
+      input.value = '';
+      loadProfiles();
+    } else {
+      const e = await r.json();
+      toast('Fehler: ' + (e.detail || 'Unbekannt'), 'error');
+    }
+  } catch(e) { toast('Fehler: ' + e.message, 'error'); }
+}
+
+async function loadProfile(name) {
+  if (!confirm('Profil "' + name + '" laden? Die aktuelle Konfiguration wird ersetzt und der Proxy neu gestartet.')) return;
+  try {
+    const r = await apiFetch('/webui/api/profiles/load/' + encodeURIComponent(name), {method:'POST'});
+    if (r.ok) {
+      toast('🔄 Profil geladen — Neustart läuft...', 'success');
+      setTimeout(async () => {
+        for (let i=0; i<20; i++) {
+          try { const rr = await fetch('/healthz'); if (rr.ok) { location.reload(); return; } } catch(e) {}
+          await new Promise(r => setTimeout(r, 1000));
+        }
+        location.reload();
+      }, 3000);
+    } else {
+      const e = await r.json();
+      toast('Fehler: ' + (e.detail || 'Unbekannt'), 'error');
+    }
+  } catch(e) {
+    // Proxy ist schon tot (erwartet bei restart)
+    toast('🔄 Neustart läuft...', 'success');
+    setTimeout(async () => {
+      for (let i=0; i<20; i++) {
+        try { const rr = await fetch('/healthz'); if (rr.ok) { location.reload(); return; } } catch(e) {}
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      location.reload();
+    }, 3000);
+  }
+}
+
+async function deleteProfile(name) {
+  if (!confirm('Profil "' + name + '" wirklich löschen?')) return;
+  try {
+    const r = await apiFetch('/webui/api/profiles/' + encodeURIComponent(name), {method:'DELETE'});
+    if (r.ok) {
+      toast('🗑️ Profil gelöscht', 'success');
+      loadProfiles();
+    } else {
+      const e = await r.json();
+      toast('Fehler: ' + (e.detail || 'Unbekannt'), 'error');
+    }
+  } catch(e) { toast('Fehler: ' + e.message, 'error'); }
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
 // ── Init ───────────────────────────────────────────────────────────────
 
 // Benutzer anzeigen
@@ -978,8 +1113,17 @@ async function apiFetch(url, options = {}) {
 loadConfig();
 refreshStatus();
 refreshLogs();
+loadProfiles();
 setInterval(refreshStatus, 15000);
 startLogPolling();
+
+// Profile beim Tab-Wechsel neu laden
+document.querySelectorAll('nav button').forEach(btn => {
+  // bestehenden Listener erweitern: bei profiles-Tab → loadProfiles()
+  btn.addEventListener('click', () => {
+    if (btn.dataset.tab === 'profiles') loadProfiles();
+  });
+});
 </script>
 </body>
 </html>"""
@@ -1147,6 +1291,100 @@ def create_webui_app() -> FastAPI:
                 except OSError:
                     pass
         return JSONResponse(content={"status": "ok", "deleted_files": deleted})
+
+    # ── Profile Management ───────────────────────────────────────────────
+
+    @webapp.get("/api/profiles")
+    async def list_profiles():
+        """Listet alle gespeicherten Profile auf."""
+        profiles = []
+        PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+        for f in sorted(PROFILES_DIR.glob("*.json")):
+            stat = f.stat()
+            try:
+                with open(f, "r", encoding="utf-8") as fh:
+                    cfg = json.load(fh)
+                # Extrahiere Kurzinfo
+                model_name = cfg.get("models", {}).get("model_name", "?")
+                cloud_model = cfg.get("cloud", {}).get("model", "") or cfg.get("litellm", {}).get("model", "")
+                cloud_enabled = cfg.get("cloud", {}).get("enabled", False) or bool(cloud_model)
+                profiles.append({
+                    "name": f.stem,
+                    "size_bytes": stat.st_size,
+                    "modified": stat.st_mtime,
+                    "model_name": model_name,
+                    "cloud": cloud_model if cloud_enabled else None,
+                    "chatty": cfg.get("proxy", {}).get("chatty_mode", False),
+                })
+            except (json.JSONDecodeError, OSError):
+                profiles.append({
+                    "name": f.stem,
+                    "size_bytes": stat.st_size,
+                    "modified": stat.st_mtime,
+                    "error": True,
+                })
+        return JSONResponse(content={"profiles": profiles})
+
+    @webapp.post("/api/profiles/save")
+    async def save_profile(request: Request):
+        """Sichert die aktuelle Konfiguration als Profil."""
+        try:
+            data = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON")
+        name = (data.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Profil-Name darf nicht leer sein")
+        # Name sanitizen: nur Buchstaben, Zahlen, Bindestriche, Unterstriche
+        safe_name = re.sub(r"[^a-zA-Z0-9_\- ]", "_", name).strip()
+        if safe_name != name:
+            raise HTTPException(status_code=400, detail=f"Ungültiger Profil-Name. Erlaubt: Buchstaben, Zahlen, -, _, Leerzeichen")
+
+        cfg = _load_config()
+        PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+        profile_path = PROFILES_DIR / f"{safe_name}.json"
+        with open(profile_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+        _log(f"📦 Profil gespeichert: {safe_name}")
+        return JSONResponse(content={"status": "ok", "name": safe_name})
+
+    @webapp.post("/api/profiles/load/{name}")
+    async def load_profile(name: str):
+        """Lädt ein Profil in config.json und startet neu."""
+        safe_name = re.sub(r"[^a-zA-Z0-9_\- ]", "_", name)
+        profile_path = PROFILES_DIR / f"{safe_name}.json"
+        if not profile_path.exists():
+            raise HTTPException(status_code=404, detail=f"Profil '{safe_name}' nicht gefunden")
+
+        try:
+            with open(profile_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            raise HTTPException(status_code=500, detail=f"Profil '{safe_name}' konnte nicht gelesen werden")
+
+        _save_config(cfg)
+        _log(f"📥 Profil geladen: {safe_name} — starte neu...")
+
+        # Neustart triggern (gleicher Mechanismus wie /api/restart)
+        import threading as _th
+        def _do_restart():
+            import time as _t
+            _t.sleep(0.5)
+            import subprocess as _sp
+            _sp.run(["systemctl", "restart", "localproxy"], capture_output=True)
+        _th.Thread(target=_do_restart, daemon=True).start()
+        return JSONResponse(content={"status": "ok", "message": f"Profil '{safe_name}' geladen — Neustart läuft"})
+
+    @webapp.delete("/api/profiles/{name}")
+    async def delete_profile(name: str):
+        """Löscht ein gespeichertes Profil."""
+        safe_name = re.sub(r"[^a-zA-Z0-9_\- ]", "_", name)
+        profile_path = PROFILES_DIR / f"{safe_name}.json"
+        if not profile_path.exists():
+            raise HTTPException(status_code=404, detail=f"Profil '{safe_name}' nicht gefunden")
+        profile_path.unlink()
+        _log(f"🗑️ Profil gelöscht: {safe_name}")
+        return JSONResponse(content={"status": "ok", "message": f"Profil '{safe_name}' gelöscht"})
 
     return webapp
 

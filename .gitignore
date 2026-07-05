@@ -29,6 +29,10 @@ data/plans/*
 data/debug/*
 !data/debug/.gitkeep
 
+# Profile-Backups (enthalten API-Keys — niemals committen!)
+data/profiles/*
+!data/profiles/.gitkeep
+
 # venvs
 .venv/
 .venv-1/
