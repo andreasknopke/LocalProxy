@@ -1989,18 +1989,16 @@ def _build_worker_payload(
         if pre_loaded_files:
             injected = 0
             for fp, content in pre_loaded_files.items():
-                if len(content) > 6000:
-                    content = content[:6000] + f"\n...[TRUNCATED: {len(content) - 6000} chars]"
                 block = (
-                    f"[PRE-LOADED FILE: {fp}]\n"
-                    f"Trust this as the true contents. Do NOT re-read this file.\n"
+                    f"[PRE-LOADED FILE: {fp} — FULL CONTENT, TRUST THIS]\n"
+                    f"Do NOT re-read this file. Its complete contents are below.\n"
                     f"---FILE-START---\n"
                     f"{content}\n"
                     f"---FILE-END---"
                 )
                 new_msgs.append({"role": "user", "content": block})
                 injected += 1
-            _log(f"  📎 Preloaded: {injected} Dateien "                                  
+            _log(f"  📎 Preloaded: {injected} Dateien "
                  f"({sum(len(v) for v in pre_loaded_files.values())} chars total)")
 
     if has_tool_msgs:
