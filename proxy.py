@@ -2013,11 +2013,10 @@ def _build_worker_payload(
     # Plan + Memory als eigene User-Message anhängen (Plan-Isolat-Layout):
     # pierced after the original User-Task message. So sieht DeepSeek klar:
     #   System + Tools
-    #   User-Task (original)
-    #   -> Plan (binding)
+    #   User-Task (original) ← DAS ist die aktuelle Aufgabe
+    #   -> Plan (binding)    ← so umsetzen
+    #   -> Hindsight (context) ← Zusatzwissen aus vergangenen Sessions
     context_blocks = []
-    if memory_context:
-        context_blocks.append(f"[HINDSIGHT MEMORY -主动 relevant context from prior sessions]\n{memory_context}")
     if plan:
         context_blocks.append(
             "[CLOUD EXECUTION PLAN — FOLLOW EXACTLY]\n"
@@ -2025,6 +2024,18 @@ def _build_worker_payload(
             "You do not need to re-plan. Read it, then execute it step by step.\n"
             "Use your own read_file/grep tools to see the code before each edit.\n\n"
             f"{plan}"
+        )
+    if memory_context:
+        context_blocks.append(
+            "---\n"
+            "⚠️ BACKGROUND KNOWLEDGE — NOT YOUR CURRENT TASK ⚠️\n"
+            "The following is LEARNED CONTEXT from PRIOR coding sessions.\n"
+            "It may contain patterns, fixes, and conventions relevant to the\n"
+            "current task. Use it for REFERENCE only.\n"
+            "YOUR CURRENT TASK is described in the user message ABOVE this one.\n"
+            "The PLAN you must execute is above this section.\n"
+            "---\n"
+            f"{memory_context}"
         )
     context_str = "\n\n".join(context_blocks)
 
