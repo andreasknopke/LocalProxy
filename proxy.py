@@ -1495,16 +1495,53 @@ _PLANNER_ALLOWED_TOOLS = {
 # Tools die der Worker auf Continuation NICHT bekommt (Aider-Pattern:
 # Editor hat keine Read-Tools, bekommt Dateien direkt injiziert).
 _WORKER_READ_TOOLS = {
+    # Read/Explore
     "read_file", "grep_search", "file_search", "list_dir",
     "view_image", "get_errors", "copilot_getNotebookSummary",
-    "read_notebook_cell_output", "terminal_last_command", "terminal_selection",
-    "get_task_output", "get_terminal_output", "testFailure",
+    "read_notebook_cell_output",
+    # Terminal (Worker nutzt als read_file-Ersatz!)
+    "run_in_terminal", "send_to_terminal", "create_and_run_task",
+    "get_task_output", "get_terminal_output",
+    "terminal_last_command", "terminal_selection",
+    # Web exploration
     "fetch_webpage", "github_repo", "github_text_search",
-    "session_store_sql", "vscode_listCodeUsages",
+    "session_store_sql", "vscode_listCodeUsages", "testFailure",
+    # Memory (Worker liest plan statt ihn zu nutzen)
     "memory", "resolve_memory_file_uri",
+    # Interaction
     "vscode_askQuestions", "vscode_renameSymbol",
-    "read_page", "screenshot_page",
-    # Alles was Dateien/Code liest oder erkundet
+    # Browser
+    "read_page", "screenshot_page", "open_browser_page",
+    # Subagents / Notebooks
+    "runSubagent", "run_notebook_cell",
+    "run_vscode_command", "install_extension",
+    "vscode_searchExtensions_internal",
+    "create_new_workspace", "create_new_jupyter_notebook",
+    # Python/Dotnet config
+    "configure_python_environment", "get_python_environment_details",
+    "get_python_executable_details", "install_python_packages",
+    "find_dotnet_executable_path", "install_dotnet_sdk",
+    "recommended_dotnet_sdk_version", "list_installed_dotnet_versions",
+    "list_available_dotnet_versions_to_install",
+    "uninstall_system_dotnet_sdk", "uninstall_vscode_owned_dotnet_runtime",
+    "get_settings_info_for_dotnet_installation_management",
+    "container-tools_get-config",
+    # MCP Pylance
+    "mcp_provides_tool_pylanceDocString",
+    "mcp_provides_tool_pylanceDocuments",
+    "mcp_provides_tool_pylanceFileSyntaxErrors",
+    "mcp_provides_tool_pylanceImports",
+    "mcp_provides_tool_pylanceInstalledTopLevelModules",
+    "mcp_provides_tool_pylanceInvokeRefactoring",
+    "mcp_provides_tool_pylancePythonEnvironments",
+    "mcp_provides_tool_pylanceRunCodeSnippet",
+    "mcp_provides_tool_pylanceSettings",
+    "mcp_provides_tool_pylanceSyntaxErrors",
+    "mcp_provides_tool_pylanceUpdatePythonEnvironment",
+    "mcp_provides_tool_pylanceWorkspaceRoots",
+    "mcp_provides_tool_pylanceWorkspaceUserFiles",
+    # Render
+    "renderMermaidDiagram",
 }
 
 
@@ -4354,9 +4391,7 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             _log(f"  📎 Planner-Files gecached: {len(planner_files)} Dateien "
                  f"({sum(len(v) for v in planner_files.values())} chars)")
             _PLANNER_SESSIONS[session_hash] = {
-                "state": "done", "ts": time.time(), "worker_rounds": 0, "planner_files": {},"plan": pc, "pflags": planner_flags,
-                "plan_path": str(plan_path) if plan_path else None,
-                "planner_files": planner_files,
+                "state": "done", "ts": time.time(), "worker_rounds": 0, "planner_files": {},"planner_files": planner_files,
             }
 
         if planner_result.get("tool_calls"):
@@ -4376,184 +4411,7 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             # Plan in dak-dat File persistieren (Codespace-Copilot-Stil)
             plan_path = _save_plan_to_file(session_hash, plan, query=body.get("messages", [{}])[0].get("content", ""))
             _PLANNER_SESSIONS[session_hash] = {
-                "state": "done", "ts": time.time(), "worker_rounds": 0, "planner_files": {},"plan": plan, "pflags": planner_flags,
-                "plan_path": str(plan_path) if plan_path else None,
-            }
-            progress.append(_format_chat_progress_message(
-                "phase1_plan_ready",
-                f"🧠 Cloud-Planner (Kimi): Plan erstellt ({len(plan)} chars).",
-                {"duration_seconds": planner_result.get("duration_seconds")},
-            ))
-
-            # Jetzt Worker mit Plan ausführen
-            progress.append(_format_chat_progress_message(
-                "phase2_execute",
-                f"🛠️ Worker ({MODEL_NAME}) führt Plan aus.",
-                {"model": MODEL_NAME},
-            ))
-
-            worker_payload = _build_worker_payload(
-                body, plan, "",
-                plan_path=_PLANNER_SESSIONS.get(session_hash, {}).get("plan_path"),
-                is_first_worker_call=True,
-            )
-            worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
-            results.append(worker_result)
-            worker_response = worker_result.get("content", "")
-
-            if worker_result.get("tool_calls") or _contains_tool_calls(worker_response):
-                _log("  🔧 Worker enthält Tool-Calls → Durchreiche an Client")
-                await client.aclose()
-                # Session NICHT löschen – "done" bleibt erhalten, damit der
-                # nächste Request (tool_cont) den Plan-Kontext wiederfindet
-                # und der Worker weiterarbeiten kann. Sonst startet VS Code
-                # eine brandneue Planner-Session ohne Plan-Kontext.
-                _hindsight.retain(body, worker_response)
-                return {
-                    "combined_response_text": worker_response,
-                    "results": results,
-                    "duration_seconds": time.perf_counter() - start_time,
-                }
-
-            progress.append(_format_chat_progress_message(
-                "phase2_done", "Worker-Ausführung abgeschlossen.",
-                {"duration_seconds": worker_result.get("duration_seconds")},
-            ))
-
-            # Phase 3: Review mit Feedback-Loop (nur im Planner-Session-Pfad)
-            verified_response = await _review_with_feedback_loop(
-                client, body, plan, query_clean, worker_response,
-                force_review, progress, results,
-                session_hash=session_hash,
-            )
-
-            del _PLANNER_SESSIONS[session_hash]
-            await client.aclose()
-
-            final = verified_response
-            if CHATTY_MODE:
-                plan_preview = plan[:2000] + ("\n...[truncated]" if len(plan) > 2000 else "")
-                final = (
-                    f"## 🧠 Cloud-Planner Plan (Kimi K2.7)\n\n{plan_preview}\n\n"
-                    f"---\n\n## 🛠️ Worker Ausführung ({MODEL_NAME})\n\n{verified_response}"
-                )
-            combined = "".join(progress) + final
-            _hindsight.retain(body, combined)
-            return {
-                "combined_response_text": combined,
-                "results": results,
-                "duration_seconds": time.perf_counter() - start_time,
-            }
-        else:
-            # Planner fehlgeschlagen → Fallback
-            _log("  ⚠ Cloud-Planner-Agent fehlgeschlagen → Fallback auf Worker direkt")
-            del _PLANNER_SESSIONS[session_hash]
-            worker_payload = _build_direct_payload(body)
-            worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
-            results.append(worker_result)
-            await client.aclose()
-            combined = "".join(progress) + worker_result.get("content", "")
-            _hindsight.retain(body, combined)
-            return {
-                "combined_response_text": combined,
-                "results": results,
-                "duration_seconds": time.perf_counter() - start_time,
-            }
-
-    elif session and session.get("state") == "done":
-        # ── Plan ready, Worker soll ausführen (nächste User-Nachricht ohne Tool-Cont) ──
-        plan = session.get("plan", "")
-        planner_flags = session.get("pflags", {})
-        force_review = force_review or planner_flags.get("force_review", False)
-
-        if plan:
-            # Falls kein Plan-Path in der alten Session stand, jetzt speichern
-            plan_path = session.get("plan_path")
-            if plan and not plan_path:
-                plan_path_obj = _save_plan_to_file(
-                    session_hash, plan,
-                    query=body.get("messages", [{}])[0].get("content", ""),
-                )
-                plan_path = str(plan_path_obj) if plan_path_obj else None
-                session["plan_path"] = plan_path
-            worker_round = int(session.get("worker_rounds", 0))
-            worker_payload = _build_worker_payload(body, plan, "", plan_path=plan_path,
-                                                    is_first_worker_call=(worker_round == 0),
-                                                    preloaded_files=session.get("planner_files"))
-            session["worker_rounds"] = worker_round + 1
-            worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
-        else:
-            worker_payload = _build_direct_payload(body)
-            worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
-
-        results.append(worker_result)
-        worker_response = worker_result.get("content", "")
-
-        # Wenn der Worker Tool-Calls zurückgibt, Session behalten, damit
-        # der nächste Request (tool_cont) den Plan-Kontext wiederfindet.
-        if not (worker_result.get("tool_calls") or _contains_tool_calls(worker_response)):
-            del _PLANNER_SESSIONS[session_hash]
-        await client.aclose()
-        _hindsight.retain(body, worker_response)
-        return {
-            "combined_response_text": worker_response,
-            "results": results,
-            "duration_seconds": time.perf_counter() - start_time,
-        }
-
-    # ═══════════════════════════════════════════════════════════════════
-    # STANDARD / FORCE-PLANNING: Erster Request
-    # ═══════════════════════════════════════════════════════════════════
-
-    # ── Hindsight Recall ──────────────────────────────────────────────
-    memory_records = _hindsight.recall(query_clean)
-    memory_context = _hindsight.format_context(memory_records)
-    progress.append(_format_chat_progress_message(
-        "phase1_recall",
-        f"Hindsight Recall: {len(memory_records)} relevante Erinnerungen geladen.",
-        {"memory_records": len(memory_records), "networks": list(set(n for r in memory_records for n in r.networks))},
-    ))
-
-    if force_planning and CLOUD_REVIEW_ENABLED and CLOUD_REVIEW_API_KEY:
-        # ── PLANNER-FIRST: Kimi als Tool-Agent, dann Worker ──────────
-        _log("  🧠 Cloud-Planner-Agent (Kimi K2.7 mit Tools) exploriert Workspace...")
-        progress.append(_format_chat_progress_message(
-            "phase1_planner_start",
-            "🧠 Cloud-Planner (Kimi K2.7) exploriert Workspace und erstellt Plan.",
-            {"model": CLOUD_REVIEW_MODEL},
-        ))
-
-        # ══ PHASE 0: User-Prompt mit Fast-Modell komprimieren ══════════
-        # User-Vision: CHEAP model compresses prompt BEFORE teure Cloud.
-        if CAVEMAN_ENABLED and len(query_clean) > 80:
-            progress.append(_format_chat_progress_message(
-                "phase0_compress", "🗜️ Phase 0: User-Prompt wird komprimiert.",
-                {"fast_model": FAST_MODEL_NAME, "original_chars": len(query_clean)},
-            ))
-            compressed = await _phase0_compress_prompt(client, query_clean)
-            # Komprimierte Version an letzte User-Message in body anhaengen
-            if compressed != query_clean:
-                msgs = body.get("messages", [])
-                for msg in reversed(msgs):
-                    if isinstance(msg, dict) and msg.get("role") == "user":
-                        orig = msg.get("content", "")
-                        if isinstance(orig, str):
-                            msg["content"] = f"{orig}\n\n[CAVEMAN-PROMPT-COMPRESSED]\n{compressed}"
-                        break
-
-        planner_result = await _call_cloud_planner_agent(client, body, "", results)  # Kein Hindsight im Planner — sauberer Plan-Kontext
-        results.append(planner_result)
-
-        # ══ Plan-Erkennung: Kimi hat fertig, auch wenn noch tool_calls (memory) anstehen ══
-        pc = planner_result.get("content", "")
-        plan_detected = _content_contains_plan(pc) and len(pc) > 200
-        if plan_detected:
-            _log(f"  🎉 Plan im Content erkannt ({len(pc)} chars) → Session done, Plan persistiert")
-            plan_path = _save_plan_to_file(session_hash, pc, query=body.get("messages", [{}])[0].get("content", ""))
-            planner_files = _extract_planner_file_contents(body.get("messages", []))
-            _log(f"  📎 Planner-Files gecached: {len(planner_files)} Dateien")
-            _PLANNER_SESSIONS[session_hash] = {
-                "state": "done", "ts": time.time(), "worker_rounds": 0, "planner_files": {},"plan": pc, "pflags": {"force_review": force_review, "bypass_worker": bypass_worker},
+                "state": "done", "ts": time.time(), "worker_rounds": 0, "planner_files": {},"planner_files": {},"plan": pc, "pflags": {"force_review": force_review, "bypass_worker": bypass_worker},
                 "plan_path": str(plan_path) if plan_path else None,
                 "planner_files": planner_files,
             }
@@ -4590,38 +4448,7 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             # Plan als Datei persistieren
             plan_path = _save_plan_to_file(session_hash, plan, query=body.get("messages", [{}])[0].get("content", ""))
             _PLANNER_SESSIONS[session_hash] = {
-                "state": "done", "ts": time.time(), "worker_rounds": 0, "planner_files": {},"plan": plan, "pflags": planner_flags,
-                "plan_path": str(plan_path) if plan_path else None,
-            }
-            progress.append(_format_chat_progress_message(
-                "phase1_plan_ready",
-                f"🧠 Cloud-Planner: Plan in {planner_result.get('duration_seconds',0):.1f}s erstellt.",
-                {"duration_seconds": planner_result.get("duration_seconds")},
-            ))
-        else:
-            _log("  ⚠ Cloud-Planner lieferte keinen Plan → Fallback")
-            worker_payload = _build_direct_payload(body)
-            worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
-            results.append(worker_result)
-            await client.aclose()
-            combined = "".join(progress) + worker_result.get("content", "")
-            _hindsight.retain(body, combined)
-            return {
-                "combined_response_text": combined,
-                "results": results,
-                "duration_seconds": time.perf_counter() - start_time,
-            }
-    else:
-        # ── Klassischer Cloud-Planer (Caveman, ohne Tools) ───────────
-        planner_result = await _call_cloud_planner(client, body, memory_context)
-        results.append(planner_result)
-        plan_status = planner_result.get("status")
-        plan = planner_result.get("content", "") if plan_status == "ok" else ""
-
-        if plan_status == "ok":
-            plan_path = _save_plan_to_file(session_hash, plan, query=body.get("messages", [{}])[0].get("content", ""))
-            _PLANNER_SESSIONS[session_hash] = {
-                "state": "done", "ts": time.time(), "worker_rounds": 0, "planner_files": {},"plan": plan,
+                "state": "done", "ts": time.time(), "worker_rounds": 0, "planner_files": {},"planner_files": {},"plan": plan,
                 "plan_path": str(plan_path) if plan_path else None,
             }
             progress.append(_format_chat_progress_message(
