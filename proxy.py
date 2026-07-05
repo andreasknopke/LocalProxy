@@ -126,7 +126,7 @@ CAVEMAN_MAX_TOKENS: int = int(os.getenv("CAVEMAN_MAX_TOKENS", "8192"))
 # Verhindert Token-Bombing, wenn VS Code riesige Tool-Results (z.B. 111KB grep
 # auf level_data.json) an den Proxy returniert. Tool-Messages im Payload werden
 # nach TOOL_RESULT_CAP chars hart abgeschnitten (+ TRUNCATED marker).
-TOOL_RESULT_CAP: int = int(os.getenv("TOOL_RESULT_CAP", "8000"))
+TOOL_RESULT_CAP: int = int(os.getenv("TOOL_RESULT_CAP", "32000"))
 
 # ── Hindsight / Qdrant ─────────────────────────────────────────────────────
 HINDSIGHT_ENABLED: bool = os.getenv("HINDSIGHT_ENABLED", "true").lower() in {"1", "true", "yes", "y", "on"}
@@ -1742,42 +1742,38 @@ def _build_direct_payload(
     return _clean_payload(payload, keep_tools=True)
 
 
-def _cap_tool_results_inplace(messages: List[Dict[str, Any]], label: str = "Payload") -> int:
-    """Kappt Tool-Result-Messages in-place auf TOOL_RESULT_CAP chars.
+def _cap_tool_results_inplace(messages: List[Dict[str, Any]], label: str = "Payload",
+                              max_chars: Optional[int] = None) -> int:
+    """Kappt Tool-Result-Messages in-place auf max_chars (oder TOOL_RESULT_CAP).
 
-    Verhindert Token-Bombing: Wenn VS Code 111KB grep_hits an den Proxy
-    zurückschickt, würde der gesamte Payload explodieren. Diese Funktion
-    geht jede 'role:tool'-Message durch und kappt content auf TOOL_RESULT_CAP
-    (default 8000) chars plus einen TRUNCATED-Marker.
-
-    Behandelt string und multimodal (list-of-parts) content.
-
-    Returns:
-        Anzahl gekappter Messages (für Logging).
+    Verhindert Token-Bombing. Für Planner-Calls: max_chars=0 → kein Cap.
     """
+    limit = max_chars if max_chars is not None else TOOL_RESULT_CAP
+    if limit <= 0:
+        return 0  # Kein Cap gewünscht
     capped_count = 0
     for m in messages:
         if not isinstance(m, dict) or m.get("role") != "tool":
             continue
         content = m.get("content")
-        if isinstance(content, str) and len(content) > TOOL_RESULT_CAP:
-            cut = len(content) - TOOL_RESULT_CAP
-            m["content"] = content[:TOOL_RESULT_CAP] + f"\n...[TRUNCATED by proxy: {cut} chars cut]"
+        if isinstance(content, str) and len(content) > limit:
+            cut = len(content) - limit
+            m["content"] = content[:limit] + f"\n...[TRUNCATED: {cut} chars cut]"
             capped_count += 1
         elif isinstance(content, list):
             for part in content:
                 if not isinstance(part, dict) or part.get("type") != "text":
                     continue
                 txt = part.get("content") or part.get("text") or ""
-                if isinstance(txt, str) and len(txt) > TOOL_RESULT_CAP:
-                    new_txt = txt[:TOOL_RESULT_CAP] + "\n...[TRUNCATED by proxy]"
+                if isinstance(txt, str) and len(txt) > limit:
+                    new_txt = txt[:limit] + "\n...[TRUNCATED]"
                     if "content" in part:
                         part["content"] = new_txt
                     else:
                         part["text"] = new_txt
                     capped_count += 1
     if capped_count:
-        _log(f"  ✂ {label}-Payload: {capped_count} Tool-Results auf {TOOL_RESULT_CAP} chars gekappt")
+        _log(f"  ✂ {label}-Payload: {capped_count} Tool-Results auf {limit} chars gekappt")
     return capped_count
 
 
@@ -3215,7 +3211,7 @@ async def _call_cloud_planner_agent(
         if orphaned:
             _log(f"  🧹 Planner-Cont: {orphaned} verwaiste tool→user konvertiert")
 
-        _cap_tool_results_inplace(messages, "Planner-Cont")
+        _cap_tool_results_inplace(messages, "Planner-Cont", max_chars=0)
         payload["messages"] = messages
     else:
         # ══ RUNDE 1: Copilot-style plan mode ══
@@ -3226,7 +3222,7 @@ async def _call_cloud_planner_agent(
         payload["stream"] = False
 
         messages = list(payload.get("messages", []))
-        _cap_tool_results_inplace(messages, "Planner-R1")
+        _cap_tool_results_inplace(messages, "Planner-R1", max_chars=0)
         if messages and messages[0].get("role") == "system":
             messages[0]["content"] = str(messages[0].get("content", "")) + "\n\n" + planner_mode_instructions
         else:
