@@ -1469,11 +1469,16 @@ def _contains_tool_calls(text: str) -> bool:
 # Grund: Volle 47 Tools ueberfordern Kimi + riskieren Side-Effects.
 # Der Planner darf nur LESEN/EXPLORIEREN, nichts mutieren.
 _PLANNER_ALLOWED_TOOLS = {
-    "read_file", "grep_search", "list_dir", "file_search", "semantic_search",
+    # Read-only exploration (matching Copilot Plan Mode)
+    "read_file", "grep_search", "list_dir", "file_search",
     "view_image", "get_errors", "copilot_getNotebookSummary",
     "read_notebook_cell_output", "terminal_last_command", "terminal_selection",
-    "get_vscode_api", "github_repo", "github_text_search", "memory",
-    "resolve_memory_file_uri", "session_store_sql",
+    "get_task_output", "get_terminal_output", "testFailure",
+    "fetch_webpage", "github_repo", "github_text_search",
+    "session_store_sql", "vscode_listCodeUsages",
+    # Interaction + persistence (matching Copilot Plan Mode)
+    "memory", "resolve_memory_file_uri",
+    "vscode_askQuestions",
 }
 
 
@@ -3033,13 +3038,11 @@ async def _call_cloud_planner_agent(
     memory_context: str = "",
     parent_results: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Cloud-Planner ALS VOLLWERTIGER SUB-AGENT mit VS Code Tools.
+    """Cloud-Planner im Copilot Plan-Mode Stil.
 
-    Sendet die komplette VS Code Umgebung (System-Prompt, Tool-Defs, History, Workspace-Files)
-    an Kimi K2.7 via Moonshot API. Kimi kann Tools aufrufen (read_file, search_code etc.),
-    die VS Code dann ausführt. Ergebnis: ein detaillierter Caveman-Plan (.md).
-
-    Wichtig: max_tokens=65536 für Caveman-komprimierten Output.
+    EXAKT wie Copilot: Discovery mit read-only Tools → Alignment → Design → Plan schreiben.
+    Tools: 20 read-only (wie Copilot Plan Mode). Keine Edit-Tools.
+    Workflow: siehe planner_mode_instructions.
     """
     if not (CLOUD_REVIEW_ENABLED and CLOUD_REVIEW_API_KEY) and not (LITELLM_CLOUD_MODEL and LITELLM_CLOUD_API_KEY):
         return {
@@ -3050,13 +3053,6 @@ async def _call_cloud_planner_agent(
 
     _log(f"  🧠 Cloud-Planner-Agent: model={CLOUD_REVIEW_MODEL} url={CLOUD_REVIEW_API_URL}")
 
-    # ══ DETECT: Runde 1 (Initial) vs. Runde N+ (Tool-Continuation) ══
-    # Runde 1: 'body' kommt direkt vom standard/force_planning-Pfad. Die
-    #   History ist klein und enthält den User-Task als letzte user-message.
-    #   → klassischer Payload-Build (volles body, system-suffix).
-    # Runde N+: 'body' kommt vom Tool-Continuation-Zweig. Die History ist
-    #   gewuchert (teilweise 100K+ chars tool-results). Stattdessen:
-    #   Recap-basierter Planner-Payload (Task voran, Recap der Exploration).
     body_messages = body.get("messages", [])
     body_sh = _get_planner_session_hash(body_messages)
     body_session = _PLANNER_SESSIONS.get(body_sh)
@@ -3066,14 +3062,78 @@ async def _call_cloud_planner_agent(
         and int(body_session.get("iterations", 0)) >= 2
     )
 
+    # ══ COPER-STYLE plan mode instructions ════════════════════════════
+    planner_mode_instructions = (
+        "<modeInstructions>\n"
+        "You are currently running in \"Plan\" mode. "
+        "Below are your instructions for this mode, they must take precedence "
+        "over any instructions above.\n\n"
+        "You are a PLANNING AGENT, pairing with the user to create a detailed, "
+        "actionable plan.\n\n"
+        "You research the codebase → clarify with the user → capture findings "
+        "into a comprehensive plan. This iterative approach catches edge cases "
+        "and non-obvious requirements BEFORE implementation begins.\n\n"
+        "Your SOLE responsibility is planning. NEVER start implementation.\n\n"
+        "<rules>\n"
+        "- STOP if you consider running file editing tools — plans are for "
+        "others to execute. The only write tool you have is 'memory' for persisting plans.\n"
+        "- Use 'vscode_askQuestions' freely to clarify requirements — don't make large assumptions\n"
+        "- Present a well-researched plan BEFORE implementation\n"
+        "</rules>\n\n"
+        "<workflow>\n"
+        "Cycle through these phases. This is iterative, not linear.\n\n"
+        "## 1. Discovery\n"
+        "Use read_file, grep_search, file_search, list_dir to gather context. "
+        "Explore analogous existing features to use as implementation templates. "
+        "When the task spans multiple independent areas, launch tools in parallel "
+        "to speed up discovery.\n"
+        "Update your findings via 'memory'.\n\n"
+        "## 2. Alignment\n"
+        "If research reveals major ambiguities or you need to validate assumptions:\n"
+        "- Use 'vscode_askQuestions' to clarify intent with the user.\n"
+        "- Surface discovered technical constraints or alternative approaches\n"
+        "- If answers significantly change scope, loop back to **Discovery**\n\n"
+        "## 3. Design\n"
+        "Draft a comprehensive implementation plan:\n"
+        "- Structured, concise, scannable, detailed enough for effective execution\n"
+        "- Step-by-step with explicit dependencies — mark parallel vs. blocking steps\n"
+        "- Group into named phases, each independently verifiable\n"
+        "- Verification steps for validating — both automated and manual\n"
+        "- Reference specific functions, types, patterns, not just file names\n"
+        "- Critical files to modify (with full paths)\n"
+        "- Explicit scope boundaries — included AND excluded\n"
+        "- Leave no ambiguity\n\n"
+        "Save the plan to the plan file via 'memory', then show it to the user.\n\n"
+        "## 4. Refinement\n"
+        "On user input after showing the plan:\n"
+        "- Changes → revise and present updated plan\n"
+        "- Questions → clarify, or use 'vscode_askQuestions'\n"
+        "- Alternatives → loop back to **Discovery**\n"
+        "- Approval → acknowledge completion\n\n"
+        "Keep iterating until explicit approval.\n"
+        "</workflow>\n\n"
+        "<plan_style_guide>\n"
+        "## Plan: {Title (2-10 words)}\n"
+        "{TL;DR - what, why, and how (your recommended approach).}\n\n"
+        "**Steps**\n"
+        "1. {Step — note dependency or parallelism}\n"
+        "2. {Step}\n\n"
+        "**Relevant files**\n"
+        "- `{full/path/to/file}` — {what to modify or reuse}\n\n"
+        "**Verification**\n"
+        "1. {Specific verification step}\n\n"
+        "**Decisions** (if applicable)\n"
+        "- {Decision and rationale}\n\n"
+        "**Further Considerations** (if applicable, 1-3 items)\n"
+        "1. {Clarifying question with recommendation}\n\n"
+        "Rules:\n"
+        "- NO code blocks — describe changes, reference specific symbols\n"
+        "- The plan MUST be presented to the user\n"
+        "</plan_style_guide>\n"
+        "</modeInstructions>"
+    )
+
     if is_tool_continuation:
-        # ══ RUNDE N+: Volle History (nur tool_results gekappt) ══
-        # FRÜHER: Recap-Payload (system + task + exploration summary).
-        #   Das hat Kimi verwirrt -> invalide tool_calls (filePath fehlt).
-        # JETZT: Gleicher Ansatz wie Runde 1 -> volle Message-History behalten,
-        #   tool_results auf 8000 chars kappen, planner instructions ans system.
-        #   Kimi sieht ALLE vorherigen tool_calls + results und kann
-        #   daraus lernen was schon passiert ist.
         _log(f"  🎯 Planner-Cont-Modus (round {body_session.get('iterations')}): "
              f"volle History, {len(body_messages)} messages")
         payload = copy.deepcopy(body)
@@ -3084,11 +3144,7 @@ async def _call_cloud_planner_agent(
 
         messages = list(payload.get("messages", []))
 
-        # 🗜 Message-Window: Verhindert dass Kimi mit 150+ Nachrichten
-        # überflutet wird (hängt sich sonst auf). Behalte System-Prompt +
-        # die letzten MAX_PLANNER_CONT_MESSAGES-1 Nachrichten (Sliding Window).
-        # Die letzten Nachrichten sind die aktuellsten Tool-Interaktionen,
-        # die Kimi für den nächsten Schritt braucht.
+        # Sliding Window
         MAX_PLANNER_CONT_MESSAGES = 50
         if len(messages) > MAX_PLANNER_CONT_MESSAGES:
             system_msg = None
@@ -3097,15 +3153,15 @@ async def _call_cloud_planner_agent(
             keep_count = MAX_PLANNER_CONT_MESSAGES - (1 if system_msg else 0)
             truncated = messages[-keep_count:]
             if system_msg:
-                truncated = [system_msg] + truncated
-            _log(f"  🗜 Planner-Cont: Messages von {len(messages)} auf "
-                 f"{len(truncated)} reduziert (Sliding Window={MAX_PLANNER_CONT_MESSAGES})")
+                truncated[0] = {"role": "system", "content": str(system_msg.get("content", "")) + "\n\n" + planner_mode_instructions}
+            _log(f"  🗜 Planner-Cont: {len(messages)} → {len(truncated)} (Window={MAX_PLANNER_CONT_MESSAGES})")
             messages = truncated
+        else:
+            # Inject plan-mode instructions into existing system message
+            if messages and messages[0].get("role") == "system":
+                messages[0]["content"] = str(messages[0].get("content", "")) + "\n\n" + planner_mode_instructions
 
-        # 🧹 Orphaned-Tool-Cleanup: Sliding Window kann tool-Messages
-        # ohne passenden assistant (mit tool_calls) hinterlassen.
-        # Solche verwaisten tool_call_ids führen zu 400 'tool_call_id not found'.
-        # Lösung: tool → user konvertieren (Content bleibt, tc_id fliegt raus).
+        # Orphaned-Tool-Cleanup
         valid_tc_ids = set()
         for m in messages:
             if isinstance(m, dict) and m.get("role") == "assistant":
@@ -3123,100 +3179,47 @@ async def _call_cloud_planner_agent(
                     m.pop("tool_call_id", None)
                     orphaned += 1
         if orphaned:
-            _log(f"  🧹 Planner-Cont: {orphaned} verwaiste tool→user konvertiert (tc_id nicht in Window)")
+            _log(f"  🧹 Planner-Cont: {orphaned} verwaiste tool→user konvertiert")
 
-        # Tool-Results kappen (gleiche Logik wie Runde 1)
         _cap_tool_results_inplace(messages, "Planner-Cont")
-        # Planner-Instructions an System-Prompt anhängen
-        planner_system = (
-            "You are a PLANNING AGENT with LIMITED read-only tools. "
-            "Use them ONLY to check specific details you need for your plan. "
-            "Your goal: produce a DETAILED EXECUTION PLAN in Markdown.\n\n"
-            "THE PLAN (your final output, no more tool calls):\n"
-            "- 10-20 concrete steps\n"
-            "- Each step: WHAT file, WHAT change, WHY\n"
-            "- Reference specific file paths and line numbers\n"
-            "- Caveman compression: terse symbols, no prose\n"
-            "- Format: `## Plan: <title>`, numbered list\n"
-            "- Max 4000 chars. Do NOT write code. Worker implements.\n"
-        )
-        if messages and messages[0].get("role") == "system":
-            messages[0]["content"] = str(messages[0].get("content", "")) + "\n\n" + planner_system
-        else:
-            messages.insert(0, {"role": "system", "content": planner_system})
         payload["messages"] = messages
     else:
-        # ══ RUNDE 1: Plan schreiben (Copilot-Stil) ══
-        # Keine Tools, kein Explore. Der Planner bekommt Task + Workspace-Kontext
-        # aus dem System-Prompt und schreibt direkt einen Plan.
-        # Wie Copilot Plan-Mode: Task → Plan. Der Worker führt dann aus.
+        # ══ RUNDE 1: Copilot-style plan mode ══
         payload = copy.deepcopy(body)
         payload["model"] = CLOUD_REVIEW_MODEL
         payload["max_tokens"] = min(CAVEMAN_MAX_TOKENS, 65536)
         payload["temperature"] = 0.2
         payload["stream"] = False
 
-        planner_system = (
-            "You are a PLANNING AGENT. You do NOT have tools and must NOT call any. "
-            "Your ONLY job: read the user's task and the workspace context below, "
-            "then write a DETAILED EXECUTION PLAN in Markdown. "
-            "A Worker agent with tools will execute your plan afterwards.\n\n"
-            "PLAN FORMAT:\n"
-            "- `## Plan: <descriptive title>`\n"
-            "- 10-20 numbered steps\n"
-            "- Each step: WHAT file, WHAT change, WHY\n"
-            "- Reference file paths from the workspace context\n"
-            "- Use Caveman compression: terse symbols, no prose\n"
-            "- Max 4000 chars. No code — the worker writes code.\n"
-        )
-        # System-Prompt behalten (enthält wertvollen Workspace-Kontext)
         messages = list(payload.get("messages", []))
         _cap_tool_results_inplace(messages, "Planner-R1")
         if messages and messages[0].get("role") == "system":
-            sys_content = str(messages[0].get("content", ""))
-            messages[0]["content"] = sys_content + "\n\n" + planner_system
+            messages[0]["content"] = str(messages[0].get("content", "")) + "\n\n" + planner_mode_instructions
         else:
-            messages.insert(0, {"role": "system", "content": planner_system})
+            messages.insert(0, {"role": "system", "content": planner_mode_instructions})
         payload["messages"] = messages
 
-        # Memory-Kontext an letzte User-Message anhängen (nur Runde 1 sinnvoll —
-        # im Recap-Modus ist 'messages' oben neu aufgebaut ohne_HISTORY).
         if memory_context:
             for msg in reversed(messages):
                 if msg.get("role") == "user":
                     msg["content"] = str(msg.get("content", "")) + f"\n\n[HINDSIGHT]\n{memory_context}"
                     break
 
-    # tools/tool_choice aus Original behalten
+    # ══ Tools: genau wie Copilot — 20 read-only von Runde 1 an ══
     payload = _clean_payload(payload, keep_tools=True)
     _patch_moonshot_payload(payload)
 
-    # ══ Bug-B-Fix: Tools filtern + Iteration-Cap ═════════════════════
-    # Runde 1 (kein Tool-Continuation): KEINE Tools — Planner soll Plan schreiben,
-    # nicht explorieren. Wie Copilot: Plan-Mode = Task → Plan, Agent-Mode = Worker + Tools.
-    # Runde N+ (Tool-Continuation): READ-ONLY Tools für Codebase-Recherche.
-    if not is_tool_continuation:
-        # Erster Planner-Call → Tools komplett entfernen (Copilot-Stil)
-        if "tools" in payload:
-            _log("  📝 Planner-Runde-1: Tools entfernt (Plan schreiben, nicht explorieren)")
-            payload.pop("tools", None)
-            payload.pop("tool_choice", None)
-    elif "tools" in payload:
+    if "tools" in payload:
         filtered = _filter_planner_tools(payload.get("tools"))
         if filtered and len(filtered) < len(payload["tools"]):
-            _log(f"  🔧 Planner-Tools gefiltert: {len(payload['tools'])} → {len(filtered)} (read-only)")
+            _log(f"  🔧 Planner-Tools: {len(payload['tools'])} → {len(filtered)} (Copilot Plan-Mode read-only)")
             payload["tools"] = filtered
         elif not filtered:
-            # Keine passenden Tools gefunden → ganz entfernen (sonst chaos)
-            _log("  ⚠ Keine passenden Planner-Tools → entferne tools完全")
+            _log("  ⚠ Keine passenden Planner-Tools → entfernt")
             payload.pop("tools", None)
             payload.pop("tool_choice", None)
 
-    # 2) LOOP-DETECTION (ersetzt arbitrary Iteration-Cap):
-    #    Prüft Session-Historie auf WIRKLICHE Loops. Nur dann Plan erzwingen.
-    #    Legitime Exploration (verschiedene Tools/Files) darf unbegrenzt weiterlaufen.
-    #    ACHTUNG: triggert auch im Recap-Modus, weil die tool-signaturen aus der
-    #    body-session-iteration stammen.
+    # ══ Loop-Detection (nur Safety-Net, nicht zu aggressiv) ══
     sh = _get_planner_session_hash(payload.get("messages", []))
     existing_session = _PLANNER_SESSIONS.get(sh) or body_session
     cur_messages = payload.get("messages", [])
