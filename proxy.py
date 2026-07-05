@@ -1990,11 +1990,7 @@ def _embed_files_into_plan(plan: str, planner_messages: List[Dict[str, Any]]) ->
     for fp, content in files.items():
         parts.append(f"### `{fp}`")
         parts.append("```")
-        # Kürze Dateien auf ~4000 Zeichen für Payload-Größe
-        truncated = content
-        if len(content) > 4000:
-            truncated = content[:4000] + f"\n...(truncated, {len(content)} chars total)"
-        parts.append(truncated)
+        parts.append(content)
         parts.append("```")
         parts.append("")
     result = "\n".join(parts)
