@@ -1978,20 +1978,18 @@ def _build_worker_payload(
         new_msgs.append(original_user_msg)
 
     # ══ PRE-LOADED FILES (Aider's get_chat_files_messages) ═══════
-    # JEDEN Round — nicht nur First-Call. Der Worker verliert sonst
-    # den Code-Kontext nach Runde 1 und fängt an, memory/read_file
-    # aufzurufen → klassische Re-Read-Loop.
-    # Extrahiere Kimi's read_file-Ergebnisse aus der ORIGINALEN
-    # Conversation (die 175+ msgs enthalten sie immer).
-    pre_loaded_files = {}
-    if plan:
+    # NUR beim FIRST-CALL injizieren. Bei Continuation NICHT — der
+    # Worker würde Kimis veraltete Dateiversionen sehen und Duplikat-
+    # Edits machen (z.B. 3x resize? in common.ts). Stattdessen kriegt
+    # der Worker bei Continuation seine eigenen Tool-Results aus den
+    # vorherigen Runden (unten, via letzte N Worker-Cluster).
+    if plan and not has_tool_msgs:
         pre_loaded_files = _extract_planner_file_contents(messages)
         if pre_loaded_files:
             injected = 0
             for fp, content in pre_loaded_files.items():
                 block = (
                     f"[PRE-LOADED FILE: {fp} — FULL CONTENT, TRUST THIS]\n"
-                    f"Do NOT re-read this file. Its complete contents are below.\n"
                     f"---FILE-START---\n"
                     f"{content}\n"
                     f"---FILE-END---"
@@ -2002,23 +2000,26 @@ def _build_worker_payload(
                  f"({sum(len(v) for v in pre_loaded_files.values())} chars total)")
 
     if has_tool_msgs:
-        # Continuation: NUR den letzten assistant(tool_calls) → tool results
-        # Zyklus behalten (NACH den Pre-Loaded Files, die schon in new_msgs sind)
-        last_worker_asst = None
-        for i in range(len(messages) - 1, -1, -1):
-            if isinstance(messages[i], dict) and messages[i].get("role") == "assistant" and messages[i].get("tool_calls"):
-                last_worker_asst = i
-                break
-        if last_worker_asst is not None:
-            for j in range(last_worker_asst, len(messages)):
-                msg = messages[j]
-                if not isinstance(msg, dict):
-                    continue
-                if msg.get("role") == "system":
-                    continue
-                new_msgs.append(copy.deepcopy(msg))
+        # Continuation: die letzten 3 Worker-Cluster behalten.
+        # Der Worker braucht Kontext-Kontinuität: seine eigenen
+        # read_file-Ergebnisse aus vorherigen Runden. Nur den LETZTEN
+        # Zyklus zu behalten führt zu Amnesie → Re-Read-Loop.
+        MAX_WORKER_CLUSTERS = 3
+        worker_asst_indices = []
+        for i, m in enumerate(messages):
+            if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls"):
+                worker_asst_indices.append(i)
+
+        if worker_asst_indices:
+            for start_idx in worker_asst_indices[-MAX_WORKER_CLUSTERS:]:
+                new_msgs.append(copy.deepcopy(messages[start_idx]))  # assistant
+                j = start_idx + 1
+                while j < len(messages) and isinstance(messages[j], dict) and messages[j].get("role") == "tool":
+                    new_msgs.append(copy.deepcopy(messages[j]))
+                    j += 1
+
         _log(f"  ✂ Worker-Payload (Plan-Isolat, Continuation): {len(new_msgs)} Messages "
-             f"(System+Task+{len(pre_loaded_files)}Files+Worker-Cycle, "
+             f"(System+Task+{min(len(worker_asst_indices), MAX_WORKER_CLUSTERS)} Worker-Cluster, "
              f"Original {len(messages)} → {len(new_msgs)})")
     else:
         _log(f"  ✂ Worker-Payload (Plan-Isolat, First-Call): {len(new_msgs)} Messages "
@@ -2167,23 +2168,15 @@ def _build_worker_payload(
     elif is_continuation:
         plan_hint = (
             "[CONTINUATION REMINDER — THE PLAN IS IN YOUR SYSTEM PROMPT]\n"
-            "You are mid-execution. The complete plan is at '═══ THE PLAN ═══'\n"
-            "in your system prompt above. Read it there — do NOT use the memory tool.\n"
-            "The code you need is in [PRE-LOADED FILE] blocks above.\n"
-            "Pick the NEXT unedited step and execute it NOW using replace_string_in_file."
+            "You are mid-execution. The plan is at '═══ THE PLAN ═══' in your system prompt.\n"
+            "Your previous tool results above contain file contents you've already read.\n"
+            "Read any ADDITIONAL files you need, then PICK THE NEXT UNEDITED STEP and edit."
         )
         if read_repeat_count >= 2:
             plan_hint += (
-                "\n\n⚠ LOOP ALERT: You have read the same files multiple times. "
-                "STOP reading files. STOP reading memory. "
-                "The file contents are ALREADY in your context (see [PRE-LOADED FILE] blocks).\n"
-                "Pick the NEXT plan step you have NOT started yet and EXECUTE "
-                "the edit now using replace_string_in_file / multi_replace_string_in_file."
-            )
-        else:
-            plan_hint += (
-                " DO NOT use the memory tool — the plan is in your system prompt. "
-                "DO NOT re-read files — their contents are in [PRE-LOADED FILE] blocks above."
+                "\n\n⚠ LOOP ALERT: You're re-reading the SAME files. "
+                "The contents are in your previous tool results above. "
+                "Pick the NEXT step and EXECUTE the edit NOW."
             )
         context_blocks.append(plan_hint)
     context_str = "\n\n".join(context_blocks)
