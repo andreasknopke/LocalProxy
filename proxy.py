@@ -1917,6 +1917,7 @@ def _build_worker_payload(
     model_name: Optional[str] = None,
     max_tokens: Optional[int] = None,
     plan_path: Optional[str] = None,
+    force_first_call: bool = False,
 ) -> Dict[str, Any]:
     """
     Baut den Payload fuer den WORKER - ein FULLY TOOL-CAPABLE Sub-Agent.
@@ -1992,19 +1993,23 @@ def _build_worker_payload(
 
     has_tool_msgs = any(isinstance(m, dict) and m.get("role") == "tool" for m in messages)
 
+    # ══ Plan-Session state detection ═══════════════════════════════
+    # Wenn force_first_call=True (Session gerade von active→done),
+    # dann force First-Call-Verhalten auch wenn Tool-Messages im Body
+    # sind (das sind Planner-Tools, keine Worker-Tools).
+    is_first_worker_call = (not has_tool_msgs) or force_first_call
+
     # Baue Payload: System + Original-User
     new_msgs = list(system_msgs)
     if original_user_msg is not None:
         new_msgs.append(original_user_msg)
 
     # ══ PRE-LOADED FILES (Aider's get_chat_files_messages) ═══════
-    # NUR beim FIRST-CALL: Kimi's read_file-Ergebnisse als vollständige
-    # Dateiinhalte injizieren. Zusätzlich: Dateipfade aus der
-    # "**Relevant files**" Sektion des Plans parsen und für nicht
-    # pre-geloadete Files eine explizite "Diese N Files fehlen noch"
-    # Liste zeigen — der Worker liest dann GEZIELT nur die fehlenden.
-    files_to_read = []  # Pfade die der Worker lesen MUSS
-    if plan and not has_tool_msgs:
+    # Beim FIRST worker call: Kimi's read_file-Ergebnisse + Plan-Pfade →
+    # alle relevanten Dateien als [PRE-LOADED FILE] injizieren.
+    # Bei Continuation: NICHT — Worker hat seine eigenen Tool-Results.
+    files_to_read = []
+    if plan and is_first_worker_call:
         pre_loaded_files = _extract_planner_file_contents(messages)
         plan_file_paths = _parse_plan_file_paths(plan)
 
@@ -2032,7 +2037,7 @@ def _build_worker_payload(
                 if not found:
                     files_to_read.append(fp)
 
-    if has_tool_msgs:
+    if not is_first_worker_call:
         # Continuation: die letzten 3 Worker-Cluster behalten.
         # Der Worker braucht Kontext-Kontinuität: seine eigenen
         # read_file-Ergebnisse aus vorherigen Runden. Nur den LETZTEN
@@ -2112,7 +2117,7 @@ def _build_worker_payload(
     # dieselben Files liest (read_file/grep_call mit identischen Args).
     # Das ist das Symptom der "Plan-Schleife": DeepSeek startet in jeder
     # neuen Runde von vorn, weil es denkt, der Plan sei neu.
-    is_continuation = has_tool_msgs
+    is_continuation = not is_first_worker_call
     read_repeat_count = 0
     if is_continuation:
         read_call_files = []
@@ -4527,6 +4532,7 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             worker_payload = _build_worker_payload(
                 body, plan, "",
                 plan_path=_PLANNER_SESSIONS.get(session_hash, {}).get("plan_path"),
+                force_first_call=True,  # Session gerade active→done
             )
             worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
             results.append(worker_result)
