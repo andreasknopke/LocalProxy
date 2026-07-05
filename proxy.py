@@ -2133,14 +2133,17 @@ def _build_worker_payload(
             "IMPORTANT: Code context is PRE-LOADED in [PRE-LOADED FILE] messages above.\n"
             "You do NOT need to read files — the code is already in your context.\n"
             "Rules:\n"
-            "1. Read the CLOUD EXECUTION PLAN at the bottom of this conversation FIRST.\n"
-            "2. Edit files directly — their contents are in [PRE-LOADED FILE] blocks above.\n"
+            "1. Edit files directly — their contents are in [PRE-LOADED FILE] blocks above.\n"
             "   Only read a file if it was NOT pre-loaded AND the plan references it.\n"
-            "3. Execute each plan step IN ORDER.\n"
-            "4. DO NOT refactor, add features, or 'improve' anything not in the plan.\n"
-            "5. If a step references the wrong file/line: read to find the real location, then proceed.\n"
-            "6. Do NOT create new files unless the plan explicitly says 'CREATE <path>'.\n"
-            "7. After finishing, output '## Implementation Summary' with each step ✓/⚠/✗."
+            "2. Execute each plan step IN ORDER.\n"
+            "3. DO NOT refactor, add features, or 'improve' anything not in the plan.\n"
+            "4. If a step references the wrong file/line: read to find the real location, then proceed.\n"
+            "5. Do NOT create new files unless the plan explicitly says 'CREATE <path>'.\n"
+            "6. After finishing, output '## Implementation Summary' with each step ✓/⚠/✗.\n"
+            "\n"
+            "═══ THE PLAN (survives all rounds — always visible) ═══\n"
+            f"{plan}\n"
+            "═══ END PLAN ═══"
         )
         if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
             existing = str(messages[0].get("content", ""))
@@ -2157,11 +2160,10 @@ def _build_worker_payload(
     context_blocks = []
     if plan and not is_continuation:
         context_blocks.append(
-            "[CLOUD EXECUTION PLAN — FOLLOW EXACTLY]\n"
-            "This plan was authored by a senior planner who had full codebase access.\n"
+            "[CLOUD EXECUTION PLAN — SEE SYSTEM PROMPT ABOVE]\n"
+            "The full plan is embedded in the system prompt (see '═══ THE PLAN ═══').\n"
             "The files you need are PRE-LOADED above as [PRE-LOADED FILE] blocks.\n"
-            "Edit them directly — you have the code. Do NOT re-read files that were pre-loaded.\n\n"
-            f"{plan}"
+            "Start with Step 1 and edit directly."
         )
         if memory_context:
             context_blocks.append(
@@ -2177,11 +2179,10 @@ def _build_worker_payload(
             )
     elif is_continuation:
         plan_hint = (
-            "[CONTINUATION REMINDER — DO NOT RE-READ FILES YOU ALREADY READ]\n"
-            "You are mid-execution of the CLOUD EXECUTION PLAN."
+            "[CONTINUATION REMINDER — THE PLAN IS IN YOUR SYSTEM PROMPT]\n"
+            "You are mid-execution. Look at '═══ THE PLAN ═══' in the system prompt above.\n"
+            "Pick the NEXT unedited step and execute it now."
         )
-        if plan_path:
-            plan_hint += f" Full plan persisted at: `{plan_path}` (read it ONLY if you lost context)."
         if read_repeat_count >= 2:
             plan_hint += (
                 "\n\n⚠ LOOP ALERT: You have read the same files multiple times. "
@@ -2193,8 +2194,8 @@ def _build_worker_payload(
             )
         else:
             plan_hint += (
-                " Continue with the NEXT unedited step. Use the file contents "
-                "already in your context. DO NOT re-read files unnecessarily."
+                " Use the file contents already in your context. "
+                "DO NOT read plan files or memory — the plan is in your system prompt."
             )
         context_blocks.append(plan_hint)
     context_str = "\n\n".join(context_blocks)
