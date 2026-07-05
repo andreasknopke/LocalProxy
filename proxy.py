@@ -1492,19 +1492,53 @@ _PLANNER_ALLOWED_TOOLS = {
     "vscode_askQuestions",
 }
 
-# Tools die der Worker auf Continuation NICHT bekommt (Aider-Pattern:
-# Editor hat keine Read-Tools, bekommt Dateien direkt injiziert).
+# Tools die der Worker NICHT bekommt. Nur edit/create/delete/todo tools bleiben.
 _WORKER_READ_TOOLS = {
+    # Read/Explore
     "read_file", "grep_search", "file_search", "list_dir",
     "view_image", "get_errors", "copilot_getNotebookSummary",
-    "read_notebook_cell_output", "terminal_last_command", "terminal_selection",
-    "get_task_output", "get_terminal_output", "testFailure",
+    "read_notebook_cell_output",
+    # Terminal (Worker nutzt als read_file-Ersatz!)
+    "run_in_terminal", "send_to_terminal", "create_and_run_task",
+    "get_task_output", "get_terminal_output",
+    "terminal_last_command", "terminal_selection",
+    # Web
     "fetch_webpage", "github_repo", "github_text_search",
-    "session_store_sql", "vscode_listCodeUsages",
+    "session_store_sql", "vscode_listCodeUsages", "testFailure",
+    # Memory
     "memory", "resolve_memory_file_uri",
+    # Interaction
     "vscode_askQuestions", "vscode_renameSymbol",
-    "read_page", "screenshot_page",
-    # Alles was Dateien/Code liest oder erkundet
+    # Browser
+    "read_page", "screenshot_page", "open_browser_page",
+    # Subagents / Misc
+    "runSubagent", "run_notebook_cell", "run_vscode_command",
+    "install_extension", "vscode_searchExtensions_internal",
+    "create_new_workspace", "create_new_jupyter_notebook",
+    "renderMermaidDiagram",
+    # Python/Dotnet/Container config
+    "configure_python_environment", "get_python_environment_details",
+    "get_python_executable_details", "install_python_packages",
+    "find_dotnet_executable_path", "install_dotnet_sdk",
+    "recommended_dotnet_sdk_version", "list_installed_dotnet_versions",
+    "list_available_dotnet_versions_to_install",
+    "uninstall_system_dotnet_sdk", "uninstall_vscode_owned_dotnet_runtime",
+    "get_settings_info_for_dotnet_installation_management",
+    "container-tools_get-config",
+    # MCP Pylance (all)
+    "mcp_provides_tool_pylanceDocString",
+    "mcp_provides_tool_pylanceDocuments",
+    "mcp_provides_tool_pylanceFileSyntaxErrors",
+    "mcp_provides_tool_pylanceImports",
+    "mcp_provides_tool_pylanceInstalledTopLevelModules",
+    "mcp_provides_tool_pylanceInvokeRefactoring",
+    "mcp_provides_tool_pylancePythonEnvironments",
+    "mcp_provides_tool_pylanceRunCodeSnippet",
+    "mcp_provides_tool_pylanceSettings",
+    "mcp_provides_tool_pylanceSyntaxErrors",
+    "mcp_provides_tool_pylanceUpdatePythonEnvironment",
+    "mcp_provides_tool_pylanceWorkspaceRoots",
+    "mcp_provides_tool_pylanceWorkspaceUserFiles",
 }
 
 
@@ -4354,7 +4388,8 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             _log(f"  📎 Planner-Files gecached: {len(planner_files)} Dateien "
                  f"({sum(len(v) for v in planner_files.values())} chars)")
             _PLANNER_SESSIONS[session_hash] = {
-                "state": "done", "ts": time.time(), "worker_rounds": 0, "planner_files": {},"plan": pc, "pflags": planner_flags,
+                "state": "done", "ts": time.time(), "worker_rounds": 0,
+                "plan": pc, "pflags": planner_flags,
                 "plan_path": str(plan_path) if plan_path else None,
                 "planner_files": planner_files,
             }
@@ -4376,8 +4411,10 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             # Plan in dak-dat File persistieren (Codespace-Copilot-Stil)
             plan_path = _save_plan_to_file(session_hash, plan, query=body.get("messages", [{}])[0].get("content", ""))
             _PLANNER_SESSIONS[session_hash] = {
-                "state": "done", "ts": time.time(), "worker_rounds": 0, "planner_files": {},"plan": plan, "pflags": planner_flags,
+                "state": "done", "ts": time.time(), "worker_rounds": 0,
+                "plan": plan, "pflags": planner_flags,
                 "plan_path": str(plan_path) if plan_path else None,
+                "planner_files": _extract_planner_file_contents(body.get("messages", [])),
             }
             progress.append(_format_chat_progress_message(
                 "phase1_plan_ready",
@@ -4553,7 +4590,8 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             planner_files = _extract_planner_file_contents(body.get("messages", []))
             _log(f"  📎 Planner-Files gecached: {len(planner_files)} Dateien")
             _PLANNER_SESSIONS[session_hash] = {
-                "state": "done", "ts": time.time(), "worker_rounds": 0, "planner_files": {},"plan": pc, "pflags": {"force_review": force_review, "bypass_worker": bypass_worker},
+                "state": "done", "ts": time.time(), "worker_rounds": 0,
+                "plan": pc, "pflags": {"force_review": force_review, "bypass_worker": bypass_worker},
                 "plan_path": str(plan_path) if plan_path else None,
                 "planner_files": planner_files,
             }
@@ -4590,8 +4628,10 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             # Plan als Datei persistieren
             plan_path = _save_plan_to_file(session_hash, plan, query=body.get("messages", [{}])[0].get("content", ""))
             _PLANNER_SESSIONS[session_hash] = {
-                "state": "done", "ts": time.time(), "worker_rounds": 0, "planner_files": {},"plan": plan, "pflags": planner_flags,
+                "state": "done", "ts": time.time(), "worker_rounds": 0,
+                "plan": plan, "pflags": planner_flags,
                 "plan_path": str(plan_path) if plan_path else None,
+                "planner_files": _extract_planner_file_contents(body.get("messages", [])),
             }
             progress.append(_format_chat_progress_message(
                 "phase1_plan_ready",
@@ -4621,8 +4661,10 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         if plan_status == "ok":
             plan_path = _save_plan_to_file(session_hash, plan, query=body.get("messages", [{}])[0].get("content", ""))
             _PLANNER_SESSIONS[session_hash] = {
-                "state": "done", "ts": time.time(), "worker_rounds": 0, "planner_files": {},"plan": plan,
+                "state": "done", "ts": time.time(), "worker_rounds": 0,
+                "plan": plan,
                 "plan_path": str(plan_path) if plan_path else None,
+                "planner_files": _extract_planner_file_contents(body.get("messages", [])),
             }
             progress.append(_format_chat_progress_message(
                 "phase1_plan_ready",
