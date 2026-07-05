@@ -159,7 +159,6 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
 DEFAULT_CONFIG: Dict[str, Any] = {
     "models": {
         "vllm_api_url": "http://localhost:8000/v1/chat/completions",
-        "vllm_models_url": "http://localhost:8000/v1/models",
         "vllm_api_key": "",
         "model_name": "Qwen/Qwen3-Next-80B-Chat-mxfp4",
         "fast_model_name": "Qwen/Qwen3.6-27B-Chat-FP8",
@@ -222,7 +221,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 # Wird NUR beim erstmaligen Erzeugen von config.json verwendet.
 _ENV_TO_CONFIG: Dict[str, Tuple[str, str]] = {
     "VLLM_API_URL": ("models", "vllm_api_url"),
-    "VLLM_MODELS_URL": ("models", "vllm_models_url"),
     "VLLM_API_KEY": ("models", "vllm_api_key"),
     "MODEL_NAME": ("models", "model_name"),
     "FAST_MODEL_NAME": ("models", "fast_model_name"),
@@ -473,10 +471,6 @@ pre { background: var(--surface2); padding: 12px; border-radius: var(--radius); 
         <label>Lokal/Free API URL</label>
         <input type="url" id="cfg-models-vllm_api_url" placeholder="http://localhost:8000/v1/chat/completions">
         <div class="hint">Endpoint für Lokal/Free (lokal oder Cloud-Free-Tier)</div>
-      </div>
-      <div class="form-group">
-        <label>Lokal/Free Models URL</label>
-        <input type="url" id="cfg-models-vllm_models_url" placeholder="http://localhost:8000/v1/models">
       </div>
       <div class="form-group">
         <label>Lokal/Free API Key (optional)</label>
@@ -759,7 +753,6 @@ let currentConfig = {};
 
 const ID_MAP = {
   'cfg-models-vllm_api_url': ['models','vllm_api_url'],
-  'cfg-models-vllm_models_url': ['models','vllm_models_url'],
   'cfg-models-vllm_api_key': ['models','vllm_api_key'],
   'cfg-models-model_name': ['models','model_name'],
   'cfg-models-fast_model_name': ['models','fast_model_name'],
@@ -1287,7 +1280,15 @@ def create_webui_app() -> FastAPI:
         vllm_ok = False
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
-                r = await client.get(os.getenv("VLLM_MODELS_URL", "http://localhost:8000/v1/models"))
+                # Models-URL aus API-URL ableiten
+                _api_base = cfg.get("models", {}).get("vllm_api_url", "http://localhost:8000/v1/chat/completions").rstrip("/")
+                if "/chat/completions" in _api_base:
+                    _models_url = _api_base.rsplit("/chat/completions", 1)[0] + "/models"
+                elif _api_base.endswith("/v1"):
+                    _models_url = _api_base + "/models"
+                else:
+                    _models_url = _api_base + "/v1/models"
+                r = await client.get(_models_url)
                 vllm_ok = r.status_code == 200
         except Exception:
             pass

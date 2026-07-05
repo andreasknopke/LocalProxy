@@ -80,7 +80,6 @@ except Exception:
 # ═══════════════════════════════════════════════════════════════════════════
 
 VLLM_API_URL: str = os.getenv("VLLM_API_URL", "http://localhost:8000/v1/chat/completions")
-VLLM_MODELS_URL: str = os.getenv("VLLM_MODELS_URL", "http://localhost:8000/v1/models")
 VLLM_API_KEY: str = os.getenv("VLLM_API_KEY", "")
 MODEL_NAME: str = os.getenv("MODEL_NAME", "Qwen/Qwen3-Next-80B-Chat-mxfp4")
 FAST_MODEL_NAME: str = os.getenv("FAST_MODEL_NAME", "Qwen/Qwen3.6-27B-Chat-FP8")
@@ -469,9 +468,8 @@ def _apply_config_file() -> None:
         return
 
     # Models
-    global VLLM_API_URL, VLLM_MODELS_URL, VLLM_API_KEY, MODEL_NAME, FAST_MODEL_NAME
+    global VLLM_API_URL, VLLM_API_KEY, MODEL_NAME, FAST_MODEL_NAME
     VLLM_API_URL = cfg.get("models", {}).get("vllm_api_url", VLLM_API_URL)
-    VLLM_MODELS_URL = cfg.get("models", {}).get("vllm_models_url", VLLM_MODELS_URL)
     ak = cfg.get("models", {}).get("vllm_api_key", "")
     if ak:
         VLLM_API_KEY = ak
@@ -574,20 +572,15 @@ if not _api_base_clean.endswith("/chat/completions"):
         VLLM_API_URL = _api_base_clean + "/chat/completions"
         _log(f"🔧 URL-Norm: VLLM_API_URL → {VLLM_API_URL}")
 
-_models_base_clean = VLLM_MODELS_URL.rstrip("/")
-# Models-URL muss ein gültiges Protokoll haben — sonst aus API-URL ableiten
-if not _models_base_clean.startswith(("http://", "https://")):
-    _api_for_models = VLLM_API_URL.rstrip("/")
-    if "/chat/completions" in _api_for_models:
-        VLLM_MODELS_URL = _api_for_models.rsplit("/chat/completions", 1)[0] + "/models"
-    elif _api_for_models.endswith("/v1"):
-        VLLM_MODELS_URL = _api_for_models + "/models"
-    else:
-        VLLM_MODELS_URL = _api_for_models + "/v1/models"
-    _log(f"🔧 URL-Norm: VLLM_MODELS_URL aus API-URL → {VLLM_MODELS_URL}")
-elif not _models_base_clean.endswith("/models") and not _models_base_clean.endswith("/v1/models"):
-    VLLM_MODELS_URL = _models_base_clean + "/models"
-    _log(f"🔧 URL-Norm: VLLM_MODELS_URL → {VLLM_MODELS_URL}")
+
+def _derive_models_url(api_url: str) -> str:
+    """Leitet die /models-URL aus der Chat-API-URL ab."""
+    base = api_url.rstrip("/")
+    if "/chat/completions" in base:
+        return base.rsplit("/chat/completions", 1)[0] + "/models"
+    if base.endswith("/v1"):
+        return base + "/models"
+    return base + "/v1/models"
 
 # ── Cloud-URL-Normalisierung ────────────────────────────────────────────
 # Moonshot: /v1 → /v1/chat/completions, DeepSeek: direkt /chat/completions
@@ -4851,12 +4844,9 @@ async def _startup_event() -> None:
                 return r.text[:200] if r.text else ""
 
         # 1. Worker-Modell – /v1/models testen (robuster, vermeidet JIT-Timeout)
-        _models_url = VLLM_MODELS_URL
-        if not _models_url.startswith(("http://", "https://")):
-            _models_url = VLLM_API_URL.rstrip("/").rsplit("/chat/completions", 1)[0] + "/models"
-        elif not _models_url.endswith("/models") and not _models_url.endswith("/v1/models"):
-            _models_url = VLLM_API_URL.rstrip("/") + "/models"
+        _models_url = _derive_models_url(VLLM_API_URL)
         _log(f"   🔍 Worker '{MODEL_NAME}' @ {VLLM_API_URL} ...")
+        _log(f"      Models-URL: {_models_url}")
         try:
             r = await hc.get(
                 _models_url,
@@ -4875,7 +4865,7 @@ async def _startup_event() -> None:
             else:
                 _log(f"   ❌ Worker: HTTP {r.status_code}")
         except Exception as exc:
-            _log(f"   ❌ Worker: NICHT ERREICHBAR – {exc}")
+            _log(f"   ❌ Worker: NICHT ERREICHBAR – {type(exc).__name__}: {exc}")
 
         # 1b. Fast-Modell separat testen falls abweichend
         if FAST_MODEL_NAME != MODEL_NAME:
@@ -4898,12 +4888,13 @@ async def _startup_event() -> None:
                     err = _parse_error(r) or f"HTTP {r.status_code}"
                     _log(f"   ❌ Fast-Modell: {err} ({FAST_MODEL_NAME})")
             except Exception as exc:
-                _log(f"   ❌ Fast-Modell: NICHT ERREICHBAR – {exc}")
+                _log(f"   ❌ Fast-Modell: NICHT ERREICHBAR – {type(exc).__name__}: {exc}")
 
         # 1c. Models-Liste (nice-to-have, viele Cloud-Proxys haben keinen /models-Endpoint)
-        _log(f"   🔍 Models-Liste via {VLLM_MODELS_URL} ...")
+        _list_url = _derive_models_url(VLLM_API_URL)
+        _log(f"   🔍 Models-Liste via {_list_url} ...")
         try:
-            r = await hc.get(VLLM_MODELS_URL, headers=_vllm_headers())
+            r = await hc.get(_list_url, headers=_vllm_headers())
             if r.status_code == 200:
                 data = r.json()
                 ids = [m.get("id","?") for m in data.get("data",[])]
@@ -5033,7 +5024,7 @@ async def list_models(request: Request):
     ]
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(VLLM_MODELS_URL, headers=_vllm_headers())
+            response = await client.get(_derive_models_url(VLLM_API_URL), headers=_vllm_headers())
             if response.status_code == 200:
                 data = response.json()
                 for m in data.get("data", []):
