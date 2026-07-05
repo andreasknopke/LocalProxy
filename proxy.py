@@ -568,10 +568,11 @@ _apply_config_file()
 _api_base_clean = VLLM_API_URL.rstrip("/")
 if not _api_base_clean.endswith("/chat/completions"):
     if _api_base_clean.endswith("/v1"):
-        VLLM_API_URL = _api_base_clean + "/chat/completions"
+        # /v1 ist bereits ein gültiger OpenAI-kompatibler Endpunkt — nichts anhängen
+        _log(f"ℹ️  URL-Norm: VLLM_API_URL endet auf /v1 – wird als vollständiger Endpunkt verwendet")
     else:
         VLLM_API_URL = _api_base_clean + "/chat/completions"
-    _log(f"🔧 URL-Norm: VLLM_API_URL → {VLLM_API_URL}")
+        _log(f"🔧 URL-Norm: VLLM_API_URL → {VLLM_API_URL}")
 
 _models_base_clean = VLLM_MODELS_URL.rstrip("/")
 # Models-URL muss ein gültiges Protokoll haben — sonst aus API-URL ableiten
@@ -2781,7 +2782,11 @@ async def _phase0_compress_prompt(
     try:
         # Zustatz-Header: der Fast-Worker laeuft ueber eigenem Endpoint
         headers = _vllm_headers()
-        url = VLLM_API_URL if VLLM_API_URL.endswith("/chat/completions") else VLLM_API_URL.rstrip("/") + "/chat/completions"
+        _clean = VLLM_API_URL.rstrip("/")
+        if _clean.endswith("/chat/completions") or _clean.endswith("/v1"):
+            url = VLLM_API_URL
+        else:
+            url = _clean + "/chat/completions"
         response = await client.post(url, json=payload, headers=headers, timeout=20.0)
         duration = time.perf_counter() - started
         if response.status_code == 200:
