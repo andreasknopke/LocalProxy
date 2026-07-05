@@ -2119,13 +2119,18 @@ def _build_worker_payload(
             "IMPORTANT: Code context is PRE-LOADED in [PRE-LOADED FILE] messages above.\n"
             "You do NOT need to read files — the code is already in your context.\n"
             "Rules:\n"
-            "1. Edit files directly — their contents are in [PRE-LOADED FILE] blocks above.\n"
-            "   Only read a file if it was NOT pre-loaded AND the plan references it.\n"
+            "1. Your PRIMARY output is FILE EDITS, not reads. Max 3 reads per round.\n"
+            "2. Edit files directly — their contents are in [PRE-LOADED FILE] blocks above.\n"
+            "   Only read a file if it was NOT pre-loaded AND critical for the next edit.\n"
             "2. Execute each plan step IN ORDER.\n"
             "3. DO NOT refactor, add features, or 'improve' anything not in the plan.\n"
             "4. If a step references the wrong file/line: read to find the real location, then proceed.\n"
             "5. Do NOT create new files unless the plan explicitly says 'CREATE <path>'.\n"
             "6. After finishing, output '## Implementation Summary' with each step ✓/⚠/✗.\n"
+            "\n"
+            "⛔ CRITICAL: You are an EXECUTOR, not an explorer. The planner already explored.\n"
+            "Your job is to EDIT files. Every round without an edit is a failed round.\n"
+            "Read ONLY what you need for the IMMEDIATE next edit, then EDIT.\n"
             "\n"
             "═══ THE PLAN (always visible in every round) ═══\n"
             f"{plan}\n"
@@ -2149,9 +2154,9 @@ def _build_worker_payload(
     if plan and not is_continuation:
         context_blocks.append(
             "[CLOUD EXECUTION PLAN — SEE SYSTEM PROMPT ABOVE]\n"
-            "The full plan is embedded in the system prompt (see '═══ THE PLAN ═══').\n"
-            "The files you need are PRE-LOADED above as [PRE-LOADED FILE] blocks.\n"
-            "Start with Step 1 and edit directly."
+            "The full plan is in your system prompt ('═══ THE PLAN ═══').\n"
+            "Files are PRE-LOADED above. Start editing NOW.\n"
+            "READ-BUDGET: max 3 reads, then you MUST edit."
         )
         if memory_context:
             context_blocks.append(
@@ -2167,16 +2172,17 @@ def _build_worker_payload(
             )
     elif is_continuation:
         plan_hint = (
-            "[CONTINUATION REMINDER — THE PLAN IS IN YOUR SYSTEM PROMPT]\n"
-            "You are mid-execution. The plan is at '═══ THE PLAN ═══' in your system prompt.\n"
-            "Your previous tool results above contain file contents you've already read.\n"
-            "Read any ADDITIONAL files you need, then PICK THE NEXT UNEDITED STEP and edit."
+            "[CONTINUATION — STOP READING, START EDITING]\n"
+            "You have read enough files. Your previous tool results contain code you need.\n"
+            "READ-BUDGET: MAX 2 file reads this round. Then EDIT.\n"
+            "DO NOT: read memory, re-read files, read the plan from disk.\n"
+            "DO: pick the NEXT unedited step from '═══ THE PLAN ═══' and APPLY IT.\n"
+            "Your output this round MUST contain at least ONE file edit."
         )
         if read_repeat_count >= 2:
             plan_hint += (
-                "\n\n⚠ LOOP ALERT: You're re-reading the SAME files. "
-                "The contents are in your previous tool results above. "
-                "Pick the NEXT step and EXECUTE the edit NOW."
+                "\n\n⚠ CRITICAL: You are re-reading files you already read. STOP. "
+                "The content is above in your tool results. Execute the next edit NOW."
             )
         context_blocks.append(plan_hint)
     context_str = "\n\n".join(context_blocks)
