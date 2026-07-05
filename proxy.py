@@ -4988,6 +4988,45 @@ async def _auth_or_raise(request: Request) -> None:
 
 
 # ── /v1/chat/completions ──────────────────────────────────────────────────
+
+_COPILOT_REQUEST_COUNTER = 0
+_COPILOT_DUMP_MAX = 5
+
+
+def _dump_copilot_request(request: Request, body: Dict[str, Any]) -> None:
+    """Speichert die ersten N Copilot-Requests als JSON für Analyse.
+
+    Nutzt data/debug/ (existiert schon, gitignored).
+    Damit analysieren wir was Copilot im Plan-Mode wirklich sendet.
+    """
+    global _COPILOT_REQUEST_COUNTER
+    _COPILOT_REQUEST_COUNTER += 1
+    if _COPILOT_REQUEST_COUNTER > _COPILOT_DUMP_MAX:
+        return
+    try:
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+    filename = f"copilot_request_{_COPILOT_REQUEST_COUNTER:03d}.json"
+    snapshot = {
+        "dumped_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "request_number": _COPILOT_REQUEST_COUNTER,
+        "url": str(request.url),
+        "method": request.method,
+        "headers": dict(request.headers),
+        "query_params": dict(request.query_params),
+        "body": body,
+    }
+    try:
+        (DEBUG_DIR / filename).write_text(
+            json.dumps(snapshot, indent=2, default=str, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        _log(f"📸 Copilot-Request #{_COPILOT_REQUEST_COUNTER} gespeichert → data/debug/{filename}")
+    except Exception as e:
+        _log(f"⚠️ Copilot-Request-Dump fehlgeschlagen: {e}")
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     await _auth_or_raise(request)
@@ -4995,6 +5034,9 @@ async def chat_completions(request: Request):
 
     if "messages" not in body:
         raise HTTPException(status_code=400, detail="Invalid payload: 'messages' required.")
+
+    # Dump für Plan-Mode-Analyse
+    _dump_copilot_request(request, body)
 
     # Ignoriere Client-Modell – der Proxy verwendet sein konfiguriertes Modell
     body["model"] = MODEL_NAME
@@ -5249,6 +5291,15 @@ async def debug_cleanup(request: Request):
         "before": before, "after": after, "removed": before - after,
         "DEBUG_MAX_FILES": DEBUG_MAX_FILES,
     })
+
+
+@app.post("/debug/copilot-dump-reset")
+async def debug_copilot_dump_reset(request: Request):
+    """Setzt den Copilot-Request-Dump-Counter zurück (neue 5 Dumps)."""
+    global _COPILOT_REQUEST_COUNTER
+    _COPILOT_REQUEST_COUNTER = 0
+    _log("📸 Copilot-Request-Dump-Counter zurückgesetzt")
+    return JSONResponse(content={"status": "ok", "message": "Counter reset — next 5 requests werden gedumpt"})
 
 
 # ── MCP Endpoint ───────────────────────────────────────────────────────────
