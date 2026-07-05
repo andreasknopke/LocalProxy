@@ -1950,34 +1950,19 @@ def _build_worker_payload(
     model_name: Optional[str] = None,
     max_tokens: Optional[int] = None,
     plan_path: Optional[str] = None,
-    force_first_call: bool = False,
+    is_first_worker_call: bool = False,
 ) -> Dict[str, Any]:
-    """
-    Baut den Payload fuer den WORKER - ein FULLY TOOL-CAPABLE Sub-Agent.
-    Der Worker bekommt die KOMPLETTE VS Code Umgebung:
-      - Originale System-Message (mit Tool-Definitionen & Calling-Format)
-      - Alle Messages (kein Compact!)
-      - tools / tool_choice aus dem Original-Body
-      - Plan + Memory als ZUSAETZLICHER Kontext in der letzten User-Message
-    
-    USER-VISION "Plan-bindend":
-      Der Worker wird EXPLIZIT angewiesen, den Plan strikt zu befolgen.
-      Er hat ALLE VS Code Tools, aber die System-Instruktion ist der Vertrag:
-      "Implementiere den Plan. Keine(). Neue(). Ideen. Wenn der Plan Fehler
-      hat, mache最小-korrektur und kommentiere. Keine Refactors, keine
-      Zusatz-Features, keine neuen Dateien es sei denn der Plan verlangt es."
+    """Gemini/Aider Clean-Slate Worker-Payload.
 
-    PLAN-FILE (Codespace-Copilot-Stil):
-      Neben der In-Prompt-Injection wird der Plan zusaetzlich als .md-File
-      persistiert (data/plans/Plan_<hash>.md). Der File-Pfad wird als
-      Pointer im System-Prompt veroeffentlicht - so kann der Worker auch
-      nach Runden von Tool-Calls den Plan nachlesen.
+    Prinzip: Worker sieht NIE Planner-History. Nur:
+      1. System-Messages (Tool-Definitionen)
+      2. Plan-Binding-Contract + Plan (im System-Prompt, jede Runde)
+      3. User-Task (originale Aufgabenstellung)
+      4. Pre-Loaded Files (nur Round 1 — Kimis read_file-Ergebnisse)
+      5. Worker-Cluster (Continuation — eigene Tool-Results)
 
-    REASONING-CONTENT HYGIENE:
-      Kimi-urspruengliche Assistant-Messages mit `reasoning_content` (Thinking)
-      werden entfernt, ausser wenn tool_calls dranhaengen (dann braucht
-      DeepSeek das Thinking fuer Tool-Continuations). Vermeidet
-      'thinking content could not be passed'-Fehler beim Hand-off.
+    Erste Runde: read_file + edit tools → Worker verifiziert Dateien
+    Folge-Runden: nur edit tools → Worker MUSS editieren
     """
     payload = copy.deepcopy(body)
     payload["model"] = model_name or body.get("model") or MODEL_NAME
@@ -1986,269 +1971,129 @@ def _build_worker_payload(
 
     messages = list(payload.get("messages", []))
 
-    # ══ PLAN-ISOLAT MESSAGE TRIAGE ═══════════════════════════════════
-    # Konzept: "Senior-Planner delegiert an Junior-Worker" – der manuelle
-    # Workflow des Users: Frontier-Modell plant mit vollem Kontext, dann
-    # delegiert an anderes Modell NUR den Plan (kein Kontext).
-    #
-    # Der Worker (DeepSeek) bekommt NUR:
-    #   1. System-Message (Tool-Definitionen, Calling-Format) – original
-    #   2. Die ORIGINAL User-Aufgabenbeschreibung (erste substantielle User-Msg)
-    #   3. Den fertigen Plan (binding contract + Kontext, unten injectiert)
-    #   4. Bei Continuation: NUR den letzten Worker-Tool-Zyklus
-    #
-    # Der GESAMTE Planner-Verlauf (Kimi Tool-Calls, read_file-Ergebnisse,
-    # Reasoning-Content,compactierte Caveman-Kontexte) wird ENTFERNT.
-    # Der Worker MUSS eigene read_file/grep_call machen, um Code zu sehen –
-    # exakt wie im manuellen Workflow. So wird DeepSeek nicht durch fremden
-    # Tool-Cruft verwirrt und hat einen sauberen, winzigen Kontext.
-    system_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "system"]
+    # ── 1. System-Messages extrahieren ──────────────────────────
+    system_msgs = [copy.deepcopy(m) for m in messages
+                   if isinstance(m, dict) and m.get("role") == "system"]
 
-    # Original-User-Task isolieren: ERSTE User-Message mit substantiellem Content.
-    # Überspringt VSCode-injected System-User-Msgs ("[SYSTEM:", Error-Injections).
-    original_user_msg = None
+    # ── 2. User-Task finden ─────────────────────────────────────
+    user_task = None
     for m in messages:
         if not isinstance(m, dict) or m.get("role") != "user":
             continue
-        content = m.get("content", "")
-        if isinstance(content, str):
-            stripped = content.strip()
-            if not stripped:
-                continue
-            # Skip re-injected system/error messages
-            if stripped.startswith("[SYSTEM:") or stripped.startswith("[HINDSIGHT"):
-                continue
-            original_user_msg = copy.deepcopy(m)
+        c = m.get("content", "")
+        if isinstance(c, str) and c.strip() and not c.strip().startswith(("[SYSTEM:", "[HINDSIGHT")):
+            user_task = copy.deepcopy(m)
             break
-        elif isinstance(content, list) and content:
-            original_user_msg = copy.deepcopy(m)
+        if isinstance(c, list) and c:
+            user_task = copy.deepcopy(m)
             break
 
-    has_tool_msgs = any(isinstance(m, dict) and m.get("role") == "tool" for m in messages)
+    is_continuation = not is_first_worker_call
 
-    # ══ Plan-Session state detection ═══════════════════════════════
-    # Wenn force_first_call=True (Session gerade von active→done),
-    # dann force First-Call-Verhalten auch wenn Tool-Messages im Body
-    # sind (das sind Planner-Tools, keine Worker-Tools).
-    is_first_worker_call = (not has_tool_msgs) or force_first_call
+    # ── 4. Clean-Slate Payload bauen ────────────────────────────
+    new_msgs: List[Dict[str, Any]] = list(system_msgs)
+    if user_task:
+        new_msgs.append(user_task)
 
-    # Baue Payload: System + Original-User
-    new_msgs = list(system_msgs)
-    if original_user_msg is not None:
-        new_msgs.append(original_user_msg)
-
-    # ══ PRE-LOADED FILES ═══════════════════════════════════════
-    # NUR beim ersten Worker-Call: Kimi's read_file-Ergebnisse als
-    # [PRE-LOADED FILE] injizieren. Worker verifiziert per read_file
-    # (nur in Round 1 verfügbar), editiert. Bei Continuation KEINE
-    # Pre-Loads — sonst sieht Worker Kimis ALTE Versionen und macht
-    # Duplikat-Edits (3x resize? in common.ts).
-    if plan and is_first_worker_call:
-        pre_loaded_files = _extract_planner_file_contents(messages)
-        if pre_loaded_files:
-            injected = 0
-            for fp, content in pre_loaded_files.items():
+    # Pre-Loaded Files: NUR beim ersten Worker-Call
+    if plan and not is_continuation:
+        pre_loaded = _extract_planner_file_contents(messages)
+        if pre_loaded:
+            for fp, content in pre_loaded.items():
                 block = (
                     f"[PRE-LOADED FILE: {fp} — PLANNER VERSION]\n"
-                    f"This is what the PLANNER saw. Verify with read_file before editing.\n"
-                    f"---FILE-START---\n"
-                    f"{content}\n"
-                    f"---FILE-END---"
+                    f"Verify with read_file before editing.\n"
+                    f"---FILE-START---\n{content}\n---FILE-END---"
                 )
                 new_msgs.append({"role": "user", "content": block})
-                injected += 1
-            _log(f"  📎 Preloaded: {injected} Dateien "
-                 f"({sum(len(v) for v in pre_loaded_files.values())} chars total)")
+            _log(f"  📎 Preloaded: {len(pre_loaded)} Dateien "
+                 f"({sum(len(v) for v in pre_loaded.values())} chars)")
 
-    if not is_first_worker_call:
-        # Continuation: die letzten 3 Worker-Cluster behalten.
-        # Der Worker braucht Kontext-Kontinuität: seine eigenen
-        # read_file-Ergebnisse aus vorherigen Runden. Nur den LETZTEN
-        # Zyklus zu behalten führt zu Amnesie → Re-Read-Loop.
-        MAX_WORKER_CLUSTERS = 3
-        worker_asst_indices = []
+    # Worker-Cluster: bei Continuation die letzten N behalten
+    if is_continuation:
+        worker_clusters = []
         for i, m in enumerate(messages):
             if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls"):
-                worker_asst_indices.append(i)
+                # Prüfen ob es ein Worker assistant ist (nicht Kimi)
+                # Kimi's tc_ids fangen meist mit "call_" an, aber Worker auch.
+                # Einfache Heuristik: nach dem Plan-Output
+                worker_clusters.append(i)
+        MAX_CLUSTERS = 3
+        for start in worker_clusters[-MAX_CLUSTERS:]:
+            new_msgs.append(copy.deepcopy(messages[start]))
+            j = start + 1
+            while j < len(messages) and isinstance(messages[j], dict) and messages[j].get("role") == "tool":
+                new_msgs.append(copy.deepcopy(messages[j]))
+                j += 1
 
-        if worker_asst_indices:
-            for start_idx in worker_asst_indices[-MAX_WORKER_CLUSTERS:]:
-                new_msgs.append(copy.deepcopy(messages[start_idx]))  # assistant
-                j = start_idx + 1
-                while j < len(messages) and isinstance(messages[j], dict) and messages[j].get("role") == "tool":
-                    new_msgs.append(copy.deepcopy(messages[j]))
-                    j += 1
-
-        _log(f"  ✂ Worker-Payload (Plan-Isolat, Continuation): {len(new_msgs)} Messages "
-             f"(System+Task+{min(len(worker_asst_indices), MAX_WORKER_CLUSTERS)} Worker-Cluster, "
-             f"Original {len(messages)} → {len(new_msgs)})")
-    else:
-        _log(f"  ✂ Worker-Payload (Plan-Isolat, First-Call): {len(new_msgs)} Messages "
-             f"(Original {len(messages)} → {len(new_msgs)}, Planner-Verlauf entfernt)")
+    _log(f"  ✂ Worker-Payload: {len(new_msgs)} msgs "
+         f"({'First-Call' if not is_continuation else 'Continuation'}, "
+         f"Original {len(messages)} → {len(new_msgs)})")
 
     messages = new_msgs
 
-    # ══ Tool-Error-Loop-Detection ═══════════════════════════════════
-    # Wenn in der Continuation ALLE Tool-Results Fehler sind, ersetze den
-    # Zyklus durch eine User-Instruktion. Sonst dreht DeepSeek sich im Kreis.
-    tool_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "tool"]
-    error_tool_msgs = [m for m in tool_msgs if "error" in _message_text(m).lower()]
-    if tool_msgs and len(error_tool_msgs) == len(tool_msgs):
-        _log(f"  ⚠ Alle {len(tool_msgs)} Tool-Results sind Fehler → Error-Loop-Prävention")
-        # Schneide NACH der letzten user-msg ab, ersetze Tool-Zyklus durch Instruktion
-        last_user_idx = None
-        for i in range(len(messages) - 1, -1, -1):
-            if isinstance(messages[i], dict) and messages[i].get("role") == "user":
-                last_user_idx = i
-                break
-        error_summary = "; ".join(set(_message_text(m)[:120] for m in tool_msgs))
-        messages = messages[:last_user_idx + 1] if last_user_idx is not None else messages[:1]
-        messages.append({
-            "role": "user",
-            "content": (
-                f"[SYSTEM: Your last {len(tool_msgs)} tool calls all failed validation: {error_summary}]\n"
-                "[SYSTEM: Re-read the tool definitions in the system prompt. "
-                "Required parameters MUST be valid JSON. Try a different tool or simpler arguments.]"
-            ),
-        })
-        _log(f"  🛡️ Tool-Error-Loop gebrochen: {len(tool_msgs)} Fehler durch Instruktion ersetzt")
-
-    # ══ Tool-Result-Truncation: verhindert Token-Bombing ══════════════
-    # Wenn VS Code riesige Tool-Results (z.B. 111KB grep_hits) zurückschickt,
-    # explodiert der Payload. Cap hart auf TOOL_RESULT_CAP chars pro Tool-Msg.
+    # ── 5. Cleanup & Sanitize ───────────────────────────────────
     _cap_tool_results_inplace(messages, "Worker", max_chars=0)
-
-    # ══ image_url-Sanitizer für text-only Models ═════════════════════
-    # DeepSeek V4 wirft sonst 400 ('unknown variant image_url, expected text').
-    # Bedingte Anwendung: nur wenn das Ziel-Model text-only ist.
     effective_model = model_name or body.get("model") or MODEL_NAME
     if _is_text_only_model(effective_model):
         _sanitize_image_urls_inplace(messages, "Worker")
-
-    # ══ reasoning_content von Kimi-Seite entfernen ═══════              
     removed = _strip_kimi_reasoning(messages)
-    # Auch reasoning_content auf Assistants MIT tool_calls strippen
     for m in messages:
         if isinstance(m, dict) and "reasoning_content" in m:
             del m["reasoning_content"]
             removed += 1
     if removed:
-        _log(f"  🧹 Worker-Payload: {removed} reasoning_content-Felder entfernt")
+        _log(f"  🧹 Worker: {removed} reasoning_content entfernt")
 
-    # ══ Loop-Detection: Wiederholte Reads desselben Files? ════════════
-    # Bei Tool-Continuation prüfen, ob der Worker gerade immer wieder
-    # dieselben Files liest (read_file/grep_call mit identischen Args).
-    # Das ist das Symptom der "Plan-Schleife": DeepSeek startet in jeder
-    # neuen Runde von vorn, weil es denkt, der Plan sei neu.
-    is_continuation = not is_first_worker_call
-    read_repeat_count = 0
-    if is_continuation:
-        read_call_files = []
-        for m in messages:
-            if not isinstance(m, dict) or m.get("role") != "assistant":
-                continue
-            for tc in (m.get("tool_calls") or []):
-                if not isinstance(tc, dict):
-                    continue
-                fn = (tc.get("function") or {}).get("name", "")
-                if fn not in ("read_file", "grep_search", "file_search", "list_dir"):
-                    continue
-                try:
-                    args = json.loads((tc.get("function") or {}).get("arguments", "{}") or "{}")
-                except Exception:
-                    args = {}
-                sig_key = (fn, str(args.get("filePath") or args.get("path") or
-                                   args.get("query") or args.get("pattern") or ""))
-                read_call_files.append(sig_key)
-        if read_call_files:
-            uniq = set(read_call_files)
-            read_repeat_count = len(read_call_files) - len(uniq)
-            if read_repeat_count >= 2:
-                _log(f"  ⚠ Worker-Read-Loop erkannt: {read_repeat_count} wiederholte Reads "
-                     f"(von {len(read_call_files)} Read-Calls) → Kompakt-Instruktion injizieren")
-
-    # ══ Plan-binding System-Prompt injecten (JEDEN Round!) ══════
-    # VS Code sendet bei tool_continuation seinen EIGENEN System-Prompt,
-    # nicht unseren modifizierten. Deshalb MUSS der Plan in JEDER Runde
-    # neu in den System-Prompt injiziert werden.
-    # Früherer Kommentar "nicht erneut injecten → Worker denkt neuer
-    # Auftrag" war falsch — der CONTINUATION REMINDER sagt "mid-execution".
+    # ── 6. Plan-Binding in System-Prompt (JEDE Runde) ───────────
     if plan:
-        plan_binding = (
+        contract = (
             "\n\n[PLAN-BINDING CONTRACT]\n"
-            "A senior planner has prepared a plan. Your job: IMPLEMENT IT.\n"
-            "\n"
-            "THIS ROUND: read_file is available. Use it to verify file contents\n"
-            "(pre-loaded files above show PLANNER VERSIONS — files may have changed).\n"
-            "Read the files you need for Step 1, then EDIT them.\n"
-            "NEXT ROUNDS: read_file will be REMOVED — you MUST edit based on what\n"
-            "you read this round.\n"
-            "\n"
-            "Rules:\n"
-            "1. Read files you need for Step 1 NOW. Then edit. Then continue.\n"
-            "2. Execute each plan step IN ORDER.\n"
-            "3. After finishing, output '## Implementation Summary'.\n"
-            "\n"
-            "═══ THE PLAN ═══\n"
-            f"{plan}\n"
-            "═══ END PLAN ═══"
+            "A senior planner (Kimi) explored the codebase and wrote this plan.\n"
+            "Your job: IMPLEMENT IT step by step.\n"
+        )
+        if not is_continuation:
+            contract += (
+                "\nROUND 1: read_file + edit tools available. Verify file contents\n"
+                "against pre-loaded versions above, then edit.\n"
+                "NEXT ROUNDS: read_file removed — you MUST edit from your own reads.\n"
+            )
+        else:
+            contract += (
+                "\nCONTINUATION: read_file REMOVED. You can ONLY edit.\n"
+                "Your file reads from earlier rounds are in the tool results above.\n"
+            )
+        contract += (
+            "\nRules: 1) Execute steps in order. 2) No refactoring. "
+            "3) No new files unless plan says CREATE.\n"
+            f"\n═══ THE PLAN ═══\n{plan}\n═══ END PLAN ═══"
         )
         if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
             existing = str(messages[0].get("content", ""))
-            # Do NOT re-inject if the plan is already in the system prompt
             if "═══ THE PLAN" not in existing:
-                messages[0]["content"] = existing + plan_binding
+                messages[0]["content"] = existing + contract
         else:
-            messages.insert(0, {"role": "system", "content": plan_binding.strip()})
+            messages.insert(0, {"role": "system", "content": contract.strip()})
 
-    # ══ Plan + Memory als User-Messages ══════════════════════════════
-    # BEIM FIRST-CALL: voller Plan als abschließende User-Message → Worker
-    #   weiss, was er tun soll, und startet mit read_file.
-    # BEI CONTINUATION: KEINE Re-Injection des vollen Plans! Sonst Schleife.
-    #   Nur ein kurzer Reminder, wo der Plan liegt, und ein Loop-Breaker
-    #   wenn der Worker wiederholt dieselben Files liest.
-    context_blocks = []
+    # ── 7. User-Message Hint ────────────────────────────────────
+    hint = ""
     if plan and not is_continuation:
-        msg_parts = [
-            "[PRE-LOADED FILES SHOW PLANNER VERSIONS — VERIFY WITH read_file]\n"
-            "The plan is in your system prompt ('═══ THE PLAN ═══').\n"
-            "This is the ONLY round where read_file works. Read files you need for Step 1.\n"
-            "Then EDIT. Future rounds will only allow edit tools."
-        ]
-        context_blocks.append("".join(msg_parts))
-        if memory_context:
-            context_blocks.append(
-                "---\n"
-                "⚠️ BACKGROUND KNOWLEDGE — NOT YOUR CURRENT TASK ⚠️\n"
-                "The following is LEARNED CONTEXT from PRIOR coding sessions.\n"
-                "It may contain patterns, fixes, and conventions relevant to the\n"
-                "current task. Use it for REFERENCE only.\n"
-                "YOUR CURRENT TASK is described in the user message ABOVE this one.\n"
-                "The PLAN you must execute is above this section.\n"
-                "---\n"
-                f"{memory_context}"
-            )
-    elif is_continuation:
-        plan_hint = (
-            "[CONTINUATION — EDIT ONLY]\n"
-            "read_file has been REMOVED. You can ONLY use edit tools now.\n"
-            "Your previous reads are in the tool results above. The plan is in your system prompt.\n"
-            "Pick the NEXT unedited step and execute it NOW."
+        hint = (
+            "[PRE-LOADED FILES ABOVE — read_file available this round]\n"
+            "Plan is in system prompt. Verify files, then start editing Step 1."
         )
-        context_blocks.append(plan_hint)
-    context_str = "\n\n".join(context_blocks)
+    elif is_continuation:
+        hint = (
+            "[CONTINUATION — read_file REMOVED, EDIT ONLY]\n"
+            "Your reads are above. Plan is in system prompt. Edit the next step."
+        )
+    if hint:
+        messages.append({"role": "user", "content": hint})
 
-    if context_str:
-        messages.append({"role": "user", "content": context_str})
-
-    # ALLE Messages behalten - kein Compact! Das System-Prompt mit Tool-Defs bleibt erhalten.
     payload["messages"] = messages
     payload = _clean_payload(payload, keep_tools=True)
 
-    # ══ Worker-Tools: Round 1 hat read_file, Round 2+ NUR Edit ══
-    # Runde 1: read_file + edit tools → Worker verifiziert Dateien
-    # Runde 2+: read_file ENTFERNT → Worker MUSS editieren (seine
-    # Round-1-Reads sind in den Continuation-Clustern).
+    # ── 8. Tools-Filter: Continuation = Edit-Only ───────────────
     if is_continuation and "tools" in payload:
         payload["tools"] = _filter_worker_edit_only_tools(payload["tools"])
         if not payload["tools"]:
@@ -4541,7 +4386,7 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             worker_payload = _build_worker_payload(
                 body, plan, "",
                 plan_path=_PLANNER_SESSIONS.get(session_hash, {}).get("plan_path"),
-                force_first_call=True,  # Session gerade active→done
+                is_first_worker_call=True,
             )
             worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
             results.append(worker_result)
@@ -4813,6 +4658,7 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         worker_payload = _build_worker_payload(
             body, plan, memory_context,
             plan_path=_PLANNER_SESSIONS.get(session_hash, {}).get("plan_path"),
+            is_first_worker_call=True,
         )
         worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
         results.append(worker_result)
