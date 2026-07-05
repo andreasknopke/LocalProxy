@@ -4402,7 +4402,6 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         pc = planner_result.get("content", "")
         if _content_contains_plan(pc) and len(pc) > 200:
             _log(f"  🎉 Plan im Content erkannt ({len(pc)} chars) → Session done, Plan persistiert")
-            # Files IN den Plan einbetten — nächster Request hat sie dann im System-Prompt
             pc = _embed_files_into_plan(pc, body.get("messages", []))
             plan_path = _save_plan_to_file(session_hash, pc, query=body.get("messages", [{}])[0].get("content", ""))
             _PLANNER_SESSIONS[session_hash] = {
@@ -4410,9 +4409,24 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
                 "plan": pc, "pflags": planner_flags,
                 "plan_path": str(plan_path) if plan_path else None,
             }
+            # Wenn Kimi noch tool_calls hat (memory), diese durchreichen.
+            # Der Plan ist schon gespeichert, Worker startet beim nächsten Request.
+            if planner_result.get("tool_calls"):
+                _log("  🔧 Cloud-Planner fordert weitere Tools → Durchreiche an VS Code")
+                await client.aclose()
+                return {
+                    "combined_response_text": planner_result.get("content", ""),
+                    "results": [planner_result],
+                    "duration_seconds": time.perf_counter() - start_time,
+                }
+            # Keine weiteren tool_calls → Plan ist final, Worker starten
+            plan = pc
+            plan_already_embedded = True
+        else:
+            plan_already_embedded = False
 
-        if planner_result.get("tool_calls"):
-            # Kimi will weitere Tools → Tool-Calls an VS Code weiterleiten
+        if planner_result.get("tool_calls") and not plan_already_embedded:
+            # Kimi will Tools (aber noch kein Plan) → an VS Code
             _log("  🔧 Cloud-Planner-Agent fordert weitere Tools → Durchreiche an VS Code")
             await client.aclose()
             return {
@@ -4421,18 +4435,18 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
                 "duration_seconds": time.perf_counter() - start_time,
             }
 
-        # Kimi hat fertig → Plan extrahieren
-        plan = pc if planner_result.get("status") == "ok" else ""
-        if plan:
-            _log(f"  📝 Cloud-Planner hat Plan erstellt ({len(plan)} chars)")
-            # Files in den Plan einbetten — Worker hat sie dann direkt im System-Prompt
-            plan = _embed_files_into_plan(plan, body.get("messages", []))
-            plan_path = _save_plan_to_file(session_hash, plan, query=body.get("messages", [{}])[0].get("content", ""))
-            _PLANNER_SESSIONS[session_hash] = {
-                "state": "done", "ts": time.time(), "worker_rounds": 0,
-                "plan": plan, "pflags": planner_flags,
-                "plan_path": str(plan_path) if plan_path else None,
-            }
+        # Plan aus Content holen (falls nicht schon über content_contains_plan gesetzt)
+        if not plan_already_embedded:
+            plan = pc if planner_result.get("status") == "ok" else ""
+            if plan:
+                _log(f"  📝 Cloud-Planner hat Plan erstellt ({len(plan)} chars)")
+                plan = _embed_files_into_plan(plan, body.get("messages", []))
+                plan_path = _save_plan_to_file(session_hash, plan, query=body.get("messages", [{}])[0].get("content", ""))
+                _PLANNER_SESSIONS[session_hash] = {
+                    "state": "done", "ts": time.time(), "worker_rounds": 0,
+                    "plan": plan, "pflags": planner_flags,
+                    "plan_path": str(plan_path) if plan_path else None,
+                }
             progress.append(_format_chat_progress_message(
                 "phase1_plan_ready",
                 f"🧠 Cloud-Planner (Kimi): Plan erstellt ({len(plan)} chars).",
