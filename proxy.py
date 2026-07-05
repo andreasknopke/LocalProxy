@@ -4104,6 +4104,41 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         force_review = force_review or planner_flags.get("force_review", False)
         bypass_worker = bypass_worker or planner_flags.get("bypass_worker", False)
 
+        # ══ Plan-Extraktion aus memory-Tool-Result ════════════════════
+        # Nachdem der Planner seinen Plan via 'memory' Tool persistiert hat,
+        # brauchen wir keinen weiteren Planner-Call – direkt zum Worker.
+        plan_from_memory = None
+        for m in reversed(body.get("messages", [])):
+            if isinstance(m, dict) and m.get("role") == "tool":
+                content = _message_text(m)
+                if content and ("## Plan:" in content or "## plan:" in content.lower()):
+                    plan_from_memory = content
+                    break
+        if plan_from_memory and len(plan_from_memory) > 200:
+            _log(f"  🎉 Plan aus memory-Tool extrahiert ({len(plan_from_memory)} chars) → Worker starten")
+            _PLANNER_SESSIONS[session_hash] = {
+                "state": "done", "ts": time.time(),
+                "plan": plan_from_memory, "pflags": planner_flags,
+            }
+            worker_payload = _build_worker_payload(body, plan_from_memory, "")
+            worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
+            results.append(worker_result)
+            worker_response = worker_result.get("content", "")
+            if worker_result.get("tool_calls") or _contains_tool_calls(worker_response):
+                _log("  🔧 Worker enthält Tool-Calls → Durchreiche an Client")
+                await client.aclose()
+                return {
+                    "combined_response_text": worker_response,
+                    "results": results,
+                    "duration_seconds": time.perf_counter() - start_time,
+                }
+            await client.aclose()
+            return {
+                "combined_response_text": worker_response,
+                "results": results,
+                "duration_seconds": time.perf_counter() - start_time,
+            }
+
         # Loop-Detection: statt blinden Counter, letzte Tool-Requests tracken.
         # Die Tool-Resultate (vorige Runde) sind in der History (letzter 'tool'-Eintrag).
         # Wir extrahieren die vorigen tool_calls aus der Message-History.
