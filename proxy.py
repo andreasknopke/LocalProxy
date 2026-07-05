@@ -209,7 +209,10 @@ _PLANNER_SESSIONS: Dict[str, Dict[str, Any]] = {}
 #      wenn Kimi völlig außer Kontrolle gerät.
 #
 # Detector-Historie wird beim Start jeder neuen Planner-Session zurückgesetzt.
-MAX_PLANNER_ITERATIONS = 60       # Soft-Tripwire (ehemals 8, jetzt Panik-Schutz)
+MAX_PLANNER_ITERATIONS = 15       # Aider-Äquivalent: Architect hat begrenzten Kontext.
+                                  # Mit dem <exploration_budget> von 5–8 Reads + ein paar
+                                  # Clarifying/Grep-Calls sind 15 Runden großzügig.
+                                  # Danach: harte Plan-Ausgabe (kein weiteres Tool-Ping-Pong).
 PLANNER_REPEAT_HARD_STOP = 3      # Bei N identischen (name,args)-Wiederholungen in Folge → Plan erzwingen
                                   # (3 statt 2: read(x)→read(x) kann legitim sein; 3x = echter Loop)
 PLANNER_WARN_AFTER = 12           # Ab Iteration M: sanfter System-Hinweis "bald plan ausgeben"
@@ -3146,6 +3149,16 @@ async def _call_cloud_planner_agent(
         "into a comprehensive plan. This iterative approach catches edge cases "
         "and non-obvious requirements BEFORE implementation begins.\n\n"
         "Your SOLE responsibility is planning. NEVER start implementation.\n\n"
+        "<exploration_budget>\n"
+        "DISCIPLINE: Aim for AT MOST 5–8 read tool calls before producing the plan.\n"
+        "The editor model (DeepSeek) will read the relevant files ITSELF before "
+        "editing — you do NOT need to dump every line of every file into your context.\n"
+        "DO NOT read the same file twice. DO NOT chase every reference; capture the\n"
+        "top-level shape of the change (entry points, signatures, where they live)\n"
+        "and move to the plan. Reference files by path + symbol name, not by quoted\n"
+        "source. If you find yourself reading a 6th+ file, STOP and write the plan\n"
+        "with what you already know.\n"
+        "</exploration_budget>\n\n"
         "<rules>\n"
         "- STOP if you consider running file editing tools — plans are for "
         "others to execute. The only write tool you have is 'memory' for persisting plans.\n"
@@ -3159,7 +3172,9 @@ async def _call_cloud_planner_agent(
         "Explore analogous existing features to use as implementation templates. "
         "When the task spans multiple independent areas, launch tools in parallel "
         "to speed up discovery.\n"
-        "Update your findings via 'memory'.\n\n"
+        "KEEP IT TIGHT: the goal is to identify the touch points and the shape of\n"
+        "the change, not to read every related line. 3–6 well-chosen reads usually\n"
+        "suffice. Update your findings via 'memory'.\n\n"
         "## 2. Alignment\n"
         "If research reveals major ambiguities or you need to validate assumptions:\n"
         "- Use 'vscode_askQuestions' to clarify intent with the user.\n"
@@ -3219,8 +3234,18 @@ async def _call_cloud_planner_agent(
         # ══ Planner-Cont Window: System + Task + letzte N Messages ══
         # Kein Sliding Window mehr — das zerstörte Tool-Integrität
         # (verwaiste tc_ids → 400 'tool_call_id not found').
-        # Stattdessen: immer System + Original-Task + letzte 43 Msg behalten.
-        # Tool-Results sind auf 8000 chars gekappt → selbst 50 Msg sind <400KB.
+        # ══ Window mit Tool-Cluster-Atomicität ═════════════════════════
+        # Vorheriger Bug: keep = keep[-(MAX_PLANNER_WINDOW - 2):] schnitt
+        # mitten durch einen assistant(tool_calls) → tool1..toolN Cluster.
+        # Folge: isolierten tool-Nachrichten ohne Elter, die zu user gemacht
+        # wurden → 4-5 user-Msgs am Stück im Payload → Moonshot hat sich bei
+        # >100KB mit Strukturfehlern自己和 (90s+ timeout, keine Antwort).
+        #
+        # NEU: Cluster-aware Cut. Ein 'Cluster' = assistant(tool_calls) +
+        # all seine tool-Ergebnisse. Wir schneiden NUR an Cluster-Grenzen
+        # und NIE mittendrin. Zusätzlich: User-Fragmente zwischen Clustern
+        # VERWERFEN (das sind Proxy/VS Code-Injektionen, keine echte User-
+        # Eingaben - die echte User-Aufgabe steht in first_user_msg).
         system_msg = messages[0] if messages and messages[0].get("role") == "system" else None
         first_user_msg = None
         for m in messages:
@@ -3229,17 +3254,71 @@ async def _call_cloud_planner_agent(
                     first_user_msg = m
                     break
 
-        MAX_PLANNER_WINDOW = 45
+        # Aider-Äquivalent: Architect bekommt eine begrenzte Kontextgröße
+        # (dort via repo-map), nicht 30+ Tool-Resultate. Bewiesenermaßen
+        # lief Runde 11 (15 msgs, 11.4s) noch, Runde 12 (45 msgs, 160KB)
+        # nicht mehr → Moonshot-Timeout. 22 = System+Task+ca. 9 Cluster.
+        MAX_PLANNER_WINDOW = 22
+
+        def _build_clusters(msgs):
+            """Gruppiert Messages in Cluster: assistant(tool_calls)+alle tools
+            danach bis zur nächsten nicht-tool-Message. Andere Messages
+            (assistant-ohne-tool_calls, user, system) sind eigenständige
+            Cluster."""
+            clusters = []
+            i = 0
+            while i < len(msgs):
+                m = msgs[i]
+                if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls"):
+                    cluster = [m]
+                    j = i + 1
+                    while j < len(msgs) and msgs[j].get("role") == "tool":
+                        cluster.append(msgs[j])
+                        j += 1
+                    clusters.append(cluster)
+                    i = j
+                else:
+                    clusters.append([m])
+                    i += 1
+            return clusters
+
         if len(messages) > MAX_PLANNER_WINDOW:
-            keep = [m for m in messages if m is not system_msg and m is not first_user_msg]
-            keep = keep[-(MAX_PLANNER_WINDOW - 2):]
+            # Cluster bilden, system/first_user extrahieren
+            clusters_raw = _build_clusters(messages)
+
+            # Behalte nur Cluster, die NICHT system_msg oder first_user_msg sind
+            keep_clusters = []
+            for c in clusters_raw:
+                # 1-elementiger Cluster mit system/first_user → skip
+                if len(c) == 1 and c[0] is system_msg:
+                    continue
+                if len(c) == 1 and c[0] is first_user_msg:
+                    continue
+                keep_clusters.append(c)
+
+            # Solange die Gesamt-Message-Zahl zu groß ist: älteste Cluster
+            # wegwerfen (FIFO), bis unter Limit ODER nur noch wenige übrig.
+            def _cluster_total(clist):
+                return sum(len(c) for c in clist)
+
+            # System + first_user brauchen 2 Slots
+            available = MAX_PLANNER_WINDOW - 2
+            while _cluster_total(keep_clusters) > available and len(keep_clusters) > 2:
+                dropped = keep_clusters.pop(0)
+                _log(f"  🗜 Planner-Cont: Cluster gedropped "
+                     f"({len(dropped)} msgs, started role={dropped[0].get('role')})")
+
+            # Re- zusammensetzen in korrekter Reihenfolge
             result = []
             if system_msg:
-                result.append({"role": "system", "content": str(system_msg.get("content", "")) + "\n\n" + planner_mode_instructions})
+                result.append({"role": "system",
+                               "content": str(system_msg.get("content", "")) + "\n\n" + planner_mode_instructions})
             if first_user_msg:
                 result.append(first_user_msg)
-            result.extend(keep)
-            _log(f"  🗜 Planner-Cont: {len(messages)} → {len(result)} (System + Task + letzte)")
+            for c in keep_clusters:
+                result.extend(c)
+            _log(f"  🗜 Planner-Cont: {len(messages)} → {len(result)} "
+                 f"(System + Task + {len(keep_clusters)} Tool-Cluster, atomar geschnitten)")
             messages = result
         else:
             if messages and messages[0].get("role") == "system":
@@ -3274,7 +3353,11 @@ async def _call_cloud_planner_agent(
         if orphaned:
             _log(f"  🧹 Planner-Cont: {orphaned} verwaiste tool→user konvertiert")
 
-        _cap_tool_results_inplace(messages, "Planner-Cont", max_chars=0)
+        # Tool-Result-Cap bewusst ENTFERNT — siehe Aider Architect/Editor.
+        # Der Architect braucht vollen Code-Sicht, um valide Pläne zu
+        # schreiben. Statt Capping wird die Window-Size (MAX_PLANNER_WINDOW)
+        # verkleinert — älteste Cluster fallen ganz raus, die verbleibenden
+        # Tools liefern unverfälschte Dateiinhalte.
         payload["messages"] = messages
     else:
         # ══ RUNDE 1: Copilot-style plan mode ══
@@ -3364,10 +3447,21 @@ async def _call_cloud_planner_agent(
                 _log(f"  🧹 Loop-Detection: {orphaned} tool-Nachrichten → user konvertiert (tc_id entfernt)")
             if cur_messages and isinstance(cur_messages[-1], dict) and cur_messages[-1].get("role") == "user":
                 force_msg = (
-                    "\n\n[SYSTEM: Du scheinst in einer Schleife zu sein "
-                    f"({loop_reason}). Gib JETZT deinen finalen Ausfuehrungs-Plan aus. "
-                    "KEINE weiteren tool_calls. Format: '## Plan: <title>' + "
-                    "numbered steps. Max 4000 chars.]"
+                    "\n\n[SYSTEM: Du bist über die Explorationsschwelle gekommen "
+                    f"({loop_reason}). Du hast GENUG Code-Kontext. Gib JETZT deinen "
+                    "finalen Ausfuehrungs-Plan aus.\n"
+                    "KEINE weiteren tool_calls. Der Editor liest die Dateien SELBST.\n"
+                    "Pflicht-Format:\n"
+                    "  ## Plan: <2-6 word title>\n"
+                    "  <TL;DR: was + warum, 2 Sätze>\n"
+                    "  **Steps**\n"
+                    "  1. < konkrete Anweisung mit Dateipfad + Symbolname >\n"
+                    "  2. ...\n"
+                    "  **Relevant files**\n"
+                    "  - `<full/path>` — <was ändern>\n"
+                    "  **Verification**\n"
+                    "  1. <wie prüfen>\n"
+                    "Schreibe nur den Plan, nichts davor/danach.]"
                 )
                 user_content = cur_messages[-1].get("content", "")
                 if isinstance(user_content, str):
