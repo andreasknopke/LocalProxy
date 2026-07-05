@@ -4516,42 +4516,11 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             }
 
     elif session and session.get("state") == "done":
-        plan = session.get("plan", "")
-        # Alten Plan (ohne File-Inhalte) invalidieren
-        if plan and "## PLANNER FILE CONTENTS" not in plan:
-            _log("  🗑 Alter Plan (vor _embed_files_into_plan) → invalidiert, Planner-Neustart")
-            del _PLANNER_SESSIONS[session_hash]
-            # Fall-through zum Standard-Pfad unten (Planner wird neu gestartet)
-        else:
-            # ✅ Valider Plan MIT Files → Worker ausführen
-            plan_path = session.get("plan_path")
-            if plan and not plan_path:
-                plan_path_obj = _save_plan_to_file(
-                    session_hash, plan,
-                    query=body.get("messages", [{}])[0].get("content", ""),
-                )
-                plan_path = str(plan_path_obj) if plan_path_obj else None
-                session["plan_path"] = plan_path
-            worker_round = int(session.get("worker_rounds", 0))
-            worker_payload = _build_worker_payload(body, plan, "", plan_path=plan_path,
-                                                    is_first_worker_call=(worker_round == 0))
-            session["worker_rounds"] = worker_round + 1
-            worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
-
-            results.append(worker_result)
-            worker_response = worker_result.get("content", "")
-
-            # Wenn der Worker Tool-Calls zurückgibt, Session behalten, damit
-            # der nächste Request (tool_cont) den Plan-Kontext wiederfindet.
-            if not (worker_result.get("tool_calls") or _contains_tool_calls(worker_response)):
-                del _PLANNER_SESSIONS[session_hash]
-            await client.aclose()
-            _hindsight.retain(body, worker_response)
-            return {
-                "combined_response_text": worker_response,
-                "results": results,
-                "duration_seconds": time.perf_counter() - start_time,
-            }
+        # ══ ALLE done-Sessions löschen — Planner läuft immer neu ══
+        # Session-Caching später wieder einbauen, wenn stabil.
+        _log("  🗑 Done-Session gelöscht → Planner-Neustart")
+        del _PLANNER_SESSIONS[session_hash]
+        # Fall-through zum Standard/Force-Planning-Pfad unten
 
     # ═══════════════════════════════════════════════════════════════════
     # STANDARD / FORCE-PLANNING: Erster Request
