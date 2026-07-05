@@ -1951,6 +1951,7 @@ def _build_worker_payload(
     max_tokens: Optional[int] = None,
     plan_path: Optional[str] = None,
     is_first_worker_call: bool = False,
+    preloaded_files: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Gemini/Aider Clean-Slate Worker-Payload.
 
@@ -1958,7 +1959,7 @@ def _build_worker_payload(
       1. System-Messages (Tool-Definitionen)
       2. Plan-Binding-Contract + Plan (im System-Prompt, jede Runde)
       3. User-Task (originale Aufgabenstellung)
-      4. Pre-Loaded Files (nur Round 1 — Kimis read_file-Ergebnisse)
+      4. Pre-Loaded Files (nur Round 1 — vom Caller übergeben)
       5. Worker-Cluster (Continuation — eigene Tool-Results)
 
     Erste Runde: read_file + edit tools → Worker verifiziert Dateien
@@ -1995,9 +1996,11 @@ def _build_worker_payload(
     if user_task:
         new_msgs.append(user_task)
 
-    # Pre-Loaded Files: NUR beim ersten Worker-Call
+    # Pre-Loaded Files: NUR beim ersten Worker-Call.
+    # preloaded_files vom Caller (aus Session gecached) haben Vorrang.
+    # Fallback: aus Messages extrahieren (wenn im gleichen Request).
     if plan and not is_continuation:
-        pre_loaded = _extract_planner_file_contents(messages)
+        pre_loaded = preloaded_files or _extract_planner_file_contents(messages)
         if pre_loaded:
             for fp, content in pre_loaded.items():
                 block = (
@@ -2007,7 +2010,8 @@ def _build_worker_payload(
                 )
                 new_msgs.append({"role": "user", "content": block})
             _log(f"  📎 Preloaded: {len(pre_loaded)} Dateien "
-                 f"({sum(len(v) for v in pre_loaded.values())} chars)")
+                 f"(source={'session' if preloaded_files else 'messages'}, "
+                 f"{sum(len(v) for v in pre_loaded.values())} chars)")
 
     # Worker-Cluster: bei Continuation die letzten N behalten
     if is_continuation:
@@ -4343,10 +4347,16 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         if _content_contains_plan(pc) and len(pc) > 200:
             _log(f"  🎉 Plan im Content erkannt ({len(pc)} chars) → Session done, Plan persistiert")
             plan_path = _save_plan_to_file(session_hash, pc, query=body.get("messages", [{}])[0].get("content", ""))
+            # Planner's read_file-Ergebnisse JETZT extrahieren und cachen –
+            # im nächsten Request (session_state=done) ist der Planner-Body
+            # nicht mehr verfügbar.
+            planner_files = _extract_planner_file_contents(body.get("messages", []))
+            _log(f"  📎 Planner-Files gecached: {len(planner_files)} Dateien "
+                 f"({sum(len(v) for v in planner_files.values())} chars)")
             _PLANNER_SESSIONS[session_hash] = {
-                "state": "done", "ts": time.time(), "worker_rounds": 0,
-                "plan": pc, "pflags": planner_flags,
+                "state": "done", "ts": time.time(), "worker_rounds": 0, "planner_files": {},"plan": pc, "pflags": planner_flags,
                 "plan_path": str(plan_path) if plan_path else None,
+                "planner_files": planner_files,
             }
 
         if planner_result.get("tool_calls"):
@@ -4366,8 +4376,7 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             # Plan in dak-dat File persistieren (Codespace-Copilot-Stil)
             plan_path = _save_plan_to_file(session_hash, plan, query=body.get("messages", [{}])[0].get("content", ""))
             _PLANNER_SESSIONS[session_hash] = {
-                "state": "done", "ts": time.time(), "worker_rounds": 0,
-                "plan": plan, "pflags": planner_flags,
+                "state": "done", "ts": time.time(), "worker_rounds": 0, "planner_files": {},"plan": plan, "pflags": planner_flags,
                 "plan_path": str(plan_path) if plan_path else None,
             }
             progress.append(_format_chat_progress_message(
@@ -4469,7 +4478,8 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
                 session["plan_path"] = plan_path
             worker_round = int(session.get("worker_rounds", 0))
             worker_payload = _build_worker_payload(body, plan, "", plan_path=plan_path,
-                                                    is_first_worker_call=(worker_round == 0))
+                                                    is_first_worker_call=(worker_round == 0),
+                                                    preloaded_files=session.get("planner_files"))
             session["worker_rounds"] = worker_round + 1
             worker_result = await _call_vllm_with_fallback(client, worker_payload, "worker")
         else:
@@ -4540,10 +4550,12 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         if plan_detected:
             _log(f"  🎉 Plan im Content erkannt ({len(pc)} chars) → Session done, Plan persistiert")
             plan_path = _save_plan_to_file(session_hash, pc, query=body.get("messages", [{}])[0].get("content", ""))
+            planner_files = _extract_planner_file_contents(body.get("messages", []))
+            _log(f"  📎 Planner-Files gecached: {len(planner_files)} Dateien")
             _PLANNER_SESSIONS[session_hash] = {
-                "state": "done", "ts": time.time(), "worker_rounds": 0,
-                "plan": pc, "pflags": {"force_review": force_review, "bypass_worker": bypass_worker},
+                "state": "done", "ts": time.time(), "worker_rounds": 0, "planner_files": {},"plan": pc, "pflags": {"force_review": force_review, "bypass_worker": bypass_worker},
                 "plan_path": str(plan_path) if plan_path else None,
+                "planner_files": planner_files,
             }
 
         if planner_result.get("tool_calls") and not plan_detected:
@@ -4578,8 +4590,7 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
             # Plan als Datei persistieren
             plan_path = _save_plan_to_file(session_hash, plan, query=body.get("messages", [{}])[0].get("content", ""))
             _PLANNER_SESSIONS[session_hash] = {
-                "state": "done", "ts": time.time(), "worker_rounds": 0,
-                "plan": plan, "pflags": planner_flags,
+                "state": "done", "ts": time.time(), "worker_rounds": 0, "planner_files": {},"plan": plan, "pflags": planner_flags,
                 "plan_path": str(plan_path) if plan_path else None,
             }
             progress.append(_format_chat_progress_message(
@@ -4610,8 +4621,7 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
         if plan_status == "ok":
             plan_path = _save_plan_to_file(session_hash, plan, query=body.get("messages", [{}])[0].get("content", ""))
             _PLANNER_SESSIONS[session_hash] = {
-                "state": "done", "ts": time.time(), "worker_rounds": 0,
-                "plan": plan,
+                "state": "done", "ts": time.time(), "worker_rounds": 0, "planner_files": {},"plan": plan,
                 "plan_path": str(plan_path) if plan_path else None,
             }
             progress.append(_format_chat_progress_message(
