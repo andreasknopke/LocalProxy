@@ -2107,13 +2107,13 @@ def _build_worker_payload(
                 _log(f"  ⚠ Worker-Read-Loop erkannt: {read_repeat_count} wiederholte Reads "
                      f"(von {len(read_call_files)} Read-Calls) → Kompakt-Instruktion injizieren")
 
-    # ══ Plan-binding System-Prompt injecten (NUR beim FIRST-CALL) ════
-    # Bei Continuation hat der Worker bereits Tool-Calls gemacht und der
-    # Plan-Binding-Vertrag steht schon im Original-System-Message (der beim
-    # ersten Worker-Call hinzugefügt wurde und via VS-Code-Tool-Loop
-    # durchgereicht wird). Wir injizieren den Vertrag NICHT erneut — sonst
-    # denkt der Worker fälschlich "neuer Auftrag" und fängt von vorn an.
-    if plan and not is_continuation:
+    # ══ Plan-binding System-Prompt injecten (JEDEN Round!) ══════
+    # VS Code sendet bei tool_continuation seinen EIGENEN System-Prompt,
+    # nicht unseren modifizierten. Deshalb MUSS der Plan in JEDER Runde
+    # neu in den System-Prompt injiziert werden.
+    # Früherer Kommentar "nicht erneut injecten → Worker denkt neuer
+    # Auftrag" war falsch — der CONTINUATION REMINDER sagt "mid-execution".
+    if plan:
         plan_binding = (
             "\n\n[PLAN-BINDING CONTRACT — READ CAREFULLY]\n"
             "A senior planner has prepared a strategic plan for you. Your job: IMPLEMENT IT.\n"
@@ -2128,13 +2128,15 @@ def _build_worker_payload(
             "5. Do NOT create new files unless the plan explicitly says 'CREATE <path>'.\n"
             "6. After finishing, output '## Implementation Summary' with each step ✓/⚠/✗.\n"
             "\n"
-            "═══ THE PLAN (survives all rounds — always visible) ═══\n"
+            "═══ THE PLAN (always visible in every round) ═══\n"
             f"{plan}\n"
             "═══ END PLAN ═══"
         )
         if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
             existing = str(messages[0].get("content", ""))
-            messages[0]["content"] = existing + plan_binding
+            # Do NOT re-inject if the plan is already in the system prompt
+            if "═══ THE PLAN" not in existing:
+                messages[0]["content"] = existing + plan_binding
         else:
             messages.insert(0, {"role": "system", "content": plan_binding.strip()})
 
@@ -2167,22 +2169,23 @@ def _build_worker_payload(
     elif is_continuation:
         plan_hint = (
             "[CONTINUATION REMINDER — THE PLAN IS IN YOUR SYSTEM PROMPT]\n"
-            "You are mid-execution. Look at '═══ THE PLAN ═══' in the system prompt above.\n"
-            "Pick the NEXT unedited step and execute it now."
+            "You are mid-execution. The complete plan is at '═══ THE PLAN ═══'\n"
+            "in your system prompt above. Read it there — do NOT use the memory tool.\n"
+            "The code you need is in [PRE-LOADED FILE] blocks above.\n"
+            "Pick the NEXT unedited step and execute it NOW using replace_string_in_file."
         )
         if read_repeat_count >= 2:
             plan_hint += (
                 "\n\n⚠ LOOP ALERT: You have read the same files multiple times. "
-                "STOP re-reading. The file contents are ALREADY in your previous "
-                "tool results above.\n"
+                "STOP reading files. STOP reading memory. "
+                "The file contents are ALREADY in your context (see [PRE-LOADED FILE] blocks).\n"
                 "Pick the NEXT plan step you have NOT started yet and EXECUTE "
-                "the edit now using replace_string_in_file / multi_replace_string_in_file.\n"
-                "DO NOT start over. The plan has NOT changed."
+                "the edit now using replace_string_in_file / multi_replace_string_in_file."
             )
         else:
             plan_hint += (
-                " Use the file contents already in your context. "
-                "DO NOT read plan files or memory — the plan is in your system prompt."
+                " DO NOT use the memory tool — the plan is in your system prompt. "
+                "DO NOT re-read files — their contents are in [PRE-LOADED FILE] blocks above."
             )
         context_blocks.append(plan_hint)
     context_str = "\n\n".join(context_blocks)
