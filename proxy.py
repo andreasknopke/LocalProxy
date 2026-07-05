@@ -1839,6 +1839,57 @@ def _sanitize_image_urls_inplace(messages: List[Dict[str, Any]], label: str = "P
     return removed
 
 
+def _extract_planner_file_contents(messages: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Aider-Äquivalent zu get_chat_files_messages(): Scannt die Planner-
+    Conversation nach read_file-Ergebnissen und extrahiert sie als Datei-
+    Inhalt-Map. Diese werden dem Worker als Pre-Loaded-Kontext injiziert,
+    sodass er NICHT selbst read_file aufrufen muss (verhindert die
+    klassische "Worker liest immer wieder dieselben Files"-Schleife).
+    
+    Returns: {filePath: content, ...}
+    """
+    # 1. Sammle alle tool_call_ids von assistant-Nachrichten mit read_file
+    read_tc_ids: Dict[str, str] = {}  # tc_id → filePath
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        for tc in (m.get("tool_calls") or []):
+            if not isinstance(tc, dict):
+                continue
+            fn = (tc.get("function") or {}).get("name", "")
+            if fn not in ("read_file",):
+                continue
+            tc_id = tc.get("id", "")
+            if not tc_id:
+                continue
+            try:
+                args = json.loads((tc.get("function") or {}).get("arguments", "{}") or "{}")
+            except Exception:
+                continue
+            fp = args.get("filePath") or args.get("path") or ""
+            if fp:
+                read_tc_ids[tc_id] = fp
+
+    if not read_tc_ids:
+        return {}
+
+    # 2. Finde die tool-result messages mit passenden tool_call_ids
+    file_contents: Dict[str, str] = {}
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") != "tool":
+            continue
+        tc_id = m.get("tool_call_id", "")
+        if tc_id not in read_tc_ids:
+            continue
+        fp = read_tc_ids[tc_id]
+        content = m.get("content", "")
+        if isinstance(content, str) and content.strip():
+            # Nimm den neuesten Read pro File (letzter gewinnt)
+            file_contents[fp] = content
+
+    return file_contents
+
+
 def _build_worker_payload(
     body: Dict[str, Any],
     plan: str,
@@ -1921,7 +1972,7 @@ def _build_worker_payload(
 
     has_tool_msgs = any(isinstance(m, dict) and m.get("role") == "tool" for m in messages)
 
-    # Baue Payload: System + Original-User (+ Continuation falls vorhanden)
+    # Baue Payload: System + Original-User
     new_msgs = list(system_msgs)
     if original_user_msg is not None:
         new_msgs.append(original_user_msg)
@@ -1948,8 +1999,45 @@ def _build_worker_payload(
         _log(f"  ✂ Worker-Payload (Plan-Isolat, Continuation): {len(new_msgs)} Messages "
              f"(Original {len(messages)} → {len(new_msgs)}, Planner-Verlauf entfernt)")
     else:
+        # ══ AIDER-PATTERN: First-Call mit Pre-Loaded Files ═════════
+        # Wie Aider's get_chat_files_messages(): extrahiere die vom
+        # Planner gelesenen Dateiinhalte und injiziere sie DIREKT in den
+        # Worker-Kontext. Der Worker sieht den Code sofort und muss KEIN
+        # read_file mehr aufrufen → keine "Worker liest immer wieder
+        # dieselben Files"-Schleife.
+        #
+        # Dies ist der entscheidende Unterschied zum alten Pattern:
+        #   ALT: Worker bekam nur Plan → musste selbst lesen → Loop
+        #   NEU: Worker bekommt Plan + Code → editiert direkt
         _log(f"  ✂ Worker-Payload (Plan-Isolat, First-Call): {len(new_msgs)} Messages "
              f"(Original {len(messages)} → {len(new_msgs)}, Planner-Verlauf entfernt)")
+
+        if plan:
+            # Extrahiere die Planner's read_file-Ergebnisse
+            file_contents = _extract_planner_file_contents(messages)
+            if file_contents:
+                # Injiiziere jede Datei als [PRE-LOADED FILE] User-Message
+                # (Entspricht Aider's "I have added these files to the chat")
+                injected = 0
+                for fp, content in file_contents.items():
+                    # Kürze sehr große Dateien auf ~6000 chars für Payload-Größe
+                    truncated = ""
+                    if len(content) > 6000:
+                        truncated = f"\n...[TRUNCATED: {len(content) - 6000} chars omitted]"
+                        content = content[:6000]
+                    block = (
+                        f"[PRE-LOADED FILE: {fp}]\n"
+                        f"This file was read by the planner. Its contents are current.\n"
+                        f"Do NOT re-read this file — edit it directly.\n"
+                        f"---FILE-START---\n"
+                        f"{content}"
+                        f"{truncated}\n"
+                        f"---FILE-END---"
+                    )
+                    new_msgs.append({"role": "user", "content": block})
+                    injected += 1
+                _log(f"  📎 Aider-Preload: {injected} Dateien als [PRE-LOADED FILE] injiziert "
+                     f"({sum(len(v) for v in file_contents.values())} chars total)")
 
     messages = new_msgs
 
@@ -2042,11 +2130,12 @@ def _build_worker_payload(
         plan_binding = (
             "\n\n[PLAN-BINDING CONTRACT — READ CAREFULLY]\n"
             "A senior planner has prepared a strategic plan for you. Your job: IMPLEMENT IT.\n"
-            "IMPORTANT: You have NO code context. The planner's tool results have been removed.\n"
-            "You MUST read the relevant files yourself before editing.\n"
+            "IMPORTANT: Code context is PRE-LOADED in [PRE-LOADED FILE] messages above.\n"
+            "You do NOT need to read files — the code is already in your context.\n"
             "Rules:\n"
             "1. Read the CLOUD EXECUTION PLAN at the bottom of this conversation FIRST.\n"
-            "2. Before any edit, read the target file with your file-reading tool.\n"
+            "2. Edit files directly — their contents are in [PRE-LOADED FILE] blocks above.\n"
+            "   Only read a file if it was NOT pre-loaded AND the plan references it.\n"
             "3. Execute each plan step IN ORDER.\n"
             "4. DO NOT refactor, add features, or 'improve' anything not in the plan.\n"
             "5. If a step references the wrong file/line: read to find the real location, then proceed.\n"
@@ -2070,8 +2159,8 @@ def _build_worker_payload(
         context_blocks.append(
             "[CLOUD EXECUTION PLAN — FOLLOW EXACTLY]\n"
             "This plan was authored by a senior planner who had full codebase access.\n"
-            "You do not need to re-plan. Read it, then execute it step by step.\n"
-            "Use your own read_file/grep tools to see the code before each edit.\n\n"
+            "The files you need are PRE-LOADED above as [PRE-LOADED FILE] blocks.\n"
+            "Edit them directly — you have the code. Do NOT re-read files that were pre-loaded.\n\n"
             f"{plan}"
         )
         if memory_context:
