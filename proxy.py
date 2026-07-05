@@ -1998,24 +1998,24 @@ def _build_worker_payload(
         _log(f"  🧹 Worker-Payload: {removed} reasoning_content-Felder entfernt")
 
     # ══ Plan-binding System-Prompt injecten ══════════════════════════
-    # Plan-Isolat-Design: Der Worker hat KEINEN Code-Kontext. Er muss die
-    # Dateien SELBST lesen. Das System-Prompt wird um zwei Verträge ergänzt:
-    #   A) "Plan-Binding Contract": Was er tun soll (Plan exektuieren)
-    #   B) "Self-Read Mandate": Was er WISSEN muss (Dateien selbst lesen)
+    # Plan direkt IM System-Prompt — nicht als letzte Message.
+    # Wenn der Plan als letzte Message kommt, ignoriert das Modell ihn oft
+    # und greift auf Hindsight/User-Memory zurück (z.B. alte FlappyBird-Fragen).
     if plan:
         plan_binding = (
-            "\n\n[PLAN-BINDING CONTRACT — READ CAREFULLY]\n"
-            "A senior planner has prepared a strategic plan for you. Your job: IMPLEMENT IT.\n"
-            "IMPORTANT: You have NO code context. The planner's tool results have been removed.\n"
-            "You MUST read the relevant files yourself before editing.\n"
-            "Rules:\n"
-            "1. Read the CLOUD EXECUTION PLAN at the bottom of this conversation FIRST.\n"
-            "2. Before any edit, read the target file with your file-reading tool.\n"
-            "3. Execute each plan step IN ORDER.\n"
-            "4. DO NOT refactor, add features, or 'improve' anything not in the plan.\n"
-            "5. If a step references the wrong file/line: read to find the real location, then proceed.\n"
-            "6. Do NOT create new files unless the plan explicitly says 'CREATE <path>'.\n"
-            "7. After finishing, output '## Implementation Summary' with each step ✓/⚠/✗."
+            "\n\n=== YOUR ASSIGNMENT ===\n"
+            "The user's task is described above. Below is the EXECUTION PLAN\n"
+            "created by a senior planner who already researched the codebase.\n"
+            "You are the WORKER. Your ONLY job: execute this plan step by step.\n"
+            "DO NOT ask clarifying questions. DO NOT re-plan. DO NOT explore.\n"
+            "The plan IS your instruction. Execute it. NOW.\n\n"
+            "=== PLAN START ===\n"
+            f"{plan}\n"
+            "=== PLAN END ===\n\n"
+            "RULES:\n"
+            "1. Read target files before editing.\n"
+            "2. Execute steps IN ORDER.\n"
+            "3. After finishing: '## Implementation Summary' with each step ✓/⚠/✗.\n"
         )
         if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
             existing = str(messages[0].get("content", ""))
@@ -2023,37 +2023,14 @@ def _build_worker_payload(
         else:
             messages.insert(0, {"role": "system", "content": plan_binding.strip()})
 
-    # Plan + Memory als eigene User-Message anhängen (Plan-Isolat-Layout):
-    # pierced after the original User-Task message. So sieht DeepSeek klar:
-    #   System + Tools
-    #   User-Task (original) ← DAS ist die aktuelle Aufgabe
-    #   -> Plan (binding)    ← so umsetzen
-    #   -> Hindsight (context) ← Zusatzwissen aus vergangenen Sessions
-    context_blocks = []
-    if plan:
-        context_blocks.append(
-            "[CLOUD EXECUTION PLAN — FOLLOW EXACTLY]\n"
-            "This plan was authored by a senior planner who had full codebase access.\n"
-            "You do not need to re-plan. Read it, then execute it step by step.\n"
-            "Use your own read_file/grep tools to see the code before each edit.\n\n"
-            f"{plan}"
-        )
+    # Hindsight als letzte User-Message, klar getrennt vom Plan
     if memory_context:
-        context_blocks.append(
-            "---\n"
-            "⚠️ BACKGROUND KNOWLEDGE — NOT YOUR CURRENT TASK ⚠️\n"
-            "The following is LEARNED CONTEXT from PRIOR coding sessions.\n"
-            "It may contain patterns, fixes, and conventions relevant to the\n"
-            "current task. Use it for REFERENCE only.\n"
-            "YOUR CURRENT TASK is described in the user message ABOVE this one.\n"
-            "The PLAN you must execute is above this section.\n"
-            "---\n"
+        messages.append({"role": "user", "content":
+            "⚠️ The following is LEARNED CONTEXT from PRIOR coding sessions.\n"
+            "It is NOT your current task. Your task and plan are in the\n"
+            "system prompt above. Use this ONLY for reference patterns.\n\n"
             f"{memory_context}"
-        )
-    context_str = "\n\n".join(context_blocks)
-
-    if context_str:
-        messages.append({"role": "user", "content": context_str})
+        })
 
     # ALLE Messages behalten - kein Compact! Das System-Prompt mit Tool-Defs bleibt erhalten.
     payload["messages"] = messages
