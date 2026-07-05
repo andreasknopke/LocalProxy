@@ -1487,8 +1487,7 @@ _PLANNER_ALLOWED_TOOLS = {
     "get_task_output", "get_terminal_output", "testFailure",
     "fetch_webpage", "github_repo", "github_text_search",
     "session_store_sql", "vscode_listCodeUsages",
-    # Interaction + persistence (matching Copilot Plan Mode)
-    "memory", "resolve_memory_file_uri",
+    # Interaction (NO memory — Planner liest Quellcode, nicht alte Pläne)
     "vscode_askQuestions",
 }
 
@@ -3215,7 +3214,7 @@ async def _call_cloud_planner_agent(
         "to speed up discovery.\n"
         "KEEP IT TIGHT: the goal is to identify the touch points and the shape of\n"
         "the change, not to read every related line. 3–6 well-chosen reads usually\n"
-        "suffice. Update your findings via 'memory'.\n\n"
+        "suffice. The proxy will persist your plan automatically.\n\n"
         "## 2. Alignment\n"
         "If research reveals major ambiguities or you need to validate assumptions:\n"
         "- Use 'vscode_askQuestions' to clarify intent with the user.\n"
@@ -3231,7 +3230,7 @@ async def _call_cloud_planner_agent(
         "- Critical files to modify (with full paths)\n"
         "- Explicit scope boundaries — included AND excluded\n"
         "- Leave no ambiguity\n\n"
-        "Save the plan to the plan file via 'memory', then show it to the user.\n\n"
+        "Present the plan to the user. The proxy will persist it automatically.\n\n"
         "## 4. Refinement\n"
         "On user input after showing the plan:\n"
         "- Changes → revise and present updated plan\n"
