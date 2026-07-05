@@ -3148,11 +3148,19 @@ async def _call_cloud_planner_agent(
 
         messages = list(payload.get("messages", []))
 
-        # ══ Clean Sliding Window: System + letzter assistant→tool Zyklus ══
-        # Problem: Altes Sliding Window ließ verwaiste tool-Nachrichten stehen
-        # (assistant mit tool_calls rausgeschnitten, tool-Antworten blieben).
-        # Lösung: Nur System + letzten vollständigen assistant→tool Zyklus behalten.
+        # ══ Clean Sliding Window: System + originale User-Task + letzter Zyklus ══
+        # Problem: Window schnitt die original User-Task-Nachricht weg.
+        # Der Planner sah nur Tool-Results, nicht mehr den Task → fragte ratlos.
+        # Lösung: System + erste User-Message (immer) + letzter Zyklus + Kontext.
         system_msg = messages[0] if messages and messages[0].get("role") == "system" else None
+        # Finde erste echte User-Nachricht (die den Task enthält)
+        first_user_msg = None
+        for m in messages:
+            if isinstance(m, dict) and m.get("role") == "user":
+                content = m.get("content", "")
+                if isinstance(content, str) and content.strip():
+                    first_user_msg = m
+                    break
         MAX_PLANNER_WINDOW = 30
 
         # Finde letzten assistant mit tool_calls
@@ -3166,15 +3174,16 @@ async def _call_cloud_planner_agent(
         if last_asst_idx is not None and len(messages) > MAX_PLANNER_WINDOW:
             keep_from = max(0, last_asst_idx - 10)
             truncated = messages[keep_from:]
-            if system_msg and keep_from > 0:
-                truncated = [system_msg] + truncated
+            # Immer System + originale User-Task an den Anfang
+            prefix = []
+            if system_msg:
+                prefix.append({"role": "system", "content": str(system_msg.get("content", "")) + "\n\n" + planner_mode_instructions})
+            if first_user_msg and first_user_msg not in truncated:
+                prefix.append(first_user_msg)
+            truncated = prefix + [m for m in truncated if m is not first_user_msg and m is not system_msg]
             if len(truncated) > MAX_PLANNER_WINDOW:
-                truncated = truncated[-MAX_PLANNER_WINDOW:]
-                if system_msg and truncated[0].get("role") != "system":
-                    truncated = [system_msg] + truncated[-MAX_PLANNER_WINDOW + 1:]
-            if truncated and truncated[0].get("role") == "system":
-                truncated[0]["content"] = str(truncated[0].get("content", "")) + "\n\n" + planner_mode_instructions
-            _log(f"  🗜 Planner-Cont: {len(messages)} → {len(truncated)} (letzter Zyklus + Kontext)")
+                truncated = truncated[:1] + truncated[-(MAX_PLANNER_WINDOW - 1):]  # System + letzte N
+            _log(f"  🗜 Planner-Cont: {len(messages)} → {len(truncated)} (System + Task + letzter Zyklus)")
             messages = truncated
         elif len(messages) > MAX_PLANNER_WINDOW:
             if system_msg:
