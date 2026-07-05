@@ -1492,14 +1492,25 @@ _PLANNER_ALLOWED_TOOLS = {
     "vscode_askQuestions",
 }
 
+# Tools die der Worker auf Continuation NICHT bekommt (Aider-Pattern:
+# Editor hat keine Read-Tools, bekommt Dateien direkt injiziert).
+_WORKER_READ_TOOLS = {
+    "read_file", "grep_search", "file_search", "list_dir",
+    "view_image", "get_errors", "copilot_getNotebookSummary",
+    "read_notebook_cell_output", "terminal_last_command", "terminal_selection",
+    "get_task_output", "get_terminal_output", "testFailure",
+    "fetch_webpage", "github_repo", "github_text_search",
+    "session_store_sql", "vscode_listCodeUsages",
+    "memory", "resolve_memory_file_uri",
+    "vscode_askQuestions", "vscode_renameSymbol",
+    "read_page", "screenshot_page",
+    # Alles was Dateien/Code liest oder erkundet
+}
+
 
 def _filter_planner_tools(tools: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
     """Filtert die vom Client uebergebenen Tool-Definitionen auf das sichere
     READ-ONLY Subset, das der Cloud-Planner verwenden darf.
-    
-    Das reduziert die Tool-Liste von 47 auf ~15 - Kimi wird stabiler beim
-    Tool-Argument-Mashing und die Komplexitaet des Tool-Auswahl-Logits sinkt.
-    Im Idealfall reduziert das auch die malformed-tool-args-Rate massiv.
     """
     if not tools:
         return tools
@@ -1510,6 +1521,28 @@ def _filter_planner_tools(tools: Optional[List[Dict[str, Any]]]) -> Optional[Lis
         name = tool.get("function", {}).get("name") or tool.get("name", "")
         if name in _PLANNER_ALLOWED_TOOLS:
             filtered.append(tool)
+    return filtered or None
+
+
+def _filter_worker_edit_only_tools(tools: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+    """Aider-Pattern: Entfernt ALLE Read-Tools aus Worker-Payload auf
+    Continuation. Der Editor bekommt Dateien direkt injiziert und hat
+    nur Edit/Execute-Tools. Kein read_file, kein grep, kein memory.
+    """
+    if not tools:
+        return tools
+    filtered = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("function", {}).get("name") or tool.get("name", "")
+        if name not in _WORKER_READ_TOOLS:
+            filtered.append(tool)
+    if filtered:
+        _log(f"  🔨 Worker-Edit-Only: {len(tools)} → {len(filtered)} Tools "
+             f"(Read-Tools entfernt: {', '.join(sorted(set(
+                 t.get('function',{}).get('name','') for t in tools
+             ) & _WORKER_READ_TOOLS))})")
     return filtered or None
 
 
@@ -2221,18 +2254,12 @@ def _build_worker_payload(
             )
     elif is_continuation:
         plan_hint = (
-            "[CONTINUATION — STOP READING, START EDITING]\n"
-            "You have read enough files. Your previous tool results contain code you need.\n"
-            "READ-BUDGET: MAX 2 file reads this round. Then EDIT.\n"
-            "DO NOT: read memory, re-read files, read the plan from disk.\n"
-            "DO: pick the NEXT unedited step from '═══ THE PLAN ═══' and APPLY IT.\n"
-            "Your output this round MUST contain at least ONE file edit."
+            "[CONTINUATION — EDIT-ONLY MODE]\n"
+            "Read tools have been removed. You can ONLY edit files now.\n"
+            "The plan is at '═══ THE PLAN ═══' in your system prompt.\n"
+            "Your previous tool results above contain all code you need.\n"
+            "Execute the NEXT unedited step NOW."
         )
-        if read_repeat_count >= 2:
-            plan_hint += (
-                "\n\n⚠ CRITICAL: You are re-reading files you already read. STOP. "
-                "The content is above in your tool results. Execute the next edit NOW."
-            )
         context_blocks.append(plan_hint)
     context_str = "\n\n".join(context_blocks)
 
@@ -2241,7 +2268,19 @@ def _build_worker_payload(
 
     # ALLE Messages behalten - kein Compact! Das System-Prompt mit Tool-Defs bleibt erhalten.
     payload["messages"] = messages
-    return _clean_payload(payload, keep_tools=True)
+    payload = _clean_payload(payload, keep_tools=True)
+
+    # ══ Aider-Pattern: Worker-Continuation ohne Read-Tools ═══════
+    # Der Worker hat auf Continuation KEINE read_file/grep/memory Tools.
+    # Er KANN nicht mehr lesen — er MUSS editieren. Exakt wie Aider's
+    # Editor, der nur edit-format tools hat.
+    if is_continuation and "tools" in payload:
+        payload["tools"] = _filter_worker_edit_only_tools(payload["tools"])
+        if not payload["tools"]:
+            payload.pop("tools", None)
+            payload.pop("tool_choice", None)
+
+    return payload
 
 
 def _build_cloud_plan_payload(body: Dict[str, Any], memory_context: str) -> Dict[str, Any]:
