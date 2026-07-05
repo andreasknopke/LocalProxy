@@ -1990,12 +1990,6 @@ def _build_worker_payload(
     #   A) "Plan-Binding Contract": Was er tun soll (Plan exektuieren)
     #   B) "Self-Read Mandate": Was er WISSEN muss (Dateien selbst lesen)
     if plan:
-        plan_file_hint = ""
-        if plan_path:
-            plan_file_hint = (
-                f"\n8. The plan is also persisted at **`{plan_path}`**. "
-                f"READ that file first if you need the full plan."
-            )
         plan_binding = (
             "\n\n[PLAN-BINDING CONTRACT — READ CAREFULLY]\n"
             "A senior planner has prepared a strategic plan for you. Your job: IMPLEMENT IT.\n"
@@ -2009,7 +2003,6 @@ def _build_worker_payload(
             "5. If a step references the wrong file/line: read to find the real location, then proceed.\n"
             "6. Do NOT create new files unless the plan explicitly says 'CREATE <path>'.\n"
             "7. After finishing, output '## Implementation Summary' with each step ✓/⚠/✗."
-            f"{plan_file_hint}"
         )
         if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
             existing = str(messages[0].get("content", ""))
