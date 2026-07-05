@@ -2037,17 +2037,20 @@ def _build_worker_payload(
     if original_user_msg is not None:
         new_msgs.append(original_user_msg)
 
-    # ══ PRE-LOADED FILES (Aider's get_chat_files_messages) ═══════
-    # Beim FIRST worker call: Kimi's read_file-Ergebnisse als [PRE-LOADED FILE]
-    # injizieren. Der Worker hat KEINE Read-Tools — das hier ist sein EINZIGER
-    # Code-Kontext. Bei Continuation: NICHT — Worker hat seine eigenen Tool-Results.
+    # ══ PRE-LOADED FILES ═══════════════════════════════════════
+    # NUR beim ersten Worker-Call: Kimi's read_file-Ergebnisse als
+    # [PRE-LOADED FILE] injizieren. Worker verifiziert per read_file
+    # (nur in Round 1 verfügbar), editiert. Bei Continuation KEINE
+    # Pre-Loads — sonst sieht Worker Kimis ALTE Versionen und macht
+    # Duplikat-Edits (3x resize? in common.ts).
     if plan and is_first_worker_call:
         pre_loaded_files = _extract_planner_file_contents(messages)
         if pre_loaded_files:
             injected = 0
             for fp, content in pre_loaded_files.items():
                 block = (
-                    f"[PRE-LOADED FILE: {fp} — FULL CONTENT]\n"
+                    f"[PRE-LOADED FILE: {fp} — PLANNER VERSION]\n"
+                    f"This is what the PLANNER saw. Verify with read_file before editing.\n"
                     f"---FILE-START---\n"
                     f"{content}\n"
                     f"---FILE-END---"
@@ -2172,16 +2175,19 @@ def _build_worker_payload(
     # Auftrag" war falsch — der CONTINUATION REMINDER sagt "mid-execution".
     if plan:
         plan_binding = (
-            "\n\n[PLAN-BINDING CONTRACT — EDIT-ONLY MODE]\n"
-            "A senior planner has prepared a strategic plan. Your job: IMPLEMENT IT.\n"
-            "Read tools have been REMOVED. You can ONLY edit files.\n"
-            "File contents are in [PRE-LOADED FILE] blocks above — use them.\n"
+            "\n\n[PLAN-BINDING CONTRACT]\n"
+            "A senior planner has prepared a plan. Your job: IMPLEMENT IT.\n"
+            "\n"
+            "THIS ROUND: read_file is available. Use it to verify file contents\n"
+            "(pre-loaded files above show PLANNER VERSIONS — files may have changed).\n"
+            "Read the files you need for Step 1, then EDIT them.\n"
+            "NEXT ROUNDS: read_file will be REMOVED — you MUST edit based on what\n"
+            "you read this round.\n"
             "\n"
             "Rules:\n"
-            "1. Execute each plan step IN ORDER using replace_string_in_file.\n"
-            "2. DO NOT refactor, add features, or 'improve' anything not in the plan.\n"
-            "3. Do NOT create new files unless the plan explicitly says 'CREATE <path>'.\n"
-            "4. After finishing, output '## Implementation Summary'.\n"
+            "1. Read files you need for Step 1 NOW. Then edit. Then continue.\n"
+            "2. Execute each plan step IN ORDER.\n"
+            "3. After finishing, output '## Implementation Summary'.\n"
             "\n"
             "═══ THE PLAN ═══\n"
             f"{plan}\n"
@@ -2204,11 +2210,10 @@ def _build_worker_payload(
     context_blocks = []
     if plan and not is_continuation:
         msg_parts = [
-            "[EDIT-ONLY MODE — ALL FILES PRE-LOADED]\n"
-            "Read tools have been removed. You can ONLY edit files.\n"
-            "The full plan is in your system prompt ('═══ THE PLAN ═══').\n"
-            "File contents are above as [PRE-LOADED FILE] blocks.\n"
-            "You have EVERYTHING you need. Execute Step 1 NOW using replace_string_in_file."
+            "[PRE-LOADED FILES SHOW PLANNER VERSIONS — VERIFY WITH read_file]\n"
+            "The plan is in your system prompt ('═══ THE PLAN ═══').\n"
+            "This is the ONLY round where read_file works. Read files you need for Step 1.\n"
+            "Then EDIT. Future rounds will only allow edit tools."
         ]
         context_blocks.append("".join(msg_parts))
         if memory_context:
@@ -2225,11 +2230,10 @@ def _build_worker_payload(
             )
     elif is_continuation:
         plan_hint = (
-            "[CONTINUATION — EDIT-ONLY MODE]\n"
-            "Read tools are REMOVED. You can ONLY edit files.\n"
-            "The plan is at '═══ THE PLAN ═══' in your system prompt.\n"
-            "File contents are in your previous tool results.\n"
-            "Execute the NEXT unedited step NOW using replace_string_in_file."
+            "[CONTINUATION — EDIT ONLY]\n"
+            "read_file has been REMOVED. You can ONLY use edit tools now.\n"
+            "Your previous reads are in the tool results above. The plan is in your system prompt.\n"
+            "Pick the NEXT unedited step and execute it NOW."
         )
         context_blocks.append(plan_hint)
     context_str = "\n\n".join(context_blocks)
@@ -2241,11 +2245,11 @@ def _build_worker_payload(
     payload["messages"] = messages
     payload = _clean_payload(payload, keep_tools=True)
 
-    # ══ Aider-Pattern: Worker NUR mit Edit-Tools ═══════════════
-    # Der Worker bekommt Dateien direkt als [PRE-LOADED FILE] injiziert.
-    # Er hat KEINE Read-Tools — weder auf First-Call noch Continuation.
-    # Er KANN nicht lesen, er MUSS editieren. Exakt wie Aider's Editor.
-    if plan and "tools" in payload:
+    # ══ Worker-Tools: Round 1 hat read_file, Round 2+ NUR Edit ══
+    # Runde 1: read_file + edit tools → Worker verifiziert Dateien
+    # Runde 2+: read_file ENTFERNT → Worker MUSS editieren (seine
+    # Round-1-Reads sind in den Continuation-Clustern).
+    if is_continuation and "tools" in payload:
         payload["tools"] = _filter_worker_edit_only_tools(payload["tools"])
         if not payload["tools"]:
             payload.pop("tools", None)
