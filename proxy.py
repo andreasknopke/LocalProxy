@@ -1731,10 +1731,14 @@ def _build_direct_payload(
     effective_model = model_name or body.get("model") or MODEL_NAME
     if _is_text_only_model(effective_model):
         _sanitize_image_urls_inplace(messages, "DirectPayload")
-    # reasoning_content von Kimi-Seite entfernen (DeepSeek 400 sonst)
+    # reasoning_content von ALLEN Messages entfernen (DeepSeek crasht sonst)
     removed_rc = _strip_kimi_reasoning(messages)
+    for m in messages:
+        if isinstance(m, dict) and "reasoning_content" in m:
+            del m["reasoning_content"]
+            removed_rc += 1
     if removed_rc:
-        _log(f"  🧹 DirectPayload: {removed_rc} reasoning_content-Felder entfernt (Kimi-Thinking)")
+        _log(f"  🧹 DirectPayload: {removed_rc} reasoning_content-Felder entfernt")
     return _clean_payload(payload, keep_tools=True)
 
 
@@ -1981,8 +1985,13 @@ def _build_worker_payload(
 
     # ══ reasoning_content von Kimi-Seite entfernen ═══════              
     removed = _strip_kimi_reasoning(messages)
+    # Auch reasoning_content auf Assistants MIT tool_calls strippen
+    for m in messages:
+        if isinstance(m, dict) and "reasoning_content" in m:
+            del m["reasoning_content"]
+            removed += 1
     if removed:
-        _log(f"  🧹 Worker-Payload: {removed} reasoning_content-Felder entfernt (Kimi-Thinking)")
+        _log(f"  🧹 Worker-Payload: {removed} reasoning_content-Felder entfernt")
 
     # ══ Plan-binding System-Prompt injecten ══════════════════════════
     # Plan-Isolat-Design: Der Worker hat KEINEN Code-Kontext. Er muss die
@@ -3148,55 +3157,36 @@ async def _call_cloud_planner_agent(
 
         messages = list(payload.get("messages", []))
 
-        # ══ Clean Sliding Window: System + originale User-Task + letzter Zyklus ══
-        # Problem: Window schnitt die original User-Task-Nachricht weg.
-        # Der Planner sah nur Tool-Results, nicht mehr den Task → fragte ratlos.
-        # Lösung: System + erste User-Message (immer) + letzter Zyklus + Kontext.
+        # ══ Planner-Cont Window: System + Task + letzte N Messages ══
+        # Kein Sliding Window mehr — das zerstörte Tool-Integrität
+        # (verwaiste tc_ids → 400 'tool_call_id not found').
+        # Stattdessen: immer System + Original-Task + letzte 43 Msg behalten.
+        # Tool-Results sind auf 8000 chars gekappt → selbst 50 Msg sind <400KB.
         system_msg = messages[0] if messages and messages[0].get("role") == "system" else None
-        # Finde erste echte User-Nachricht (die den Task enthält)
         first_user_msg = None
         for m in messages:
             if isinstance(m, dict) and m.get("role") == "user":
-                content = m.get("content", "")
-                if isinstance(content, str) and content.strip():
+                if isinstance(m.get("content", ""), str) and m["content"].strip():
                     first_user_msg = m
                     break
-        MAX_PLANNER_WINDOW = 30
 
-        # Finde letzten assistant mit tool_calls
-        last_asst_idx = None
-        for i in range(len(messages) - 1, -1, -1):
-            m = messages[i]
-            if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls"):
-                last_asst_idx = i
-                break
-
-        if last_asst_idx is not None and len(messages) > MAX_PLANNER_WINDOW:
-            keep_from = max(0, last_asst_idx - 10)
-            truncated = messages[keep_from:]
-            # Immer System + originale User-Task an den Anfang
-            prefix = []
+        MAX_PLANNER_WINDOW = 45
+        if len(messages) > MAX_PLANNER_WINDOW:
+            keep = [m for m in messages if m is not system_msg and m is not first_user_msg]
+            keep = keep[-(MAX_PLANNER_WINDOW - 2):]
+            result = []
             if system_msg:
-                prefix.append({"role": "system", "content": str(system_msg.get("content", "")) + "\n\n" + planner_mode_instructions})
-            if first_user_msg and first_user_msg not in truncated:
-                prefix.append(first_user_msg)
-            truncated = prefix + [m for m in truncated if m is not first_user_msg and m is not system_msg]
-            if len(truncated) > MAX_PLANNER_WINDOW:
-                truncated = truncated[:1] + truncated[-(MAX_PLANNER_WINDOW - 1):]  # System + letzte N
-            _log(f"  🗜 Planner-Cont: {len(messages)} → {len(truncated)} (System + Task + letzter Zyklus)")
-            messages = truncated
-        elif len(messages) > MAX_PLANNER_WINDOW:
-            if system_msg:
-                truncated = [system_msg] + messages[-(MAX_PLANNER_WINDOW - 1):]
-            else:
-                truncated = messages[-MAX_PLANNER_WINDOW:]
-            _log(f"  🗜 Planner-Cont: {len(messages)} → {len(truncated)} (Window={MAX_PLANNER_WINDOW})")
-            messages = truncated
+                result.append({"role": "system", "content": str(system_msg.get("content", "")) + "\n\n" + planner_mode_instructions})
+            if first_user_msg:
+                result.append(first_user_msg)
+            result.extend(keep)
+            _log(f"  🗜 Planner-Cont: {len(messages)} → {len(result)} (System + Task + letzte)")
+            messages = result
         else:
             if messages and messages[0].get("role") == "system":
                 messages[0]["content"] = str(messages[0].get("content", "")) + "\n\n" + planner_mode_instructions
 
-        # reasoning_content strippen — sonst crasht DeepSeek (Kimi-Eigenart)
+        # reasoning_content strippen — Kimi's Thinking crasht DeepSeek
         removed = 0
         for m in messages:
             if isinstance(m, dict) and "reasoning_content" in m:
@@ -3205,7 +3195,7 @@ async def _call_cloud_planner_agent(
         if removed:
             _log(f"  🧹 Planner-Cont: {removed} reasoning_content entfernt")
 
-        # Orphaned-Tool-Cleanup: tool→user wenn assistant(tool_calls) fehlt
+        # Orphaned-Tool-Cleanup: tool→user wenn kein passender assistant(tool_calls)
         valid_tc_ids = set()
         for m in messages:
             if isinstance(m, dict) and m.get("role") == "assistant":
@@ -3668,10 +3658,14 @@ async def _call_cloud_as_worker(
         "temperature": 0.3,
         "stream": False,
     }
-    # reasoning_content von Kimi-Seite entfernen (DeepSeek 400 sonst)
+    # reasoning_content komplett strippen (Kimi-Thinking crasht DeepSeek)
     removed_rc = _strip_kimi_reasoning(cloud_payload.get("messages", []))
+    for m in cloud_payload.get("messages", []):
+        if isinstance(m, dict) and "reasoning_content" in m:
+            del m["reasoning_content"]
+            removed_rc += 1
     if removed_rc:
-        _log(f"  🧹 Cloud-Fallback: {removed_rc} reasoning_content-Felder entfernt (Kimi-Thinking)")
+        _log(f"  🧹 Cloud-Fallback: {removed_rc} reasoning_content-Felder entfernt")
     cloud_payload = _clean_payload(cloud_payload, keep_tools=False)
 
     # ── Versuch 1: LiteLLM (DeepSeek) ──────────────────────────────────
@@ -3808,10 +3802,9 @@ async def _call_vllm(
     # Moonshot/Kimi-Temperatur-Korrektur (Moonshot erlaubt nur 1.0)
     _patch_moonshot_payload(payload)
 
-    # Reasoning-Content aus Cache in Assistant-Messages injizieren
-    # (DeepSeek braucht reasoning_content beim Folgerequest mit tool_calls)
+    # Nur für Kimi-Continuation reasoning injecten, nicht für Worker
     messages = payload.get("messages", [])
-    if isinstance(messages, list):
+    if isinstance(messages, list) and "kimi" in str(payload.get("model", "")).lower():
         _inject_reasoning_from_cache(messages)
 
     # Heartbeat-Task: alle 30s loggen, dass wir noch warten
