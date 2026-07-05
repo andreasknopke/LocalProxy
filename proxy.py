@@ -2030,22 +2030,25 @@ def _build_worker_payload(
     if user_task:
         new_msgs.append(user_task)
 
-    # Pre-Loaded Files: NUR beim ersten Worker-Call.
-    # preloaded_files vom Caller (aus Session gecached) haben Vorrang.
+    # ══ Pre-Loaded Files: JEDEN Round aus Session-Cache ═══════
+    # preloaded_files vom Caller (aus Session) haben immer Vorrang.
     # Fallback: aus Messages extrahieren (wenn im gleichen Request).
-    if plan and not is_continuation:
-        pre_loaded = preloaded_files or _extract_planner_file_contents(messages)
-        if pre_loaded:
-            for fp, content in pre_loaded.items():
+    # Auf ALLEN Runden injizieren — nicht nur First-Call.
+    # Label: "PLANNER VERSION — your edits may have changed this."
+    if plan and (preloaded_files or not is_continuation):
+        sources = preloaded_files or _extract_planner_file_contents(messages)
+        if sources:
+            for fp, content in sources.items():
                 block = (
                     f"[PRE-LOADED FILE: {fp} — PLANNER VERSION]\n"
-                    f"Verify with read_file before editing.\n"
+                    f"⚠️ This was read BEFORE your edits. Your previous changes may\n"
+                    f"have modified this file. Use as REFERENCE only.\n"
                     f"---FILE-START---\n{content}\n---FILE-END---"
                 )
                 new_msgs.append({"role": "user", "content": block})
-            _log(f"  📎 Preloaded: {len(pre_loaded)} Dateien "
+            _log(f"  📎 Preloaded: {len(sources)} Dateien "
                  f"(source={'session' if preloaded_files else 'messages'}, "
-                 f"{sum(len(v) for v in pre_loaded.values())} chars)")
+                 f"{sum(len(v) for v in sources.values())} chars)")
 
     # Worker-Cluster: bei Continuation die letzten N behalten
     if is_continuation:
@@ -2098,8 +2101,10 @@ def _build_worker_payload(
             )
         else:
             contract += (
-                "\nCONTINUATION: read_file REMOVED. You can ONLY edit.\n"
-                "Your file reads from earlier rounds are in the tool results above.\n"
+                "\nCONTINUATION: read_file REMOVED. EDIT with pre-loaded files.\n"
+                "[PRE-LOADED FILE] blocks above show PLANNER VERSIONS of your files.\n"
+                "Use them as reference for replace_string_in_file oldString values.\n"
+                "If a replacement fails, try adjacent lines — the file may have changed.\n"
             )
         contract += (
             "\nRules: 1) Execute steps in order. 2) No refactoring. "
@@ -2122,8 +2127,11 @@ def _build_worker_payload(
         )
     elif is_continuation:
         hint = (
-            "[CONTINUATION — read_file REMOVED, EDIT ONLY]\n"
-            "Your reads are above. Plan is in system prompt. Edit the next step."
+            "[CONTINUATION — EDIT WITH PRE-LOADED FILES]\n"
+            "read_file is REMOVED. [PRE-LOADED FILE] blocks above are PLANNER VERSIONS.\n"
+            "Use them for replace_string_in_file context. If a replacement fails,\n"
+            "the file may have been edited — try nearby text or skip to next step.\n"
+            "Plan is in system prompt. DO NOT use memory — edit directly."
         )
     if hint:
         messages.append({"role": "user", "content": hint})
