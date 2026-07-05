@@ -1977,67 +1977,54 @@ def _build_worker_payload(
     if original_user_msg is not None:
         new_msgs.append(original_user_msg)
 
+    # ══ PRE-LOADED FILES (Aider's get_chat_files_messages) ═══════
+    # JEDEN Round — nicht nur First-Call. Der Worker verliert sonst
+    # den Code-Kontext nach Runde 1 und fängt an, memory/read_file
+    # aufzurufen → klassische Re-Read-Loop.
+    # Extrahiere Kimi's read_file-Ergebnisse aus der ORIGINALEN
+    # Conversation (die 175+ msgs enthalten sie immer).
+    pre_loaded_files = {}
+    if plan:
+        pre_loaded_files = _extract_planner_file_contents(messages)
+        if pre_loaded_files:
+            injected = 0
+            for fp, content in pre_loaded_files.items():
+                if len(content) > 6000:
+                    content = content[:6000] + f"\n...[TRUNCATED: {len(content) - 6000} chars]"
+                block = (
+                    f"[PRE-LOADED FILE: {fp}]\n"
+                    f"Trust this as the true contents. Do NOT re-read this file.\n"
+                    f"---FILE-START---\n"
+                    f"{content}\n"
+                    f"---FILE-END---"
+                )
+                new_msgs.append({"role": "user", "content": block})
+                injected += 1
+            _log(f"  📎 Preloaded: {injected} Dateien "                                  
+                 f"({sum(len(v) for v in pre_loaded_files.values())} chars total)")
+
     if has_tool_msgs:
         # Continuation: NUR den letzten assistant(tool_calls) → tool results
-        # Zyklus behalten. Frühere Runden (Planner-Cruft, alte Worker-Calls)
-        # werden ENTFERNT – der Worker braucht nur, was er selbst zuletzt sah.
+        # Zyklus behalten (NACH den Pre-Loaded Files, die schon in new_msgs sind)
         last_worker_asst = None
         for i in range(len(messages) - 1, -1, -1):
             if isinstance(messages[i], dict) and messages[i].get("role") == "assistant" and messages[i].get("tool_calls"):
                 last_worker_asst = i
                 break
         if last_worker_asst is not None:
-            # Starte GENAU beim letzten Worker-Call – alles davor ist Cruft
             for j in range(last_worker_asst, len(messages)):
                 msg = messages[j]
                 if not isinstance(msg, dict):
                     continue
-                role = msg.get("role")
-                if role == "system":
-                    continue  # schon oben
+                if msg.get("role") == "system":
+                    continue
                 new_msgs.append(copy.deepcopy(msg))
         _log(f"  ✂ Worker-Payload (Plan-Isolat, Continuation): {len(new_msgs)} Messages "
-             f"(Original {len(messages)} → {len(new_msgs)}, Planner-Verlauf entfernt)")
+             f"(System+Task+{len(pre_loaded_files)}Files+Worker-Cycle, "
+             f"Original {len(messages)} → {len(new_msgs)})")
     else:
-        # ══ AIDER-PATTERN: First-Call mit Pre-Loaded Files ═════════
-        # Wie Aider's get_chat_files_messages(): extrahiere die vom
-        # Planner gelesenen Dateiinhalte und injiziere sie DIREKT in den
-        # Worker-Kontext. Der Worker sieht den Code sofort und muss KEIN
-        # read_file mehr aufrufen → keine "Worker liest immer wieder
-        # dieselben Files"-Schleife.
-        #
-        # Dies ist der entscheidende Unterschied zum alten Pattern:
-        #   ALT: Worker bekam nur Plan → musste selbst lesen → Loop
-        #   NEU: Worker bekommt Plan + Code → editiert direkt
         _log(f"  ✂ Worker-Payload (Plan-Isolat, First-Call): {len(new_msgs)} Messages "
              f"(Original {len(messages)} → {len(new_msgs)}, Planner-Verlauf entfernt)")
-
-        if plan:
-            # Extrahiere die Planner's read_file-Ergebnisse
-            file_contents = _extract_planner_file_contents(messages)
-            if file_contents:
-                # Injiiziere jede Datei als [PRE-LOADED FILE] User-Message
-                # (Entspricht Aider's "I have added these files to the chat")
-                injected = 0
-                for fp, content in file_contents.items():
-                    # Kürze sehr große Dateien auf ~6000 chars für Payload-Größe
-                    truncated = ""
-                    if len(content) > 6000:
-                        truncated = f"\n...[TRUNCATED: {len(content) - 6000} chars omitted]"
-                        content = content[:6000]
-                    block = (
-                        f"[PRE-LOADED FILE: {fp}]\n"
-                        f"This file was read by the planner. Its contents are current.\n"
-                        f"Do NOT re-read this file — edit it directly.\n"
-                        f"---FILE-START---\n"
-                        f"{content}"
-                        f"{truncated}\n"
-                        f"---FILE-END---"
-                    )
-                    new_msgs.append({"role": "user", "content": block})
-                    injected += 1
-                _log(f"  📎 Aider-Preload: {injected} Dateien als [PRE-LOADED FILE] injiziert "
-                     f"({sum(len(v) for v in file_contents.values())} chars total)")
 
     messages = new_msgs
 
