@@ -4339,7 +4339,7 @@ async def _run_agent_workflow(body: Dict[str, Any]) -> Dict[str, Any]:
                             msg["content"] = f"{orig}\n\n[CAVEMAN-PROMPT-COMPRESSED]\n{compressed}"
                         break
 
-        planner_result = await _call_cloud_planner_agent(client, body, memory_context, results)
+        planner_result = await _call_cloud_planner_agent(client, body, "", results)  # Kein Hindsight im Planner — sauberer Plan-Kontext
         results.append(planner_result)
 
         if planner_result.get("tool_calls"):
