@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.venv-1/
+.pytest_cache/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# Test artifacts
+tests/
+
+# Logs & data (volume-mounted in production)
+proxy.log
+.hindsight_memory/
+
+# Debug dumps (volume-mounted)
+data/debug/

@@ -1,8 +1,6 @@
 """
-Web-Konfigurationsinterface für LocalProxy v2.0
-────────────────────────────────────────────────
-Modernes Single-Page-Dashboard zum Konfigurieren aller Proxy-Einstellungen:
-Modelle, Cloud-APIs, Tokens, Memory, Verifikation.
+Web-Konfigurationsinterface fuer LocalProxy v3.0
+Modernes Single-Page-Dashboard: 4 Modell-Kategorien, Hindsight, Proxy.
 """
 
 from __future__ import annotations
@@ -20,17 +18,12 @@ from typing import Any, Dict, List, Optional, Set
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Config-Datei
-# ═══════════════════════════════════════════════════════════════════════════
-
 CONFIG_PATH = Path(os.getenv("LOCALPROXY_CONFIG", "data/config.json"))
 PROFILES_DIR = CONFIG_PATH.parent / "profiles"
-LOG_FILE = os.getenv("LOG_FILE", str(Path(__file__).parent / "proxy.log"))
+LOG_FILE = os.getenv("LOG_FILE", str(Path(__file__).parent / "data" / "proxy.log"))
 
 
 def _log(msg: str) -> None:
-    """Schreibt eine Log-Zeile mit Timestamp ins selbe Log-File wie proxy.py."""
     import datetime as _dt
     timestamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] [webui] {msg}"
@@ -41,19 +34,19 @@ def _log(msg: str) -> None:
     except Exception:
         pass
 
+
 # ═══════════════════════════════════════════════════════════════════════════
-# WebUI Auth — Zwangs-Login via SPARK_AUTH_USERNAME / SPARK_AUTH_PASSWORD
+# WebUI Auth
 # ═══════════════════════════════════════════════════════════════════════════
 
 WEBUI_USERNAME: str = os.getenv("SPARK_AUTH_USERNAME", "admin")
 WEBUI_PASSWORD: str = os.getenv("SPARK_AUTH_PASSWORD", "")
 if not WEBUI_PASSWORD:
     WEBUI_PASSWORD = "localfox-" + secrets.token_hex(16)
-    _log(f"⚡ WebUI Auto-Passwort (kein SPARK_AUTH_PASSWORD gesetzt): {WEBUI_PASSWORD}")
+    _log(f"WebUI Auto-Passwort (kein SPARK_AUTH_PASSWORD gesetzt): {WEBUI_PASSWORD}")
 else:
-    _log("🔐 WebUI Login via SPARK_AUTH_USERNAME / SPARK_AUTH_PASSWORD")
+    _log("WebUI Login via SPARK_AUTH_USERNAME / SPARK_AUTH_PASSWORD")
 
-# In-Memory Session-Tokens
 _active_tokens: Set[str] = set()
 COOKIE_NAME = "webui_token"
 
@@ -71,8 +64,6 @@ def _validate_token(token: str) -> bool:
 def _remove_token(token: str) -> None:
     _active_tokens.discard(token)
 
-
-# ── Login-HTML ────────────────────────────────────────────────────────────
 
 LOGIN_HTML = """<!DOCTYPE html>
 <html lang="de">
@@ -115,7 +106,7 @@ LOGIN_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <div class="login-card">
-  <h1>🦊 LocalProxy <span class="badge">v2.0</span></h1>
+  <h1>LocalProxy <span class="badge">v3.0</span></h1>
   <p>Bitte anmelden um auf das Dashboard zuzugreifen</p>
   <form id="loginForm">
     <div class="form-group">
@@ -124,10 +115,10 @@ LOGIN_HTML = """<!DOCTYPE html>
     </div>
     <div class="form-group">
       <label for="password">Passwort</label>
-      <input type="password" id="password" name="password" placeholder="••••••••" autocomplete="current-password">
+      <input type="password" id="password" name="password" placeholder="..." autocomplete="current-password">
     </div>
     <div class="error" id="loginError">Falscher Benutzername oder Passwort</div>
-    <button type="submit" class="btn">🔐 Anmelden</button>
+    <button type="submit" class="btn">Anmelden</button>
   </form>
 </div>
 <script>
@@ -144,7 +135,6 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
     });
     if (!r.ok) { errorEl.style.display = 'block'; return; }
     const data = await r.json();
-    // Token im Cookie speichern + als Query-Parameter (Fallback)
     document.cookie = 'webui_token=' + data.token + '; path=/webui; max-age=86400; SameSite=Lax';
     window.location.href = '/webui/?token=' + data.token;
   } catch(e) {
@@ -156,43 +146,47 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
 </body>
 </html>"""
 
+
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "models": {
-        "vllm_api_url": "http://localhost:8000/v1/chat/completions",
-        "vllm_api_key": "",
-        "model_name": "Qwen/Qwen3-Next-80B-Chat-mxfp4",
-        "fast_model_name": "Qwen/Qwen3.6-27B-Chat-FP8",
+    "model_categories": {
+        "local": {
+            "api_url": "http://localhost:8000/v1/chat/completions",
+            "api_key": "",
+            "model_name": "Qwen/Qwen3-Next-80B",
+            "max_tokens": 65536,
+            "is_vision": False,
+            "timeout_seconds": 300,
+        },
+        "light": {
+            "api_url": "https://api.openai.com/v1/chat/completions",
+            "api_key": "",
+            "model_name": "gpt-4.1-mini",
+            "max_tokens": 65536,
+            "is_vision": False,
+            "timeout_seconds": 180,
+        },
+        "strong": {
+            "api_url": "https://api.anthropic.com/v1/chat/completions",
+            "api_key": "",
+            "model_name": "claude-sonnet-4-20250514",
+            "max_tokens": 65536,
+            "is_vision": False,
+            "timeout_seconds": 300,
+        },
+        "vision": {
+            "api_url": "https://api.openai.com/v1/chat/completions",
+            "api_key": "",
+            "model_name": "gpt-4o",
+            "max_tokens": 65536,
+            "is_vision": True,
+            "timeout_seconds": 180,
+        },
     },
-    "cloud": {
-        "enabled": False,
-        "api_url": "https://api.openai.com/v1/chat/completions",
-        "api_key": "",
-        "model": "gpt-4.1-mini",
-        "max_tokens": 128000,
-        "timeout_seconds": 180,
-    },
-    "litellm": {
-        "model": "",
-        "api_key": "",
-        "api_url": "",
-        "max_tokens": 16384,
-        "timeout_seconds": 180,
-    },
+    "default_category": "light",
     "proxy": {
         "port": 9001,
         "auth_enabled": True,
         "api_key": "",
-        "chatty_mode": True,
-    },
-    "tokens": {
-        "direct_max_tokens": 32768,
-        "agent_max_tokens": 65536,
-        "caveman_max_tokens": 8192,
-        "sub_agent_timeout_seconds": 120,
-        "verify_timeout_seconds": 120,
-    },
-    "caveman": {
-        "enabled": True,
     },
     "hindsight": {
         "enabled": True,
@@ -206,45 +200,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "retain_delay_seconds": 0,
         "dir": "./.hindsight_memory",
     },
-    "verify": {
-        "enabled": True,
-        "lint_command": "",
-        "test_command": "",
-    },
-    "mcp": {
-        "enabled": True,
+    "tokens": {
+        "tool_result_cap": 0,
     },
 }
 
-
-# Mapping: Env-Variable → (config-Sektion, config-Key)
-# Wird NUR beim erstmaligen Erzeugen von config.json verwendet.
 _ENV_TO_CONFIG: Dict[str, Tuple[str, str]] = {
-    "VLLM_API_URL": ("models", "vllm_api_url"),
-    "VLLM_API_KEY": ("models", "vllm_api_key"),
-    "MODEL_NAME": ("models", "model_name"),
-    "FAST_MODEL_NAME": ("models", "fast_model_name"),
     "PROXY_PORT": ("proxy", "port"),
     "PROXY_AUTH_ENABLED": ("proxy", "auth_enabled"),
     "PROXY_API_KEY": ("proxy", "api_key"),
-    "CHATTY_MODE": ("proxy", "chatty_mode"),
-    "CLOUD_REVIEW_ENABLED": ("cloud", "enabled"),
-    "CLOUD_REVIEW_API_URL": ("cloud", "api_url"),
-    "CLOUD_REVIEW_API_KEY": ("cloud", "api_key"),
-    "CLOUD_REVIEW_MODEL": ("cloud", "model"),
-    "CLOUD_REVIEW_MAX_TOKENS": ("cloud", "max_tokens"),
-    "CLOUD_REVIEW_TIMEOUT_SECONDS": ("cloud", "timeout_seconds"),
-    "LITELLM_CLOUD_MODEL": ("litellm", "model"),
-    "LITELLM_CLOUD_API_KEY": ("litellm", "api_key"),
-    "LITELLM_CLOUD_API_URL": ("litellm", "api_url"),
-    "LITELLM_CLOUD_MAX_TOKENS": ("litellm", "max_tokens"),
-    "LITELLM_CLOUD_TIMEOUT_SECONDS": ("litellm", "timeout_seconds"),
-    "DIRECT_MAX_TOKENS": ("tokens", "direct_max_tokens"),
-    "SUB_AGENT_MAX_TOKENS": ("tokens", "agent_max_tokens"),
-    "SUB_AGENT_TIMEOUT_SECONDS": ("tokens", "sub_agent_timeout_seconds"),
-    "VERIFY_TIMEOUT_SECONDS": ("tokens", "verify_timeout_seconds"),
-    "CAVEMAN_ENABLED": ("caveman", "enabled"),
-    "CAVEMAN_MAX_TOKENS": ("tokens", "caveman_max_tokens"),
     "HINDSIGHT_ENABLED": ("hindsight", "enabled"),
     "QDRANT_URL": ("hindsight", "qdrant_url"),
     "QDRANT_API_KEY": ("hindsight", "qdrant_api_key"),
@@ -255,15 +219,11 @@ _ENV_TO_CONFIG: Dict[str, Tuple[str, str]] = {
     "HINDSIGHT_MIN_SIMILARITY": ("hindsight", "min_similarity"),
     "HINDSIGHT_RETAIN_DELAY_SECONDS": ("hindsight", "retain_delay_seconds"),
     "HINDSIGHT_DIR": ("hindsight", "dir"),
-    "VERIFY_ENABLED": ("verify", "enabled"),
-    "VERIFY_LINT_COMMAND": ("verify", "lint_command"),
-    "VERIFY_TEST_COMMAND": ("verify", "test_command"),
-    "MCP_ENABLED": ("mcp", "enabled"),
+    "TOOL_RESULT_CAP": ("tokens", "tool_result_cap"),
 }
 
 
 def _env_to_config_val(env_val: str, default_val: Any) -> Any:
-    """Konvertiert einen Env-Var-String in den passenden Typ."""
     if isinstance(default_val, bool):
         return env_val.lower() in {"1", "true", "yes", "y", "on"}
     if isinstance(default_val, int):
@@ -280,8 +240,7 @@ def _env_to_config_val(env_val: str, default_val: Any) -> Any:
 
 
 def _load_config() -> Dict[str, Any]:
-    """Lädt Config aus JSON-Datei. Falls nicht vorhanden, aus Env-Vars erzeugen."""
-    cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     if CONFIG_PATH.exists():
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -291,27 +250,23 @@ def _load_config() -> Dict[str, Any]:
             pass
         return cfg
 
-    # config.json existiert nicht → aus Env-Vars + Defaults erzeugen
     for env_name, (section, key) in _ENV_TO_CONFIG.items():
         val = os.environ.get(env_name)
         if val is not None:
             default_val = DEFAULT_CONFIG.get(section, {}).get(key)
             cfg[section][key] = _env_to_config_val(val, default_val)
 
-    # Neu erzeugte Config sofort speichern (überschreibt sich beim nächsten WebUI-Save)
     _save_config(cfg)
-    _log(f"📝 config.json aus Env-Vars erzeugt: {CONFIG_PATH}")
+    _log(f"config.json aus Env-Vars erzeugt: {CONFIG_PATH}")
     return cfg
 
 
 def _save_config(cfg: Dict[str, Any]) -> None:
-    """Speichert Config als JSON."""
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
 
 def _deep_merge(base: Dict, override: Dict) -> None:
-    """Merge override dict into base dict recursively (modifiziert base in-place)."""
     for key, value in override.items():
         if key in base and isinstance(base[key], dict) and isinstance(value, dict):
             _deep_merge(base[key], value)
@@ -320,14 +275,13 @@ def _deep_merge(base: Dict, override: Dict) -> None:
 
 
 def _mask_key(key: str) -> str:
-    """Maskiert API-Keys für die Anzeige."""
     if not key or len(key) < 8:
         return key
-    return key[:4] + "•" * (len(key) - 8) + key[-4:]
+    return key[:4] + "\u2022" * (len(key) - 8) + key[-4:]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# HTML Dashboard (Single Page App, Vanilla JS, Dark Theme)
+# HTML Dashboard
 # ═══════════════════════════════════════════════════════════════════════════
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -335,20 +289,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LocalProxy v2.0 — Konfiguration</title>
+<title>LocalProxy v3.0 — Konfiguration</title>
 <style>
 :root {
-  --bg: #0d1117;
-  --surface: #161b22;
-  --surface2: #21262d;
-  --border: #30363d;
-  --text: #e6edf3;
-  --text2: #8b949e;
-  --accent: #58a6ff;
-  --accent2: #238636;
-  --danger: #f85149;
-  --warn: #d2991d;
-  --radius: 8px;
+  --bg: #0d1117; --surface: #161b22; --surface2: #21262d; --border: #30363d;
+  --text: #e6edf3; --text2: #8b949e; --accent: #58a6ff; --accent2: #238636;
+  --danger: #f85149; --warn: #d2991d; --radius: 8px;
   --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
 }
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -361,9 +307,6 @@ header {
 header h1 { font-size: 1.3rem; font-weight: 600; }
 header .badge { font-size: 0.75rem; background: var(--accent2); color: #fff; padding: 3px 10px; border-radius: 12px; }
 header .status { display: flex; gap: 16px; align-items: center; }
-.status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-.status-dot.ok { background: #3fb950; }
-.status-dot.err { background: var(--danger); }
 nav {
   background: var(--surface); border-bottom: 1px solid var(--border);
   display: flex; gap: 0; padding: 0 24px; overflow-x: auto;
@@ -383,7 +326,6 @@ section.active { display: block; }
   padding: 20px; margin-bottom: 16px;
 }
 .card h3 { font-size: 1rem; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
-.card h3 .icon { font-size: 1.2rem; }
 .form-group { margin-bottom: 14px; }
 .form-group label { display: block; font-size: 0.82rem; color: var(--text2); margin-bottom: 4px; font-weight: 500; }
 .form-group .hint { font-size: 0.72rem; color: var(--text2); opacity: 0.7; margin-top: 2px; }
@@ -393,731 +335,491 @@ input[type="text"], input[type="url"], input[type="number"], input[type="passwor
   transition: border-color .15s;
 }
 input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
-input[type="range"] { width: 100%; accent-color: var(--accent); }
 .row { display: flex; gap: 12px; }
 .row > * { flex: 1; }
 .toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; }
 .toggle-row span { font-size: 0.9rem; }
 .toggle {
-  position: relative; width: 44px; height: 24px; cursor: pointer;
+  position: relative; width: 44px; height: 24px; flex-shrink: 0;
 }
-.toggle input { display: none; }
+.toggle input { opacity: 0; width: 0; height: 0; }
 .toggle .slider {
-  position: absolute; inset: 0; background: var(--surface2); border: 1px solid var(--border);
-  border-radius: 12px; transition: .2s;
+  position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+  background: var(--surface2); border-radius: 24px; border: 1px solid var(--border);
+  transition: .2s;
 }
-.toggle .slider::after {
-  content: ''; position: absolute; width: 18px; height: 18px; border-radius: 50%;
-  background: var(--text2); top: 2px; left: 2px; transition: .2s;
+.toggle .slider:before {
+  content: ""; position: absolute; height: 18px; width: 18px;
+  left: 2px; bottom: 2px; background: var(--text2); border-radius: 50%;
+  transition: .2s;
 }
 .toggle input:checked + .slider { background: var(--accent2); border-color: var(--accent2); }
-.toggle input:checked + .slider::after { background: #fff; transform: translateX(20px); }
-.range-value { font-size: 0.8rem; color: var(--accent); margin-left: 8px; font-weight: 600; }
+.toggle input:checked + .slider:before { transform: translateX(20px); background: #fff; }
+.actions { display: flex; gap: 12px; margin-top: 20px; }
 .btn {
-  padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer;
-  font-size: 0.9rem; font-weight: 500; transition: .15s; font-family: var(--font);
+  padding: 10px 20px; border: none; border-radius: var(--radius); font-size: 0.9rem;
+  cursor: pointer; font-family: var(--font); font-weight: 500;
+  transition: background .15s;
 }
 .btn-primary { background: var(--accent2); color: #fff; }
 .btn-primary:hover { background: #2ea043; }
-.btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
-.btn-secondary:hover { background: var(--border); }
 .btn-danger { background: var(--danger); color: #fff; }
-.actions { display: flex; gap: 8px; margin-top: 20px; justify-content: flex-end; }
+.btn-danger:hover { background: #e5534b; }
 .toast {
   position: fixed; bottom: 24px; right: 24px; padding: 12px 20px;
-  border-radius: var(--radius); font-size: 0.9rem; z-index: 200;
-  animation: slideUp .3s ease; box-shadow: 0 4px 20px rgba(0,0,0,.4);
+  border-radius: var(--radius); font-size: 0.85rem; color: #fff;
+  opacity: 0; transform: translateY(20px); transition: .3s;
+  z-index: 200;
 }
-.toast.success { background: var(--accent2); color: #fff; }
-.toast.error { background: var(--danger); color: #fff; }
-@keyframes slideUp { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
-
-code { background: var(--surface2); padding: 2px 6px; border-radius: 4px; font-size: 0.85em; }
-pre { background: var(--surface2); padding: 12px; border-radius: var(--radius); overflow-x: auto; font-size: 0.82rem; }
+.toast.show { opacity: 1; transform: translateY(0); }
+.toast.success { background: var(--accent2); }
+.toast.error { background: var(--danger); }
+.model-tabs { display: flex; gap: 0; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+.model-tabs button {
+  background: none; border: none; color: var(--text2); cursor: pointer;
+  padding: 8px 16px; font-size: 0.85rem; font-family: var(--font);
+  border-bottom: 2px solid transparent;
+}
+.model-tabs button:hover { color: var(--text); }
+.model-tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
+.model-card { display: none; }
+.model-card.active { display: block; }
+.status-line { font-size: 0.8rem; color: var(--text2); margin-top: 4px; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+.status-dot.ok { background: #3fb950; }
+.status-dot.err { background: var(--danger); }
 </style>
 </head>
 <body>
 <header>
-  <div>
-    <h1>🦊 LocalProxy <span class="badge">v2.0</span></h1>
-    <span style="font-size:0.75rem;color:var(--text2)">Konfiguration &amp; Dashboard</span>
-  </div>
-  <div style="display:flex;align-items:center;gap:12px">
-    <span id="userDisplay" style="font-size:0.8rem;color:var(--text2)"></span>
-    <button class="btn btn-secondary" onclick="logout()" style="font-size:0.75rem;padding:4px 12px">🚪 Abmelden</button>
-    <div class="status">
-      <span id="proxyStatus"><span class="status-dot err"></span> Proxy</span>
-      <span id="lokalFreeStatus"><span class="status-dot err"></span> Lokal/Free</span>
-      <span id="cloudStatus"><span class="status-dot err"></span> Cloud</span>
-    </div>
+  <h1>LocalProxy <span class="badge">v3.0</span></h1>
+  <div class="status">
+    <span id="statusIndicator"><span class="status-dot" id="statusDot"></span><span id="statusText"></span></span>
+    <small style="color:var(--text2)">Port <span id="proxyPort">9001</span></small>
   </div>
 </header>
 <nav>
-  <button class="active" data-tab="models">🤖 Modelle</button>
-  <button data-tab="cloud">☁️ Cloud-APIs</button>
-  <button data-tab="tokens">🎯 Tokens &amp; Timeouts</button>
-  <button data-tab="features">⚙️ Features</button>
-  <button data-tab="hindsight">🧠 Hindsight</button>
-  <button data-tab="verify">✅ Verifikation</button>
-  <button data-tab="logs">📋 Log</button>
-  <button data-tab="profiles">💾 Profile</button>
+  <button data-section="models" class="active">Modelle</button>
+  <button data-section="hindsight">Hindsight</button>
+  <button data-section="proxy">Proxy</button>
 </nav>
 <main>
-  <!-- Models -->
-  <section id="tab-models" class="active">
+
+  <!-- ====== SEKTION: MODELLE ====== -->
+  <section id="section-models" class="active">
     <div class="card">
-      <h3><span class="icon">🖥️</span> Lokal/Free (Worker &amp; Fast)</h3>
+      <h3>Default-Kategorie</h3>
       <div class="form-group">
-        <label>Lokal/Free API URL</label>
-        <input type="url" id="cfg-models-vllm_api_url" placeholder="http://localhost:8000/v1/chat/completions">
-        <div class="hint">Endpoint für Lokal/Free (lokal oder Cloud-Free-Tier)</div>
-      </div>
-      <div class="form-group">
-        <label>Lokal/Free API Key (optional)</label>
-        <input type="password" id="cfg-models-vllm_api_key" placeholder="sk-... für Cloud-Free-Tier">
-        <div class="hint">Leer lassen für lokalen Endpoint ohne Auth</div>
-      </div>
-      <div class="row">
-        <div class="form-group">
-          <label>Hauptmodell (Worker 80B)</label>
-          <input type="text" id="cfg-models-model_name" placeholder="Qwen/Qwen3-Next-80B-Chat-mxfp4">
-        </div>
-        <div class="form-group">
-          <label>Schnelles Modell (27B)</label>
-          <input type="text" id="cfg-models-fast_model_name" placeholder="Qwen/Qwen3.6-27B-Chat-FP8">
-        </div>
+        <label>Standard-Kategorie (wenn kein --flag im Prompt)</label>
+        <select id="defaultCategory">
+          <option value="local">local — lokales Modell</option>
+          <option value="light">light — schnelles Cloud-Modell</option>
+          <option value="strong">strong — leistungsstarkes Modell</option>
+          <option value="vision">vision — multimodales Modell</option>
+        </select>
       </div>
     </div>
+
     <div class="card">
-      <h3><span class="icon">🔌</span> Proxy-Einstellungen</h3>
-      <div class="row">
+      <h3>Modell-Kategorien</h3>
+      <div class="model-tabs">
+        <button data-model="local" class="active">local</button>
+        <button data-model="light">light</button>
+        <button data-model="strong">strong</button>
+        <button data-model="vision">vision</button>
+      </div>
+
+      <div id="modelCard_local" class="model-card active">
         <div class="form-group">
-          <label>Proxy Port</label>
-          <input type="number" id="cfg-proxy-port" min="1" max="65535">
+          <label>API URL (OpenAI-kompatibel)</label>
+          <input type="url" id="local_api_url" placeholder="http://localhost:8000/v1/chat/completions">
         </div>
         <div class="form-group">
-          <label>API-Key <span style="font-size:0.7rem;color:var(--warn)">(auto-generiert wenn leer)</span></label>
-          <input type="text" id="cfg-proxy-api_key" placeholder="localfox-...">
+          <label>API Key</label>
+          <input type="password" id="local_api_key" placeholder="sk-...">
         </div>
+        <div class="form-group">
+          <label>Model Name</label>
+          <input type="text" id="local_model_name" placeholder="Qwen/Qwen3-Next-80B">
+        </div>
+        <div class="row">
+          <div class="form-group">
+            <label>Max Tokens</label>
+            <input type="number" id="local_max_tokens" min="1" max="256000">
+          </div>
+          <div class="form-group">
+            <label>Timeout (Sekunden)</label>
+            <input type="number" id="local_timeout_seconds" min="10" max="3600">
+          </div>
+        </div>
+        <div class="toggle-row">
+          <span>Vision (image_url Support)</span>
+          <label class="toggle"><input type="checkbox" id="local_is_vision"><span class="slider"></span></label>
+        </div>
+        <button class="btn btn-primary" onclick="testCategory('local')" style="margin-top:8px">Test-Endpunkt</button>
+        <div class="status-line" id="local_test_status"></div>
       </div>
-      <div class="toggle-row">
-        <span>🔐 Authentifizierung</span>
-        <label class="toggle"><input type="checkbox" id="cfg-proxy-auth_enabled"><span class="slider"></span></label>
+
+      <div id="modelCard_light" class="model-card">
+        <div class="form-group">
+          <label>API URL (OpenAI-kompatibel)</label>
+          <input type="url" id="light_api_url" placeholder="https://api.openai.com/v1/chat/completions">
+        </div>
+        <div class="form-group">
+          <label>API Key</label>
+          <input type="password" id="light_api_key" placeholder="sk-...">
+        </div>
+        <div class="form-group">
+          <label>Model Name</label>
+          <input type="text" id="light_model_name" placeholder="gpt-4.1-mini">
+        </div>
+        <div class="row">
+          <div class="form-group">
+            <label>Max Tokens</label>
+            <input type="number" id="light_max_tokens" min="1" max="256000">
+          </div>
+          <div class="form-group">
+            <label>Timeout (Sekunden)</label>
+            <input type="number" id="light_timeout_seconds" min="10" max="3600">
+          </div>
+        </div>
+        <div class="toggle-row">
+          <span>Vision (image_url Support)</span>
+          <label class="toggle"><input type="checkbox" id="light_is_vision"><span class="slider"></span></label>
+        </div>
+        <button class="btn btn-primary" onclick="testCategory('light')" style="margin-top:8px">Test-Endpunkt</button>
+        <div class="status-line" id="light_test_status"></div>
       </div>
-      <div class="toggle-row">
-        <span>💬 Chatty Mode (Status-Infos in Antworten)</span>
-        <label class="toggle"><input type="checkbox" id="cfg-proxy-chatty_mode"><span class="slider"></span></label>
+
+      <div id="modelCard_strong" class="model-card">
+        <div class="form-group">
+          <label>API URL (OpenAI-kompatibel)</label>
+          <input type="url" id="strong_api_url" placeholder="https://api.anthropic.com/v1/chat/completions">
+        </div>
+        <div class="form-group">
+          <label>API Key</label>
+          <input type="password" id="strong_api_key" placeholder="sk-ant-...">
+        </div>
+        <div class="form-group">
+          <label>Model Name</label>
+          <input type="text" id="strong_model_name" placeholder="claude-sonnet-4-20250514">
+        </div>
+        <div class="row">
+          <div class="form-group">
+            <label>Max Tokens</label>
+            <input type="number" id="strong_max_tokens" min="1" max="256000">
+          </div>
+          <div class="form-group">
+            <label>Timeout (Sekunden)</label>
+            <input type="number" id="strong_timeout_seconds" min="10" max="3600">
+          </div>
+        </div>
+        <div class="toggle-row">
+          <span>Vision (image_url Support)</span>
+          <label class="toggle"><input type="checkbox" id="strong_is_vision"><span class="slider"></span></label>
+        </div>
+        <button class="btn btn-primary" onclick="testCategory('strong')" style="margin-top:8px">Test-Endpunkt</button>
+        <div class="status-line" id="strong_test_status"></div>
       </div>
-    </div>
-    <div class="actions">
-      <button class="btn btn-primary" onclick="saveAndRestart()">💾 Speichern &amp; 🔄 Neustart</button>
+
+      <div id="modelCard_vision" class="model-card">
+        <div class="form-group">
+          <label>API URL (OpenAI-kompatibel)</label>
+          <input type="url" id="vision_api_url" placeholder="https://api.openai.com/v1/chat/completions">
+        </div>
+        <div class="form-group">
+          <label>API Key</label>
+          <input type="password" id="vision_api_key" placeholder="sk-...">
+        </div>
+        <div class="form-group">
+          <label>Model Name</label>
+          <input type="text" id="vision_model_name" placeholder="gpt-4o">
+        </div>
+        <div class="row">
+          <div class="form-group">
+            <label>Max Tokens</label>
+            <input type="number" id="vision_max_tokens" min="1" max="256000">
+          </div>
+          <div class="form-group">
+            <label>Timeout (Sekunden)</label>
+            <input type="number" id="vision_timeout_seconds" min="10" max="3600">
+          </div>
+        </div>
+        <div class="toggle-row">
+          <span>Vision (image_url Support)</span>
+          <label class="toggle"><input type="checkbox" id="vision_is_vision"><span class="slider"></span></label>
+        </div>
+        <button class="btn btn-primary" onclick="testCategory('vision')" style="margin-top:8px">Test-Endpunkt</button>
+        <div class="status-line" id="vision_test_status"></div>
+      </div>
     </div>
   </section>
 
-  <!-- Cloud APIs -->
-  <section id="tab-cloud">
+  <!-- ====== SEKTION: HINDSIGHT ====== -->
+  <section id="section-hindsight">
     <div class="card">
-      <h3><span class="icon">☁️</span> Cloud-Planer (OpenAI-kompatibel)</h3>
+      <h3>Hindsight Memory</h3>
       <div class="toggle-row">
-        <span>Cloud-Planung aktivieren</span>
-        <label class="toggle"><input type="checkbox" id="cfg-cloud-enabled"><span class="slider"></span></label>
-      </div>
-      <div class="form-group">
-        <label>API URL</label>
-        <input type="url" id="cfg-cloud-api_url" placeholder="https://api.openai.com/v1/chat/completions">
-      </div>
-      <div class="form-group">
-        <label>API Key</label>
-        <input type="password" id="cfg-cloud-api_key" placeholder="sk-...">
-      </div>
-      <div class="row">
-        <div class="form-group">
-          <label>Modell</label>
-          <input type="text" id="cfg-cloud-model" placeholder="gpt-4.1-mini">
-        </div>
-        <div class="form-group">
-          <label>Max Tokens</label>
-          <input type="number" id="cfg-cloud-max_tokens" min="64" max="1048576">
-        </div>
-      </div>
-      <div class="form-group">
-        <label>Timeout (Sekunden)</label>
-        <input type="number" id="cfg-cloud-timeout_seconds" min="5" max="600">
-      </div>
-    </div>
-    <div class="card">
-      <h3><span class="icon">🔄</span> LiteLLM (OpenRouter / DeepSeek / Claude)</h3>
-      <div class="form-group">
-        <label>LiteLLM Modell</label>
-        <input type="text" id="cfg-litellm-model" placeholder="openrouter/deepseek/deepseek-r1">
-        <div class="hint">z.B. <code>openrouter/anthropic/claude-3.7-sonnet</code> oder <code>deepseek/deepseek-r1</code></div>
-      </div>
-      <div class="form-group">
-        <label>LiteLLM API Key</label>
-        <input type="password" id="cfg-litellm-api_key" placeholder="sk-or-...">
-      </div>
-      <div class="form-group">
-        <label>API URL (optional, z.B. OpenRouter Base-URL)</label>
-        <input type="url" id="cfg-litellm-api_url" placeholder="https://openrouter.ai/api/v1">
-        <div class="hint">Leer lassen für LiteLLM-Standard-Routing (anhand des Modellnamens)</div>
-      </div>
-      <div class="row">
-        <div class="form-group">
-          <label>Max Tokens</label>
-          <input type="number" id="cfg-litellm-max_tokens" min="64" max="1048576" value="16384">
-        </div>
-        <div class="form-group">
-          <label>Timeout (Sekunden)</label>
-          <input type="number" id="cfg-litellm-timeout_seconds" min="5" max="600" value="180">
-        </div>
-      </div>
-    </div>
-    <div class="actions">
-      <button class="btn btn-primary" onclick="saveAndRestart()">💾 Speichern &amp; 🔄 Neustart</button>
-    </div>
-  </section>
-
-  <!-- Tokens & Timeouts -->
-  <section id="tab-tokens">
-    <div class="card">
-      <h3><span class="icon">🎯</span> Token-Budgets</h3>
-      <div class="form-group">
-        <label>Direkte Requests: Max Tokens <span class="range-value" id="val-direct_max_tokens">32768</span></label>
-        <input type="range" id="cfg-tokens-direct_max_tokens" min="256" max="131072" step="256" oninput="document.getElementById('val-direct_max_tokens').textContent=this.value">
-      </div>
-      <div class="form-group">
-        <label>Agent-Worker: Max Tokens <span class="range-value" id="val-agent_max_tokens">65536</span></label>
-        <input type="range" id="cfg-tokens-agent_max_tokens" min="256" max="262144" step="256" oninput="document.getElementById('val-agent_max_tokens').textContent=this.value">
-      </div>
-      <div class="form-group">
-        <label>Caveman-Plan: Max Tokens <span class="range-value" id="val-caveman_max_tokens">8192</span></label>
-        <input type="range" id="cfg-tokens-caveman_max_tokens" min="64" max="65536" step="64" oninput="document.getElementById('val-caveman_max_tokens').textContent=this.value">
-      </div>
-    </div>
-    <div class="card">
-      <h3><span class="icon">⏱️</span> Timeouts</h3>
-      <div class="form-group">
-        <label>Sub-Agent Timeout (Sekunden) <span class="range-value" id="val-sub_agent_timeout">60</span></label>
-        <input type="range" id="cfg-tokens-sub_agent_timeout_seconds" min="5" max="300" step="5" oninput="document.getElementById('val-sub_agent_timeout').textContent=this.value">
-      </div>
-      <div class="form-group">
-        <label>Verify Timeout (Sekunden) <span class="range-value" id="val-verify_timeout">45</span></label>
-        <input type="range" id="cfg-tokens-verify_timeout_seconds" min="5" max="300" step="5" oninput="document.getElementById('val-verify_timeout').textContent=this.value">
-      </div>
-    </div>
-    <div class="actions">
-      <button class="btn btn-primary" onclick="saveAndRestart()">💾 Speichern &amp; 🔄 Neustart</button>
-    </div>
-  </section>
-
-  <!-- Features -->
-  <section id="tab-features">
-    <div class="card">
-      <h3><span class="icon">⚙️</span> Feature-Toggles</h3>
-      <div class="toggle-row">
-        <span>🗿 Caveman Ultra (Token-Kompression)</span>
-        <label class="toggle"><input type="checkbox" id="cfg-caveman-enabled"><span class="slider"></span></label>
-      </div>
-      <div class="toggle-row">
-        <span>🧠 Hindsight Memory</span>
-        <label class="toggle"><input type="checkbox" id="cfg-hindsight-enabled"><span class="slider"></span></label>
-      </div>
-      <div class="toggle-row">
-        <span>✅ Phase-3-Verifikation (Linter/Tests)</span>
-        <label class="toggle"><input type="checkbox" id="cfg-verify-enabled"><span class="slider"></span></label>
-      </div>
-      <div class="toggle-row">
-        <span>🔧 MCP-Server (VS Code Tool-Zugriff)</span>
-        <label class="toggle"><input type="checkbox" id="cfg-mcp-enabled"><span class="slider"></span></label>
-      </div>
-    </div>
-    <div class="actions">
-      <button class="btn btn-primary" onclick="saveAndRestart()">💾 Speichern &amp; 🔄 Neustart</button>
-    </div>
-  </section>
-
-  <!-- Hindsight -->
-  <section id="tab-hindsight">
-    <div class="card">
-      <h3><span class="icon">🧠</span> Hindsight Memory — Qdrant</h3>
-      <div class="toggle-row">
-        <span>Qdrant verwenden (statt JSONL)</span>
-        <label class="toggle"><input type="checkbox" id="cfg-hindsight-use_qdrant"><span class="slider"></span></label>
+        <span>Hindsight aktiviert</span>
+        <label class="toggle"><input type="checkbox" id="hindsight_enabled"><span class="slider"></span></label>
       </div>
       <div class="form-group">
         <label>Qdrant URL</label>
-        <input type="url" id="cfg-hindsight-qdrant_url" placeholder="http://localhost:6333">
+        <input type="text" id="qdrant_url" placeholder="http://localhost:6333">
+        <div class="hint">Leer lassen fuer JSONL-Fallback</div>
       </div>
       <div class="form-group">
         <label>Qdrant API Key</label>
-        <input type="password" id="cfg-hindsight-qdrant_api_key" placeholder="(optional)">
+        <input type="password" id="qdrant_api_key" placeholder="(optional)">
+      </div>
+      <div class="toggle-row">
+        <span>Qdrant verwenden</span>
+        <label class="toggle"><input type="checkbox" id="use_qdrant"><span class="slider"></span></label>
+      </div>
+      <div class="form-group">
+        <label>Collection Name</label>
+        <input type="text" id="hindsight_collection" placeholder="hindsight_memory">
       </div>
       <div class="row">
         <div class="form-group">
-          <label>Collection</label>
-          <input type="text" id="cfg-hindsight-collection" placeholder="hindsight_memory">
+          <label>Embedding Dimension</label>
+          <input type="number" id="embedding_dim" min="64" max="4096">
         </div>
         <div class="form-group">
-          <label>Embedding-Dimension</label>
-          <input type="number" id="cfg-hindsight-embedding_dim" min="64" max="4096">
+          <label>Max Memory Tokens</label>
+          <input type="number" id="max_memory_tokens" min="100" max="32000">
         </div>
       </div>
-    </div>
-    <div class="card">
-      <h3><span class="icon">📐</span> Recall &amp; Retain</h3>
-      <div class="form-group">
-        <label>Max Memory Tokens <span class="range-value" id="val-max_memory_tokens">4000</span></label>
-        <input type="range" id="cfg-hindsight-max_memory_tokens" min="256" max="16384" step="256" oninput="document.getElementById('val-max_memory_tokens').textContent=this.value">
+      <div class="row">
+        <div class="form-group">
+          <label>Min Similarity</label>
+          <input type="number" id="min_similarity" min="0" max="1" step="0.01">
+        </div>
+        <div class="form-group">
+          <label>Retain Delay (s)</label>
+          <input type="number" id="retain_delay_seconds" min="0" max="60" step="0.1">
+        </div>
       </div>
       <div class="form-group">
-        <label>Min Similarity <span class="range-value" id="val-min_similarity">0.18</span></label>
-        <input type="range" id="cfg-hindsight-min_similarity" min="0.05" max="0.95" step="0.01" oninput="document.getElementById('val-min_similarity').textContent=this.value">
+        <label>Speicherverzeichnis</label>
+        <input type="text" id="hindsight_dir" placeholder="./.hindsight_memory">
       </div>
-      <div class="form-group">
-        <label>Retain Delay (Sekunden)</label>
-        <input type="number" id="cfg-hindsight-retain_delay_seconds" min="0" max="60" step="0.1">
-      </div>
-      <div class="form-group">
-        <label>JSONL-Speicherverzeichnis</label>
-        <input type="text" id="cfg-hindsight-dir" placeholder="./.hindsight_memory">
-      </div>
-    </div>
-    <div class="actions">
-      <button class="btn btn-secondary" onclick="clearMemory()">🗑️ Memory löschen</button>
-      <button class="btn btn-primary" onclick="saveAndRestart()">💾 Speichern &amp; 🔄 Neustart</button>
     </div>
   </section>
 
-  <!-- Verify -->
-  <section id="tab-verify">
+  <!-- ====== SEKTION: PROXY ====== -->
+  <section id="section-proxy">
     <div class="card">
-      <h3><span class="icon">✅</span> Phase 3 — Verifikation</h3>
+      <h3>Proxy-Einstellungen</h3>
       <div class="form-group">
-        <label>Lint-Befehl</label>
-        <input type="text" id="cfg-verify-lint_command" placeholder="ruff check">
-        <div class="hint">Wird im Shell ausgeführt, Output wird analysiert</div>
+        <label>Port</label>
+        <input type="number" id="proxy_port" min="1" max="65535">
+      </div>
+      <div class="toggle-row">
+        <span>Auth aktiviert</span>
+        <label class="toggle"><input type="checkbox" id="proxy_auth_enabled"><span class="slider"></span></label>
       </div>
       <div class="form-group">
-        <label>Test-Befehl</label>
-        <input type="text" id="cfg-verify-test_command" placeholder="pytest -x --tb=short">
-        <div class="hint">Wird im Shell ausgeführt, Output wird analysiert</div>
+        <label>API Key</label>
+        <input type="text" id="proxy_api_key" placeholder="localfox-... (auto-generiert falls leer)">
       </div>
     </div>
-    <div class="actions">
-      <button class="btn btn-primary" onclick="saveAndRestart()">💾 Speichern &amp; 🔄 Neustart</button>
-    </div>
-  </section>
-  <!-- Logs -->
-  <section id="tab-logs">
     <div class="card">
-      <h3><span class="icon">📋</span> Live-Log <span style="font-weight:400;font-size:0.75rem;color:var(--text2)">(letzte 200 Zeilen, auto-refresh)</span></h3>
-      <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
-        <button class="btn btn-secondary" onclick="refreshLogs()" style="font-size:0.8rem;padding:4px 12px">🔄 Jetzt laden</button>
-        <label style="display:flex;align-items:center;gap:6px;font-size:0.8rem;color:var(--text2);cursor:pointer">
-          <input type="checkbox" id="log-autorefresh" checked onchange="toggleLogAutoRefresh()"> Auto-Refresh (3s)
-        </label>
-        <span id="log-info" style="font-size:0.75rem;color:var(--text2);margin-left:auto"></span>
+      <h3>Token-Schutz</h3>
+      <div class="form-group">
+        <label>Tool-Result-Cap (Zeichen, 0=aus)</label>
+        <input type="number" id="tool_result_cap" min="0" max="1000000">
+        <div class="hint">Kappt grosse grep/read-Ergebnisse auf dieses Limit. 0 = deaktiviert.</div>
       </div>
-      <pre id="log-viewer" style="background:var(--bg);border:1px solid var(--border);max-height:60vh;overflow-y:auto;font-size:0.75rem;line-height:1.6;white-space:pre-wrap;word-break:break-all">Wird geladen...</pre>
     </div>
   </section>
 
-  <!-- Profiles -->
-  <section id="tab-profiles">
-    <div class="card">
-      <h3><span class="icon">💾</span> Setup als Profil sichern</h3>
-      <p style="font-size:0.85rem;color:var(--text2);margin-bottom:12px">
-        Sichert die <em>komplette</em> Konfiguration inkl. aller API-Keys als benanntes Profil.
-        So kannst du schnell zwischen verschiedenen Setups wechseln.
-      </p>
-      <div style="display:flex;gap:8px;align-items:flex-end">
-        <div class="form-group" style="flex:1;margin-bottom:0">
-          <label>Profil-Name</label>
-          <input type="text" id="profile-name" placeholder="z.B. produktiv-lokal, staging-cloud, deepseek-offen">
-        </div>
-        <button class="btn btn-primary" onclick="saveProfile()" style="height:38px">💾 Jetzt sichern</button>
-      </div>
-    </div>
-    <div class="card">
-      <h3><span class="icon">📂</span> Gespeicherte Profile</h3>
-      <div id="profile-list" style="font-size:0.85rem;color:var(--text2)">
-        Wird geladen...
-      </div>
-    </div>
-  </section>
+  <div class="actions">
+    <button class="btn btn-primary" onclick="saveConfig()">Konfiguration speichern</button>
+    <button class="btn btn-danger" onclick="restartProxy()">Proxy neustarten</button>
+  </div>
 </main>
 
+<div class="toast" id="toast"></div>
+
 <script>
-// ── State ──────────────────────────────────────────────────────────────
-let currentConfig = {};
-
-const ID_MAP = {
-  'cfg-models-vllm_api_url': ['models','vllm_api_url'],
-  'cfg-models-vllm_api_key': ['models','vllm_api_key'],
-  'cfg-models-model_name': ['models','model_name'],
-  'cfg-models-fast_model_name': ['models','fast_model_name'],
-  'cfg-proxy-port': ['proxy','port'],
-  'cfg-proxy-auth_enabled': ['proxy','auth_enabled'],
-  'cfg-proxy-api_key': ['proxy','api_key'],
-  'cfg-proxy-chatty_mode': ['proxy','chatty_mode'],
-  'cfg-cloud-enabled': ['cloud','enabled'],
-  'cfg-cloud-api_url': ['cloud','api_url'],
-  'cfg-cloud-api_key': ['cloud','api_key'],
-  'cfg-cloud-model': ['cloud','model'],
-  'cfg-cloud-max_tokens': ['cloud','max_tokens'],
-  'cfg-cloud-timeout_seconds': ['cloud','timeout_seconds'],
-  'cfg-litellm-model': ['litellm','model'],
-  'cfg-litellm-api_key': ['litellm','api_key'],
-  'cfg-litellm-api_url': ['litellm','api_url'],
-  'cfg-litellm-max_tokens': ['litellm','max_tokens'],
-  'cfg-litellm-timeout_seconds': ['litellm','timeout_seconds'],
-  'cfg-tokens-direct_max_tokens': ['tokens','direct_max_tokens'],
-  'cfg-tokens-agent_max_tokens': ['tokens','agent_max_tokens'],
-  'cfg-tokens-caveman_max_tokens': ['tokens','caveman_max_tokens'],
-  'cfg-tokens-sub_agent_timeout_seconds': ['tokens','sub_agent_timeout_seconds'],
-  'cfg-tokens-verify_timeout_seconds': ['tokens','verify_timeout_seconds'],
-  'cfg-caveman-enabled': ['caveman','enabled'],
-  'cfg-hindsight-enabled': ['hindsight','enabled'],
-  'cfg-hindsight-use_qdrant': ['hindsight','use_qdrant'],
-  'cfg-hindsight-qdrant_url': ['hindsight','qdrant_url'],
-  'cfg-hindsight-qdrant_api_key': ['hindsight','qdrant_api_key'],
-  'cfg-hindsight-collection': ['hindsight','collection'],
-  'cfg-hindsight-embedding_dim': ['hindsight','embedding_dim'],
-  'cfg-hindsight-max_memory_tokens': ['hindsight','max_memory_tokens'],
-  'cfg-hindsight-min_similarity': ['hindsight','min_similarity'],
-  'cfg-hindsight-retain_delay_seconds': ['hindsight','retain_delay_seconds'],
-  'cfg-hindsight-dir': ['hindsight','dir'],
-  'cfg-verify-enabled': ['verify','enabled'],
-  'cfg-verify-lint_command': ['verify','lint_command'],
-  'cfg-verify-test_command': ['verify','test_command'],
-  'cfg-mcp-enabled': ['mcp','enabled'],
-};
-
-function getNested(obj, path) { return path.reduce((o,k) => (o||{})[k], obj); }
-
-function setField(id, value) {
-  const path = ID_MAP[id]; if (!path) return;
-  let obj = currentConfig;
-  for (let i=0; i<path.length-1; i++) { if (!obj[path[i]]) obj[path[i]]={}; obj=obj[path[i]]; }
-  obj[path[path.length-1]] = value;
-}
-
-function populateForm() {
-  Object.entries(ID_MAP).forEach(([id, path]) => {
-    const el = document.getElementById(id); if (!el) return;
-    const val = getNested(currentConfig, path);
-    if (el.type === 'checkbox') el.checked = !!val;
-    else el.value = val ?? '';
-  });
-  // Sync range displays
-  ['direct_max_tokens','agent_max_tokens','caveman_max_tokens','max_memory_tokens'].forEach(k => {
-    const el = document.getElementById('cfg-tokens-'+k) || document.getElementById('cfg-hindsight-'+k);
-    const disp = document.getElementById('val-'+k);
-    if (el && disp) disp.textContent = el.value;
-  });
-  ['sub_agent_timeout_seconds','verify_timeout_seconds'].forEach(k => {
-    const el = document.getElementById('cfg-tokens-'+k);
-    const disp = document.getElementById('val-'+k.replace('_seconds',''));
-    if (el && disp) disp.textContent = el.value;
-  });
-  const minSim = document.getElementById('cfg-hindsight-min_similarity');
-  if (minSim) document.getElementById('val-min_similarity').textContent = minSim.value;
-}
-
-function collectForm() {
-  Object.entries(ID_MAP).forEach(([id,_]) => {
-    const el = document.getElementById(id); if (!el) return;
-    const val = el.type === 'checkbox' ? el.checked :
-                (el.type === 'number' || el.type === 'range') ? (parseFloat(el.value) || 0) : el.value;
-    setField(id, val);
-  });
-}
-
-// ── Tab Switching ──────────────────────────────────────────────────────
+// ============ NAVIGATION ============
 document.querySelectorAll('nav button').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('section').forEach(s => s.classList.remove('active'));
     btn.classList.add('active');
-    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+    const section = btn.dataset.section;
+    document.querySelectorAll('main > section').forEach(s => s.classList.remove('active'));
+    document.getElementById('section-' + section).classList.add('active');
   });
 });
 
-// ── Toast ──────────────────────────────────────────────────────────────
-function toast(msg, type='success') {
-  const t = document.createElement('div');
-  t.className = 'toast ' + type; t.textContent = msg;
-  document.body.appendChild(t);
-  setTimeout(() => t.remove(), 3000);
+// ============ MODEL-TABS ============
+document.querySelectorAll('.model-tabs button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.model-tabs button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const model = btn.dataset.model;
+    document.querySelectorAll('.model-card').forEach(c => c.classList.remove('active'));
+    document.getElementById('modelCard_' + model).classList.add('active');
+  });
+});
+
+// ============ TOAST ============
+function showToast(msg, type) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast ' + type + ' show';
+  setTimeout(() => { t.classList.remove('show'); }, 3000);
 }
 
-// ── API Calls ──────────────────────────────────────────────────────────
+// ============ LOAD CONFIG ============
 async function loadConfig() {
   try {
-    const r = await apiFetch('/webui/api/config');
-    currentConfig = await r.json();
-    populateForm();
-    toast('Konfiguration geladen', 'success');
-  } catch(e) { toast('Fehler beim Laden: '+e.message, 'error'); }
+    const r = await fetch('/webui/api/config');
+    const cfg = await r.json();
+
+    // Default category
+    document.getElementById('defaultCategory').value = cfg.default_category || 'light';
+
+    // Model categories
+    const cats = cfg.model_categories || {};
+    for (const key of ['local','light','strong','vision']) {
+      const c = cats[key] || {};
+      document.getElementById(key + '_api_url').value = c.api_url || '';
+      document.getElementById(key + '_api_key').value = c.api_key || '';
+      document.getElementById(key + '_model_name').value = c.model_name || '';
+      document.getElementById(key + '_max_tokens').value = c.max_tokens || 65536;
+      document.getElementById(key + '_timeout_seconds').value = c.timeout_seconds || 180;
+      document.getElementById(key + '_is_vision').checked = !!c.is_vision;
+    }
+
+    // Hindsight
+    const hs = cfg.hindsight || {};
+    document.getElementById('hindsight_enabled').checked = hs.enabled !== false;
+    document.getElementById('qdrant_url').value = hs.qdrant_url || '';
+    document.getElementById('qdrant_api_key').value = hs.qdrant_api_key || '';
+    document.getElementById('use_qdrant').checked = !!hs.use_qdrant;
+    document.getElementById('hindsight_collection').value = hs.collection || 'hindsight_memory';
+    document.getElementById('embedding_dim').value = hs.embedding_dim || 768;
+    document.getElementById('max_memory_tokens').value = hs.max_memory_tokens || 4000;
+    document.getElementById('min_similarity').value = hs.min_similarity || 0.18;
+    document.getElementById('retain_delay_seconds').value = hs.retain_delay_seconds || 0;
+    document.getElementById('hindsight_dir').value = hs.dir || './.hindsight_memory';
+
+    // Proxy
+    const px = cfg.proxy || {};
+    document.getElementById('proxy_port').value = px.port || 9001;
+    document.getElementById('proxy_auth_enabled').checked = px.auth_enabled !== false;
+    document.getElementById('proxy_api_key').value = px.api_key || '';
+
+    // Tokens
+    const tk = cfg.tokens || {};
+    document.getElementById('tool_result_cap').value = tk.tool_result_cap || 0;
+
+  } catch(e) {
+    showToast('Fehler beim Laden: ' + e.message, 'error');
+  }
 }
 
+// ============ SAVE CONFIG ============
 async function saveConfig() {
-  collectForm();
+  const cfg = {};
+
+  cfg.default_category = document.getElementById('defaultCategory').value;
+
+  cfg.model_categories = {};
+  for (const key of ['local','light','strong','vision']) {
+    cfg.model_categories[key] = {
+      api_url: document.getElementById(key + '_api_url').value,
+      api_key: document.getElementById(key + '_api_key').value,
+      model_name: document.getElementById(key + '_model_name').value,
+      max_tokens: parseInt(document.getElementById(key + '_max_tokens').value) || 65536,
+      timeout_seconds: parseFloat(document.getElementById(key + '_timeout_seconds').value) || 180,
+      is_vision: document.getElementById(key + '_is_vision').checked,
+    };
+  }
+
+  cfg.hindsight = {
+    enabled: document.getElementById('hindsight_enabled').checked,
+    qdrant_url: document.getElementById('qdrant_url').value,
+    qdrant_api_key: document.getElementById('qdrant_api_key').value,
+    use_qdrant: document.getElementById('use_qdrant').checked,
+    collection: document.getElementById('hindsight_collection').value,
+    embedding_dim: parseInt(document.getElementById('embedding_dim').value) || 768,
+    max_memory_tokens: parseInt(document.getElementById('max_memory_tokens').value) || 4000,
+    min_similarity: parseFloat(document.getElementById('min_similarity').value) || 0.18,
+    retain_delay_seconds: parseFloat(document.getElementById('retain_delay_seconds').value) || 0,
+    dir: document.getElementById('hindsight_dir').value,
+  };
+
+  cfg.proxy = {
+    port: parseInt(document.getElementById('proxy_port').value) || 9001,
+    auth_enabled: document.getElementById('proxy_auth_enabled').checked,
+    api_key: document.getElementById('proxy_api_key').value,
+  };
+
+  cfg.tokens = {
+    tool_result_cap: parseInt(document.getElementById('tool_result_cap').value) || 0,
+  };
+
   try {
-    const r = await apiFetch('/webui/api/config', {
-      method: 'PUT', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify(currentConfig)
+    const r = await fetch('/webui/api/config', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(cfg),
     });
-    if (r.ok) { toast('✅ Gespeichert — Proxy muss neu gestartet werden für Änderungen', 'success'); return true; }
-    else { const e = await r.json(); toast('Fehler: '+e.detail, 'error'); return false; }
-  } catch(e) { toast('Fehler beim Speichern: '+e.message, 'error'); return false; }
-}
-
-async function saveAndRestart() {
-  const saved = await saveConfig();
-  if (!saved) return;
-  toast('🔄 Starte Proxy neu...', 'success');
-  try {
-    const r = await apiFetch('/webui/api/restart', {method:'POST'});
-    if (r.ok) {
-      toast('✅ Neustart läuft — Seite lädt in 4s neu', 'success');
-      // Warten bis Proxy wieder da ist, dann neuladen
-      setTimeout(async () => {
-        for (let i=0; i<20; i++) {
-          try {
-            const rr = await fetch('/healthz');
-            if (rr.ok) { location.reload(); return; }
-          } catch(e) {}
-          await new Promise(r => setTimeout(r, 1000));
-        }
-        location.reload();
-      }, 4000);
-    } else {
-      toast('⚠️ Config gespeichert, aber Neustart fehlgeschlagen', 'error');
-    }
+    if (!r.ok) { const err = await r.json(); throw new Error(err.detail || 'Fehler'); }
+    showToast('Konfiguration gespeichert', 'success');
   } catch(e) {
-    // Proxy ist schon tot (erwartet), Seite lädt neu
-    toast('🔄 Neustart läuft...', 'success');
-    setTimeout(() => {
-      (async () => {
-        for (let i=0; i<20; i++) {
-          try { const rr = await fetch('/healthz'); if (rr.ok) { location.reload(); return; } } catch(e) {}
-          await new Promise(r => setTimeout(r, 1000));
-        }
-        location.reload();
-      })();
-    }, 3000);
+    showToast('Fehler: ' + e.message, 'error');
   }
 }
 
-async function clearMemory() {
-  if (!confirm('Hindsight Memory wirklich löschen?')) return;
+// ============ RESTART PROXY ============
+async function restartProxy() {
+  if (!confirm('Proxy wirklich neustarten? Laufende Requests werden abgebrochen.')) return;
   try {
-    const r = await apiFetch('/webui/api/memory/clear', {method:'POST'});
-    if (r.ok) toast('Memory gelöscht', 'success');
-    else toast('Fehler beim Löschen', 'error');
-  } catch(e) { toast('Fehler: '+e.message, 'error'); }
-}
-
-async function refreshStatus() {
-  try {
-    const r = await fetch('/healthz');
-    const h = await r.json();
-    document.querySelector('#proxyStatus .status-dot').className = 'status-dot ' + (h.status==='ok'?'ok':'err');
-    document.querySelector('#proxyStatus').childNodes[1].textContent = ' Proxy';
-  } catch(e) {}
-  try {
-    const r = await apiFetch('/webui/api/status');
-    const s = await r.json();
-    document.querySelector('#lokalFreeStatus .status-dot').className = 'status-dot ' + (s.vllm_ok?'ok':'err');
-    document.querySelector('#cloudStatus .status-dot').className = 'status-dot ' + (s.cloud_configured?'ok':'err');
-    if (s.user) document.getElementById('userDisplay').textContent = '👤 ' + s.user;
-  } catch(e) {}
-}
-
-let logAutoRefresh = true;
-let logTimer = null;
-
-function toggleLogAutoRefresh() {
-  logAutoRefresh = document.getElementById('log-autorefresh').checked;
-  if (logAutoRefresh) { startLogPolling(); }
-  else { if (logTimer) { clearInterval(logTimer); logTimer = null; } }
-}
-
-async function refreshLogs() {
-  try {
-    const r = await fetch('/logs?lines=200');
-    if (!r.ok) throw new Error(r.status);
-    const d = await r.json();
-    const el = document.getElementById('log-viewer');
-    if (el) {
-      el.textContent = d.lines.join('');
-      el.scrollTop = el.scrollHeight;
-    }
-    const info = document.getElementById('log-info');
-    if (info) info.textContent = d.count + '/' + d.total + ' Zeilen';
+    await fetch('/webui/api/restart', {method:'POST'});
+    showToast('Neustart eingeleitet...', 'success');
   } catch(e) {
-    const el = document.getElementById('log-viewer');
-    if (el) el.textContent = 'Fehler beim Laden: ' + e.message;
+    showToast('Neustart-Fehler: ' + e.message, 'error');
   }
 }
 
-function startLogPolling() {
-  if (logTimer) clearInterval(logTimer);
-  logTimer = setInterval(refreshLogs, 3000);
-}
+// ============ TEST ENDPOINT ============
+async function testCategory(key) {
+  const apiUrl = document.getElementById(key + '_api_url').value;
+  const apiKey = document.getElementById(key + '_api_key').value;
+  const modelName = document.getElementById(key + '_model_name').value;
+  const statusEl = document.getElementById(key + '_test_status');
 
-// ── Profile Management ────────────────────────────────────────────────
+  if (!apiUrl || !modelName) {
+    statusEl.innerHTML = '<span class="status-dot err"></span> URL und Model-Name erforderlich';
+    return;
+  }
 
-async function loadProfiles() {
-  const list = document.getElementById('profile-list');
-  if (!list) return;
+  statusEl.innerHTML = '<span class="status-dot" style="background:var(--warn)"></span> Teste...';
+
   try {
-    const r = await apiFetch('/webui/api/profiles');
+    const r = await fetch('/webui/api/test-endpoint', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({api_url: apiUrl, api_key: apiKey, model_name: modelName}),
+    });
     const data = await r.json();
-    if (!data.profiles || data.profiles.length === 0) {
-      list.innerHTML = '<p style="color:var(--text2)">Keine Profile gespeichert. Sichere dein aktuelles Setup mit einem Namen.</p>';
-      return;
-    }
-    list.innerHTML = data.profiles.map(p => {
-      const date = new Date(p.modified * 1000).toLocaleString('de-DE');
-      let info = '';
-      if (p.error) {
-        info = '<span style="color:var(--danger)">⚠️ Fehlerhaft</span>';
-      } else {
-        info = '🤖 ' + escapeHtml(p.model_name || '?');
-        if (p.cloud) info += ' &nbsp;☁️ ' + escapeHtml(p.cloud);
-        if (p.chatty) info += ' &nbsp;💬 Chatty';
-      }
-      return `<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:var(--surface2);border-radius:6px;margin-bottom:8px;border:1px solid var(--border)">
-        <div>
-          <strong style="color:var(--text)">${escapeHtml(p.name)}</strong>
-          <div style="font-size:0.75rem;color:var(--text2);margin-top:2px">${info} &nbsp;·&nbsp; ${date} &nbsp;·&nbsp; ${(p.size_bytes/1024).toFixed(1)} KB</div>
-        </div>
-        <div style="display:flex;gap:6px;flex-shrink:0;margin-left:12px">
-          <button class="btn btn-primary" onclick="loadProfile('${escapeHtml(p.name)}')" style="font-size:0.75rem;padding:4px 12px">📥 Laden</button>
-          <button class="btn btn-danger" onclick="deleteProfile('${escapeHtml(p.name)}')" style="font-size:0.75rem;padding:4px 12px">🗑️</button>
-        </div>
-      </div>`;
-    }).join('');
-  } catch(e) {
-    list.innerHTML = '<p style="color:var(--danger)">Fehler: ' + escapeHtml(e.message) + '</p>';
-  }
-}
-
-async function saveProfile() {
-  const input = document.getElementById('profile-name');
-  const name = input.value.trim();
-  if (!name) { toast('Bitte Profil-Name eingeben', 'error'); return; }
-  try {
-    const r = await apiFetch('/webui/api/profiles/save', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({name})
-    });
-    if (r.ok) {
-      toast('📦 Profil "' + name + '" gespeichert', 'success');
-      input.value = '';
-      loadProfiles();
+    if (data.ok) {
+      statusEl.innerHTML = '<span class="status-dot ok"></span> OK (' + data.duration + ')';
     } else {
-      const e = await r.json();
-      toast('Fehler: ' + (e.detail || 'Unbekannt'), 'error');
-    }
-  } catch(e) { toast('Fehler: ' + e.message, 'error'); }
-}
-
-async function loadProfile(name) {
-  if (!confirm('Profil "' + name + '" laden? Die aktuelle Konfiguration wird ersetzt und der Proxy neu gestartet.')) return;
-  try {
-    const r = await apiFetch('/webui/api/profiles/load/' + encodeURIComponent(name), {method:'POST'});
-    if (r.ok) {
-      toast('🔄 Profil geladen — Neustart läuft...', 'success');
-      setTimeout(async () => {
-        for (let i=0; i<20; i++) {
-          try { const rr = await fetch('/healthz'); if (rr.ok) { location.reload(); return; } } catch(e) {}
-          await new Promise(r => setTimeout(r, 1000));
-        }
-        location.reload();
-      }, 3000);
-    } else {
-      const e = await r.json();
-      toast('Fehler: ' + (e.detail || 'Unbekannt'), 'error');
+      statusEl.innerHTML = '<span class="status-dot err"></span> ' + (data.error || 'Unbekannter Fehler');
     }
   } catch(e) {
-    // Proxy ist schon tot (erwartet bei restart)
-    toast('🔄 Neustart läuft...', 'success');
-    setTimeout(async () => {
-      for (let i=0; i<20; i++) {
-        try { const rr = await fetch('/healthz'); if (rr.ok) { location.reload(); return; } } catch(e) {}
-        await new Promise(r => setTimeout(r, 1000));
-      }
-      location.reload();
-    }, 3000);
+    statusEl.innerHTML = '<span class="status-dot err"></span> ' + e.message;
   }
 }
 
-async function deleteProfile(name) {
-  if (!confirm('Profil "' + name + '" wirklich löschen?')) return;
-  try {
-    const r = await apiFetch('/webui/api/profiles/' + encodeURIComponent(name), {method:'DELETE'});
-    if (r.ok) {
-      toast('🗑️ Profil gelöscht', 'success');
-      loadProfiles();
-    } else {
-      const e = await r.json();
-      toast('Fehler: ' + (e.detail || 'Unbekannt'), 'error');
-    }
-  } catch(e) { toast('Fehler: ' + e.message, 'error'); }
-}
-
-function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
-}
-
-// ── Init ───────────────────────────────────────────────────────────────
-
-// Benutzer anzeigen
-const params = new URLSearchParams(window.location.search);
-const tokenParam = params.get('token');
-if (tokenParam) {
-  document.cookie = 'webui_token=' + tokenParam + '; path=/webui; max-age=86400; SameSite=Lax';
-}
-document.getElementById('userDisplay').textContent = '👤 ' + ('WEBUI_USER'); // wird von refreshStatus() überschrieben
-
-async function logout() {
-  const r = await fetch('/webui/api/logout', {method:'POST'});
-  if (r.ok) {
-    document.cookie = 'webui_token=; path=/webui; max-age=0; SameSite=Lax';
-    window.location.href = '/webui/login';
-  }
-}
-
-// 401-Handler für API-Fetch
-async function apiFetch(url, options = {}) {
-  const r = await fetch(url, options);
-  if (r.status === 401) {
-    document.cookie = 'webui_token=; path=/webui; max-age=0; SameSite=Lax';
-    window.location.href = '/webui/login';
-    throw new Error('Unauthorized');
-  }
-  return r;
-}
-
+// ============ INIT ============
 loadConfig();
-refreshStatus();
-refreshLogs();
-loadProfiles();
-setInterval(refreshStatus, 15000);
-startLogPolling();
-
-// Profile beim Tab-Wechsel neu laden
-document.querySelectorAll('nav button').forEach(btn => {
-  // bestehenden Listener erweitern: bei profiles-Tab → loadProfiles()
-  btn.addEventListener('click', () => {
-    if (btn.dataset.tab === 'profiles') loadProfiles();
-  });
-});
 </script>
 </body>
 </html>"""
@@ -1128,98 +830,66 @@ document.querySelectorAll('nav button').forEach(btn => {
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _reload_proxy_config() -> None:
-    """Aktualisiert die In-Memory-Globals des Proxy aus config.json (ohne Neustart)."""
     try:
         from proxy import _apply_config_file
         _apply_config_file()
-        _log("🔄 Proxy-Config aus config.json neu geladen (in-process)")
+        _log("Proxy-Config aus config.json neu geladen (in-process)")
     except Exception as e:
-        _log(f"⚠️  Proxy-Config-Reload fehlgeschlagen: {e}")
+        _log(f"Proxy-Config-Reload fehlgeschlagen: {e}")
+
 
 def _trigger_restart() -> None:
-    """Startet den Proxy-Prozess neu.
-    
-    Versucht zuerst systemctl (bare-metal), fällt zurück auf SIGTERM (Docker/Coolify).
-    """
-    _log("🔄 Neustart angefordert via WebUI")
+    _log("Neustart angefordert via WebUI")
     import threading as _th
     import subprocess as _sp
 
     def _do_restart():
         time.sleep(0.5)
-        # Versuche systemctl (bare-metal Linux)
         try:
             result = _sp.run(["systemctl", "restart", "localproxy"], capture_output=True, timeout=5)
             if result.returncode == 0:
-                _log("✅ systemctl restart localproxy ausgeführt")
+                _log("systemctl restart localproxy ausgefuehrt")
                 return
-            _log(f"⚠️  systemctl restart fehlgeschlagen (rc={result.returncode}), versuche SIGTERM...")
         except Exception as e:
-            _log(f"⚠️  systemctl nicht verfügbar ({e}), versuche SIGTERM...")
-
-        # Fallback: SIGTERM → Docker/Process-Manager startet neu
+            _log(f"systemctl nicht verfuegbar ({e}), versuche SIGTERM...")
         try:
             os.kill(os.getpid(), signal.SIGTERM)
         except Exception as e:
-            _log(f"❌ SIGTERM fehlgeschlagen: {e}")
+            _log(f"SIGTERM fehlgeschlagen: {e}")
 
     _th.Thread(target=_do_restart, daemon=True).start()
 
-def create_webui_app() -> FastAPI:
-    """Erstellt eine FastAPI-Sub-App mit dem Webinterface."""
 
+def create_webui_app() -> FastAPI:
     webapp = FastAPI(docs_url=None, openapi_url=None, redoc_url=None)
 
-    # ── Auth-Middleware ──────────────────────────────────────────────────
     @webapp.middleware("http")
     async def _auth_middleware(request: Request, call_next):
-        # Unprotected paths
         if request.url.path in ("/webui/login", "/webui/api/login", "/webui/api/logout"):
             return await call_next(request)
-
-        # OPTIONS (CORS preflight) immer erlauben
-        if request.method == "OPTIONS":
-            return await call_next(request)
-
-        # Token aus Cookie oder Query-Parameter
-        token = request.cookies.get(COOKIE_NAME, "")
-        if not token:
-            token = request.query_params.get("token", "")
-
-        if not _validate_token(token):
-            # API-Calls → 401, sonst Redirect zum Login
-            if request.url.path.startswith("/webui/api/"):
-                return JSONResponse(status_code=401, content={"error": "Unauthorized", "login_url": "/webui/login"})
-            return RedirectResponse(url="/webui/login")
-
+        token = request.cookies.get(COOKIE_NAME) or request.query_params.get("token", "")
+        if not token or not _validate_token(token):
+            return RedirectResponse(url="/webui/login", status_code=302)
         return await call_next(request)
 
-    # ── Login-Seite ──────────────────────────────────────────────────────
     @webapp.get("/login", response_class=HTMLResponse)
     async def login_page():
         return LOGIN_HTML
 
-    # ── Login-API ────────────────────────────────────────────────────────
     @webapp.post("/api/login")
     async def api_login(request: Request, response: Response):
         try:
             data = await request.json()
         except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON")
-
-        username = data.get("username", "")
-        password = data.get("password", "")
-
-        if username == WEBUI_USERNAME and password == WEBUI_PASSWORD:
-            token = _generate_token()
-            _log(f"✅ WebUI Login erfolgreich: {username}")
-            return {"token": token, "status": "ok"}
-        _log(f"⚠ WebUI Login fehlgeschlagen: {username}")
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+            raise HTTPException(status_code=400)
+        if data.get("username") != WEBUI_USERNAME or data.get("password") != WEBUI_PASSWORD:
+            raise HTTPException(status_code=401, detail="Ungueltige Anmeldedaten")
+        token = _generate_token()
+        return {"token": token, "redirect": "/webui/"}
 
     @webapp.post("/api/logout")
     async def api_logout(request: Request):
-        token = request.cookies.get(COOKIE_NAME, "") or request.query_params.get("token", "")
+        token = request.cookies.get(COOKIE_NAME) or ""
         if token:
             _remove_token(token)
         return {"status": "ok"}
@@ -1231,15 +901,11 @@ def create_webui_app() -> FastAPI:
     @webapp.get("/api/config")
     async def get_config():
         cfg = _load_config()
-        # API-Keys maskieren
-        if cfg["cloud"]["api_key"]:
-            cfg["cloud"]["api_key"] = _mask_key(cfg["cloud"]["api_key"])
-        if cfg["litellm"]["api_key"]:
-            cfg["litellm"]["api_key"] = _mask_key(cfg["litellm"]["api_key"])
-        if cfg["models"].get("vllm_api_key"):
-            cfg["models"]["vllm_api_key"] = _mask_key(cfg["models"]["vllm_api_key"])
-        if cfg["hindsight"]["qdrant_api_key"]:
-            cfg["hindsight"]["qdrant_api_key"] = _mask_key(cfg["hindsight"]["qdrant_api_key"])
+        # API keys maskieren
+        for key in ("local", "light", "strong", "vision"):
+            cat = cfg.get("model_categories", {}).get(key, {})
+            if cat.get("api_key"):
+                cat["api_key"] = _mask_key(cat["api_key"])
         return JSONResponse(content=cfg)
 
     @webapp.put("/api/config")
@@ -1247,177 +913,75 @@ def create_webui_app() -> FastAPI:
         try:
             new_cfg = await request.json()
         except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON")
+            raise HTTPException(status_code=400, detail="Ungueltiges JSON")
 
-        # Merge mit bestehender Config (um API-Keys zu erhalten die nicht mitgesendet wurden)
         current = _load_config()
+
+        # API-Keys: wenn maskiert (enthaelt bullet), alten Wert behalten
+        for key in ("local", "light", "strong", "vision"):
+            nc = new_cfg.get("model_categories", {}).get(key, {})
+            cc = current.get("model_categories", {}).get(key, {})
+            if nc and cc and "\u2022" in str(nc.get("api_key", "")):
+                nc["api_key"] = cc.get("api_key", "")
+
         _deep_merge(current, new_cfg)
-
-        # Wenn API-Keys maskiert sind, originalen Wert behalten
-        for section, key_name in [
-            ("cloud", "api_key"),
-            ("litellm", "api_key"),
-            ("models", "vllm_api_key"),
-            ("hindsight", "qdrant_api_key"),
-        ]:
-            val = current.get(section, {}).get(key_name, "")
-            if "•" in val:
-                old_val = _load_config().get(section, {}).get(key_name, "")
-                if old_val:
-                    current[section][key_name] = old_val
-
         _save_config(current)
-        _log("💾 Config gespeichert")
-        # In-Memory-Globals sofort aktualisieren (auch ohne Neustart wirksam)
         _reload_proxy_config()
-        return JSONResponse(content={"status": "ok", "message": "Config saved"})
-
-    @webapp.get("/api/status")
-    async def get_status():
-        """Einfacher Status-Check für Lokal/Free und Cloud."""
-        import httpx
-
-        vllm_ok = False
-        try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                # Models-URL aus API-URL ableiten
-                _api_base = cfg.get("models", {}).get("vllm_api_url", "http://localhost:8000/v1/chat/completions").rstrip("/")
-                if "/chat/completions" in _api_base:
-                    _models_url = _api_base.rsplit("/chat/completions", 1)[0] + "/models"
-                elif _api_base.endswith("/v1"):
-                    _models_url = _api_base + "/models"
-                else:
-                    _models_url = _api_base + "/v1/models"
-                r = await client.get(_models_url)
-                vllm_ok = r.status_code == 200
-        except Exception:
-            pass
-
-        cfg = _load_config()
-        cloud_configured = bool(
-            cfg["cloud"]["enabled"] and cfg["cloud"]["api_key"]
-        ) or bool(cfg["litellm"]["api_key"]) or bool(cfg["litellm"]["api_url"])
-
-        return JSONResponse(content={
-            "vllm_ok": vllm_ok,
-            "cloud_configured": cloud_configured,
-            "config_exists": CONFIG_PATH.exists(),
-            "user": WEBUI_USERNAME,
-        })
+        return JSONResponse(content={"status": "ok", "message": "Config gespeichert + Proxy-Config neu geladen"})
 
     @webapp.post("/api/restart")
-    async def restart_proxy():
-        """Startet den Proxy-Service neu (systemctl oder SIGTERM)."""
+    async def api_restart():
         _trigger_restart()
-        return JSONResponse(content={"status": "ok", "message": "Restarting..."})
+        return JSONResponse(content={"status": "ok", "message": "Neustart eingeleitet"})
 
-    @webapp.post("/api/memory/clear")
-    async def clear_memory():
-        """Löscht die Hindsight-Memory-Dateien."""
-        cfg = _load_config()
-        mem_dir = Path(cfg.get("hindsight", {}).get("dir", "./.hindsight_memory"))
-        deleted = 0
-        if mem_dir.exists():
-            for f in mem_dir.glob("*.jsonl"):
-                try:
-                    f.unlink()
-                    deleted += 1
-                except OSError:
-                    pass
-        return JSONResponse(content={"status": "ok", "deleted_files": deleted})
-
-    # ── Profile Management ───────────────────────────────────────────────
-
-    @webapp.get("/api/profiles")
-    async def list_profiles():
-        """Listet alle gespeicherten Profile auf."""
-        profiles = []
-        PROFILES_DIR.mkdir(parents=True, exist_ok=True)
-        for f in sorted(PROFILES_DIR.glob("*.json")):
-            stat = f.stat()
-            try:
-                with open(f, "r", encoding="utf-8") as fh:
-                    cfg = json.load(fh)
-                # Extrahiere Kurzinfo
-                model_name = cfg.get("models", {}).get("model_name", "?")
-                cloud_model = cfg.get("cloud", {}).get("model", "") or cfg.get("litellm", {}).get("model", "")
-                cloud_enabled = cfg.get("cloud", {}).get("enabled", False) or bool(cloud_model)
-                profiles.append({
-                    "name": f.stem,
-                    "size_bytes": stat.st_size,
-                    "modified": stat.st_mtime,
-                    "model_name": model_name,
-                    "cloud": cloud_model if cloud_enabled else None,
-                    "chatty": cfg.get("proxy", {}).get("chatty_mode", False),
-                })
-            except (json.JSONDecodeError, OSError):
-                profiles.append({
-                    "name": f.stem,
-                    "size_bytes": stat.st_size,
-                    "modified": stat.st_mtime,
-                    "error": True,
-                })
-        return JSONResponse(content={"profiles": profiles})
-
-    @webapp.post("/api/profiles/save")
-    async def save_profile(request: Request):
-        """Sichert die aktuelle Konfiguration als Profil."""
+    @webapp.post("/api/test-endpoint")
+    async def api_test_endpoint(request: Request):
         try:
             data = await request.json()
         except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON")
-        name = (data.get("name") or "").strip()
-        if not name:
-            raise HTTPException(status_code=400, detail="Profil-Name darf nicht leer sein")
-        # Name sanitizen: nur Buchstaben, Zahlen, Bindestriche, Unterstriche
-        safe_name = re.sub(r"[^a-zA-Z0-9_\- ]", "_", name).strip()
-        if safe_name != name:
-            raise HTTPException(status_code=400, detail=f"Ungültiger Profil-Name. Erlaubt: Buchstaben, Zahlen, -, _, Leerzeichen")
+            raise HTTPException(status_code=400, detail="Ungueltiges JSON")
 
-        cfg = _load_config()
-        PROFILES_DIR.mkdir(parents=True, exist_ok=True)
-        profile_path = PROFILES_DIR / f"{safe_name}.json"
-        with open(profile_path, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
-        _log(f"📦 Profil gespeichert: {safe_name}")
-        return JSONResponse(content={"status": "ok", "name": safe_name})
+        api_url = str(data.get("api_url", "")).strip()
+        api_key = str(data.get("api_key", "")).strip()
+        model_name = str(data.get("model_name", "")).strip()
 
-    @webapp.post("/api/profiles/load/{name}")
-    async def load_profile(name: str):
-        """Lädt ein Profil in config.json und startet neu."""
-        safe_name = re.sub(r"[^a-zA-Z0-9_\- ]", "_", name)
-        profile_path = PROFILES_DIR / f"{safe_name}.json"
-        if not profile_path.exists():
-            raise HTTPException(status_code=404, detail=f"Profil '{safe_name}' nicht gefunden")
+        if not api_url or not model_name:
+            return JSONResponse(content={"ok": False, "error": "api_url und model_name erforderlich"})
 
+        import httpx
+        started = time.perf_counter()
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         try:
-            with open(profile_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-        except Exception:
-            raise HTTPException(status_code=500, detail=f"Profil '{safe_name}' konnte nicht gelesen werden")
-
-        _save_config(cfg)
-        _log(f"📥 Profil geladen: {safe_name} — starte neu...")
-        # In-Memory-Globals sofort aktualisieren, dann Prozess-neustart
-        _reload_proxy_config()
-        _trigger_restart()
-        return JSONResponse(content={"status": "ok", "message": f"Profil '{safe_name}' geladen — Neustart läuft"})
-
-    @webapp.delete("/api/profiles/{name}")
-    async def delete_profile(name: str):
-        """Löscht ein gespeichertes Profil."""
-        safe_name = re.sub(r"[^a-zA-Z0-9_\- ]", "_", name)
-        profile_path = PROFILES_DIR / f"{safe_name}.json"
-        if not profile_path.exists():
-            raise HTTPException(status_code=404, detail=f"Profil '{safe_name}' nicht gefunden")
-        profile_path.unlink()
-        _log(f"🗑️ Profil gelöscht: {safe_name}")
-        return JSONResponse(content={"status": "ok", "message": f"Profil '{safe_name}' gelöscht"})
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as hc:
+                r = await hc.post(
+                    api_url,
+                    json={"model": model_name,
+                          "messages": [{"role": "user", "content": "ping"}],
+                          "max_tokens": 1},
+                    headers=headers,
+                )
+            duration = f"{time.perf_counter() - started:.1f}s"
+            if r.status_code in (200, 201):
+                return JSONResponse(content={"ok": True, "duration": duration})
+            err = ""
+            try:
+                body = r.json()
+                if isinstance(body.get("error"), dict):
+                    err = body["error"].get("message", "")
+                elif isinstance(body.get("error"), str):
+                    err = body["error"]
+            except Exception:
+                err = f"HTTP {r.status_code}"
+            return JSONResponse(content={"ok": False, "duration": duration, "error": err or f"HTTP {r.status_code}"})
+        except Exception as exc:
+            duration = f"{time.perf_counter() - started:.1f}s"
+            return JSONResponse(content={"ok": False, "duration": duration, "error": str(exc)})
 
     return webapp
 
 
-def mount_webui(parent_app: FastAPI, prefix: str = "/webui") -> None:
-    """Mountet das Webinterface in die Haupt-App."""
-    webui = create_webui_app()
-    parent_app.mount(prefix, webui)
+def mount_webui(parent_app: FastAPI) -> None:
+    webapp = create_webui_app()
+    parent_app.mount("/webui", webapp)
