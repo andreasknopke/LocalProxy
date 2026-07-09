@@ -39,13 +39,16 @@ def _log(msg: str) -> None:
 
 
 def _safe_str(val: object) -> str:
-    """Konvertiert zu str mit ASCII-safe Fallback."""
+    """Konvertiert zu str mit ASCII-safe Fallback. Faengt ALLE Exceptions."""
     try:
         s = str(val)
         s.encode("ascii")
         return s
-    except UnicodeEncodeError:
-        return str(val).encode("ascii", errors="replace").decode("ascii")
+    except Exception:
+        try:
+            return str(val).encode("ascii", errors="replace").decode("ascii")
+        except Exception:
+            return "(unreadable)"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -961,7 +964,23 @@ def create_webui_app() -> FastAPI:
         if not api_url or not model_name:
             return JSONResponse(content={"ok": False, "error": "api_url und model_name erforderlich"})
 
-        _trunc = api_key[:8] + "..." if len(api_key) > 8 else (api_key or "(leer)")
+        # Maskierten Key erkennen: wenn Bullets (U+2022) enthalten sind,
+        # wurde der Key nicht geaendert → echten Key aus Config nachladen
+        if "\u2022" in api_key and len(api_key) > 8:
+            cfg = _load_config()
+            for cat_key in ("local", "light", "strong", "vision"):
+                cat = cfg.get("model_categories", {}).get(cat_key, {})
+                if cat.get("api_url", "").strip() == api_url:
+                    api_key = cat.get("api_key", "")
+                    break
+
+        # Key fuer Logging trunktieren — NUR ASCII-Safe
+        try:
+            _trunc = api_key[:8] + "..."
+            _trunc.encode("ascii")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            _trunc = "sk-****..."
+
         _log(f"Test-Endpoint: model={model_name} api_key={_trunc} url={api_url}")
 
         import httpx
