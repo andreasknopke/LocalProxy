@@ -1134,6 +1134,32 @@ app = FastAPI(
 )
 
 
+# ── Request-Logging-Middleware ─────────────────────────────────────────────
+@app.middleware("http")
+async def _log_all_requests(request: Request, call_next):
+    """Loggt JEDEN eingehenden Request — Method, Path, Auth-Status."""
+    path = request.url.path
+    # Nur API-Routen loggen, nicht Static/WebUI
+    if path.startswith("/webui") or path in ("/docs", "/openapi.json", "/favicon.ico"):
+        return await call_next(request)
+
+    auth_header = request.headers.get("authorization", "")
+    auth_prefix = ""
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+        if PROXY_AUTH_ENABLED and token:
+            auth_prefix = "proxy-key" if secrets.compare_digest(token, PROXY_API_KEY) else "fremd-key"
+        else:
+            auth_prefix = "no-proxy-auth" if not PROXY_AUTH_ENABLED else "kein-key"
+    else:
+        auth_prefix = "kein-auth-header"
+
+    _log(f"REQ-IN {request.method} {path} auth={auth_prefix}")
+    response = await call_next(request)
+    _log(f"REQ-OUT {request.method} {path} status={response.status_code}")
+    return response
+
+
 async def _run_startup_health_checks() -> None:
     """Nicht-blockierende Health-Checks (als Background-Task gestartet)."""
     await asyncio.sleep(1)  # Kurz warten bis Server ready ist
@@ -1218,17 +1244,25 @@ def _is_authorized(request: Request) -> bool:
 
 
 async def _auth_or_raise(request: Request) -> None:
-    if not _is_authorized(request):
-        raise HTTPException(status_code=401, detail="Unauthorized",
+    if not PROXY_AUTH_ENABLED:
+        _log(f"AUTH-SKIP (auth disabled) path={request.url.path}")
+        return
+    token = _get_bearer_token(request)
+    if not token:
+        _log(f"AUTH-FAIL kein Token path={request.url.path}")
+        raise HTTPException(status_code=401, detail="Unauthorized — kein Bearer-Token",
                            headers={"WWW-Authenticate": "Bearer"})
+    if not secrets.compare_digest(token, PROXY_API_KEY):
+        _log(f"AUTH-FAIL falscher Token path={request.url.path} "
+             f"got={_truncate_key(token)} expected={_truncate_key(PROXY_API_KEY)}")
+        raise HTTPException(status_code=401, detail="Unauthorized — falscher Proxy-API-Key",
+                           headers={"WWW-Authenticate": "Bearer"})
+    _log(f"AUTH-OK path={request.url.path}")
 
 
-# ── /v1/chat/completions ───────────────────────────────────────────────────
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
-    await _auth_or_raise(request)
-    body = await request.json()
-
+# ── Shared Chat-Completion Handler ─────────────────────────────────────────
+async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | StreamingResponse:
+    """Gemeinsame Logik fuer /v1/chat/completions und /chat/completions."""
     if "messages" not in body:
         raise HTTPException(status_code=400, detail="Invalid payload: 'messages' required.")
 
@@ -1258,6 +1292,23 @@ async def chat_completions(request: Request):
     response_payload = _build_response_payload(body, result.get("content", ""), [result])
     asyncio.ensure_future(_hindsight.retain_async(body, result.get("content", "")))
     return JSONResponse(content=response_payload)
+
+
+# ── /v1/chat/completions ───────────────────────────────────────────────────
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    await _auth_or_raise(request)
+    body = await request.json()
+    return await _handle_chat_completion(body)
+
+
+# ── /chat/completions (ohne /v1/ Prefix, Catch-all) ────────────────────────
+@app.post("/chat/completions")
+async def chat_completions_no_v1(request: Request):
+    _log("Route /chat/completions (ohne /v1/)")
+    await _auth_or_raise(request)
+    body = await request.json()
+    return await _handle_chat_completion(body)
 
 
 async def _stream_events(body: Dict[str, Any], category: str) -> AsyncIterator[str]:
