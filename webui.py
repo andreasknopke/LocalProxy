@@ -27,7 +27,10 @@ def _log(msg: str) -> None:
     import datetime as _dt
     timestamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] [webui] {msg}"
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        print(line.encode("ascii", errors="replace").decode("ascii"), flush=True)
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -948,6 +951,9 @@ def create_webui_app() -> FastAPI:
         if not api_url or not model_name:
             return JSONResponse(content={"ok": False, "error": "api_url und model_name erforderlich"})
 
+        _trunc = api_key[:8] + "..." if len(api_key) > 8 else (api_key or "(leer)")
+        _log(f"Test-Endpoint: model={model_name} api_key={_trunc} url={api_url}")
+
         import httpx
         started = time.perf_counter()
         headers = {}
@@ -973,11 +979,18 @@ def create_webui_app() -> FastAPI:
                 elif isinstance(body.get("error"), str):
                     err = body["error"]
             except Exception:
-                err = f"HTTP {r.status_code}"
+                try:
+                    err = r.text[:200]
+                except Exception:
+                    err = f"HTTP {r.status_code}"
             return JSONResponse(content={"ok": False, "duration": duration, "error": err or f"HTTP {r.status_code}"})
         except Exception as exc:
             duration = f"{time.perf_counter() - started:.1f}s"
-            return JSONResponse(content={"ok": False, "duration": duration, "error": str(exc)})
+            try:
+                exc_msg = str(exc)
+            except UnicodeEncodeError:
+                exc_msg = repr(exc)
+            return JSONResponse(content={"ok": False, "duration": duration, "error": exc_msg})
 
     return webapp
 

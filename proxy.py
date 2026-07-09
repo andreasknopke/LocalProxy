@@ -46,15 +46,30 @@ LOG_FILE = os.getenv("LOG_FILE", str(Path(__file__).parent / "data" / "proxy.log
 
 
 def _log(msg: str) -> None:
-    """Schreibt eine Log-Zeile mit Timestamp in Datei + stdout."""
+    """Schreibt eine Log-Zeile mit Timestamp in Datei + stdout.
+    Faengt UnicodeEncodeError ab (z.B. wenn stdout ASCII-only ist in Docker/CI).
+    """
     timestamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {msg}"
-    print(line, flush=True)
+    # Robustes stdout: fallback auf ASCII-safe print
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        print(line.encode("ascii", errors="replace").decode("ascii"), flush=True)
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
         pass
+
+
+def _truncate_key(key: str) -> str:
+    """Kuerzt einen API-Key: erste 8 Zeichen + '...'"""
+    if not key:
+        return "(leer)"
+    if len(key) <= 8:
+        return key
+    return key[:8] + "..."
 
 
 # ── Webinterface ───────────────────────────────────────────────────────────
@@ -138,7 +153,9 @@ TOOL_RESULT_CAP: int = int(os.getenv("TOOL_RESULT_CAP", "0"))
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _apply_config_file() -> None:
-    """Uebernimmt Werte aus config.json (wird beim Startup + WebUI-Save aufgerufen)."""
+    """Uebernimmt Werte aus config.json (wird beim Startup + WebUI-Save aufgerufen).
+    Leere Strings aus config.json ueberschreiben NIEMALS gesetzte Env-Var-Werte.
+    """
     if not _WEBUI_AVAILABLE:
         return
     try:
@@ -158,6 +175,9 @@ def _apply_config_file() -> None:
                                "is_vision", "timeout_seconds"):
                     if field in sc:
                         val = sc[field]
+                        # Leere api_url / api_key duerfen Env-Var-Werte NIE ueberschreiben
+                        if field in ("api_url", "api_key") and isinstance(val, str) and val.strip() == "":
+                            continue
                         if field == "max_tokens":
                             val = int(val)
                         elif field == "is_vision":
@@ -793,6 +813,7 @@ async def _call_single_model(body: Dict[str, Any], category: str) -> Dict[str, A
     msg_count = len(messages) if isinstance(messages, list) else 0
     total_chars = sum(len(str(m.get("content", ""))) for m in (messages if isinstance(messages, list) else []))
     _log(f"Single-Model call cat={category} model={model} "
+         f"api_key={_truncate_key(api_key)} "
          f"messages={msg_count} chars={total_chars} timeout={timeout:.0f}s")
 
     req_id = f"model_{category}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
@@ -845,7 +866,10 @@ async def _call_single_model(body: Dict[str, Any], category: str) -> Dict[str, A
             elif isinstance(err_body.get("error"), str):
                 err_detail = err_body["error"]
         except Exception:
-            err_detail = response.text[:200]
+            try:
+                err_detail = response.text[:200]
+            except Exception:
+                err_detail = f"HTTP {response.status_code} (body unreadable)"
         _log(f"Model STATUS {response.status_code} cat={category} "
              f"duration={duration:.1f}s: {err_detail}")
         return {
@@ -856,12 +880,20 @@ async def _call_single_model(body: Dict[str, Any], category: str) -> Dict[str, A
 
     except Exception as exc:
         duration = time.perf_counter() - started
-        _finish_active_call(req_id, "error", {"duration_seconds": duration, "error": str(exc)})
         exc_type = type(exc).__name__
-        _log(f"Model ERROR cat={category} duration={duration:.1f}s type={exc_type}: {exc}")
+        # Safe str() auf Exception — fallback auf repr() wenn str() fehlschlaegt
+        try:
+            exc_msg = str(exc)
+        except UnicodeEncodeError:
+            try:
+                exc_msg = repr(exc)
+            except Exception:
+                exc_msg = f"{exc_type} (message unreadable)"
+        _finish_active_call(req_id, "error", {"duration_seconds": duration, "error": exc_msg})
+        _log(f"Model ERROR cat={category} duration={duration:.1f}s type={exc_type}: {exc_msg}")
         return {
             "category": category, "status": "error",
-            "content": f"Model error nach {duration:.0f}s ({exc_type}): {exc}",
+            "content": f"Model error nach {duration:.0f}s ({exc_type}): {exc_msg}",
             "duration_seconds": duration, "usage": None,
         }
 
@@ -1115,14 +1147,18 @@ async def _run_startup_health_checks() -> None:
                 return body["error"]
             return str(body.get("message") or body.get("detail") or "")
         except Exception:
-            return r.text[:200] if r.text else ""
+            try:
+                return r.text[:200] if r.text else ""
+            except Exception:
+                return f"HTTP {r.status_code} (body unreadable)"
 
     for key in ("local", "light", "strong", "vision"):
         cat = _MODEL_CATEGORIES.get(key, {})
         api_url = str(cat.get("api_url", "")).rstrip("/")
         if not api_url:
             continue
-        _log(f"   {key} '{cat.get('model_name','?')}' @ {api_url} ...")
+        _log(f"   {key} '{cat.get('model_name','?')}' @ {api_url} "
+             f"api_key={_truncate_key(str(cat.get('api_key', '')))} ...")
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0)) as hc:
                 r = await hc.post(
@@ -1210,7 +1246,8 @@ async def chat_completions(request: Request):
     _strip_model_flags_from_messages(msgs)
 
     _log(f"Kategorie: {category} (Flag={'--'+category if flag_category else 'default'}), "
-         f"Modell: {_MODEL_CATEGORIES.get(category, {}).get('model_name', '?')}")
+         f"Modell: {_MODEL_CATEGORIES.get(category, {}).get('model_name', '?')}, "
+         f"api_key={_truncate_key(_MODEL_CATEGORIES.get(category, {}).get('api_key', ''))}")
 
     if body.get("stream"):
         return StreamingResponse(
