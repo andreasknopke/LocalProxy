@@ -72,6 +72,16 @@ def _truncate_key(key: str) -> str:
     return key[:8] + "..."
 
 
+def _safe_str(val: object) -> str:
+    """Konvertiert zu str mit ASCII-safe Fallback."""
+    try:
+        s = str(val)
+        s.encode("ascii")
+        return s
+    except UnicodeEncodeError:
+        return str(val).encode("ascii", errors="replace").decode("ascii")
+
+
 # ── Webinterface ───────────────────────────────────────────────────────────
 try:
     from webui import mount_webui, _load_config as _webui_load_config
@@ -862,38 +872,28 @@ async def _call_single_model(body: Dict[str, Any], category: str) -> Dict[str, A
         try:
             err_body = response.json()
             if isinstance(err_body.get("error"), dict):
-                err_detail = err_body["error"].get("message", "")
+                err_detail = _safe_str(err_body["error"].get("message", ""))
             elif isinstance(err_body.get("error"), str):
-                err_detail = err_body["error"]
+                err_detail = _safe_str(err_body["error"])
         except Exception:
-            try:
-                err_detail = response.text[:200]
-            except Exception:
-                err_detail = f"HTTP {response.status_code} (body unreadable)"
+            err_detail = f"HTTP {response.status_code}"
         _log(f"Model STATUS {response.status_code} cat={category} "
              f"duration={duration:.1f}s: {err_detail}")
         return {
             "category": category, "status": "failed",
-            "content": f"Model status {response.status_code}: {err_detail or response.text[:500]}",
+            "content": _safe_str(f"Model status {response.status_code}: {err_detail}"),
             "duration_seconds": duration, "usage": None,
         }
 
     except Exception as exc:
         duration = time.perf_counter() - started
         exc_type = type(exc).__name__
-        # Safe str() auf Exception — fallback auf repr() wenn str() fehlschlaegt
-        try:
-            exc_msg = str(exc)
-        except UnicodeEncodeError:
-            try:
-                exc_msg = repr(exc)
-            except Exception:
-                exc_msg = f"{exc_type} (message unreadable)"
+        exc_msg = _safe_str(exc)
         _finish_active_call(req_id, "error", {"duration_seconds": duration, "error": exc_msg})
         _log(f"Model ERROR cat={category} duration={duration:.1f}s type={exc_type}: {exc_msg}")
         return {
             "category": category, "status": "error",
-            "content": f"Model error nach {duration:.0f}s ({exc_type}): {exc_msg}",
+            "content": _safe_str(f"Model error nach {duration:.0f}s ({exc_type}): {exc_msg}"),
             "duration_seconds": duration, "usage": None,
         }
 
@@ -1142,15 +1142,12 @@ async def _run_startup_health_checks() -> None:
         try:
             body = r.json()
             if isinstance(body.get("error"), dict):
-                return body["error"].get("message", "")
+                return _safe_str(body["error"].get("message", ""))
             if isinstance(body.get("error"), str):
-                return body["error"]
-            return str(body.get("message") or body.get("detail") or "")
+                return _safe_str(body["error"])
+            return _safe_str(body.get("message") or body.get("detail") or "")
         except Exception:
-            try:
-                return r.text[:200] if r.text else ""
-            except Exception:
-                return f"HTTP {r.status_code} (body unreadable)"
+            return f"HTTP {r.status_code}"
 
     for key in ("local", "light", "strong", "vision"):
         cat = _MODEL_CATEGORIES.get(key, {})

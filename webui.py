@@ -38,6 +38,16 @@ def _log(msg: str) -> None:
         pass
 
 
+def _safe_str(val: object) -> str:
+    """Konvertiert zu str mit ASCII-safe Fallback."""
+    try:
+        s = str(val)
+        s.encode("ascii")
+        return s
+    except UnicodeEncodeError:
+        return str(val).encode("ascii", errors="replace").decode("ascii")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # WebUI Auth
 # ═══════════════════════════════════════════════════════════════════════════
@@ -975,22 +985,15 @@ def create_webui_app() -> FastAPI:
             try:
                 body = r.json()
                 if isinstance(body.get("error"), dict):
-                    err = body["error"].get("message", "")
+                    err = _safe_str(body["error"].get("message", ""))
                 elif isinstance(body.get("error"), str):
-                    err = body["error"]
+                    err = _safe_str(body["error"])
             except Exception:
-                try:
-                    err = r.text[:200]
-                except Exception:
-                    err = f"HTTP {r.status_code}"
+                err = f"HTTP {r.status_code}"
             return JSONResponse(content={"ok": False, "duration": duration, "error": err or f"HTTP {r.status_code}"})
         except Exception as exc:
             duration = f"{time.perf_counter() - started:.1f}s"
-            try:
-                exc_msg = str(exc)
-            except UnicodeEncodeError:
-                exc_msg = repr(exc)
-            return JSONResponse(content={"ok": False, "duration": duration, "error": exc_msg})
+            return JSONResponse(content={"ok": False, "duration": duration, "error": _safe_str(exc)})
 
     return webapp
 
