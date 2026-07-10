@@ -26,6 +26,7 @@ import json
 import os
 import re
 import secrets
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -38,6 +39,17 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qdrant_models
 from dataclasses import dataclass, field
+
+# ── UTF-8 erzwingen (Docker slim-Images haben oft kein Locale) ─────────
+# Muss VOR jeglichem print() passieren.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+try:
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # ── Logging ────────────────────────────────────────────────────────────────
 import datetime as _dt
@@ -506,7 +518,7 @@ class HindsightMemory:
                 self._ensure_collection()
                 _log(f"Hindsight: Qdrant connected @ {QDRANT_URL}")
             except Exception as exc:
-                _log(f"Qdrant nicht erreichbar ({exc}), fallback auf JSONL")
+                _log(f"Qdrant nicht erreichbar ({_safe_str(exc)}), fallback auf JSONL")
                 self._use_qdrant = False
                 self._qdrant = None
 
@@ -572,7 +584,7 @@ class HindsightMemory:
                 ))
             return records
         except Exception as exc:
-            _log(f"Qdrant recall fehlgeschlagen: {exc}")
+            _log(f"Qdrant recall fehlgeschlagen: {_safe_str(exc)}")
             return []
 
     def _recall_jsonl(self, query: str, min_similarity: float, _limit: int) -> List[MemoryRecord]:
@@ -625,7 +637,7 @@ class HindsightMemory:
                 ],
             )
         except Exception as exc:
-            _log(f"Qdrant retain fehlgeschlagen: {exc}")
+            _log(f"Qdrant retain fehlgeschlagen: {_safe_str(exc)}")
 
     def _retain_jsonl(self, point_id: str, text: str, networks: List[str]) -> None:
         records = _load_memory_records()
@@ -949,6 +961,12 @@ def _derive_models_url(api_url: str) -> str:
 
 def _api_headers(api_key: str) -> Dict[str, str]:
     if api_key:
+        # Sicherstellen dass Key ASCII-only ist (httpx crasht sonst in Docker)
+        try:
+            api_key.encode("ascii")
+        except UnicodeEncodeError:
+            _log("WARNUNG: API-Key enthielt non-ASCII Zeichen, wird bereinigt")
+            api_key = api_key.encode("ascii", errors="replace").decode("ascii")
         return {"Authorization": f"Bearer {api_key}"}
     return {}
 
@@ -1525,7 +1543,7 @@ async def _run_startup_health_checks() -> None:
                     err = _parse_error(r) or f"HTTP {r.status_code}"
                     _log(f"   {key}[{i}]: {err}")
             except Exception as exc:
-                _log(f"   {key}[{i}]: nicht erreichbar - {type(exc).__name__}: {exc}")
+                _log(f"   {key}[{i}]: nicht erreichbar - {type(exc).__name__}: {_safe_str(exc)}")
 
     _log("Health-Checks abgeschlossen")
 
