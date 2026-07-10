@@ -47,39 +47,74 @@ pytestmark = pytest.mark.skipif(not HAS_PROXY, reason=SKIP_REASON)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def test_extract_flag_light():
-    cleaned, cat = proxy._extract_model_flag("hello --light test")
+    cleaned, cat, slot = proxy._extract_model_flag("hello --light test")
     assert cat == "light"
+    assert slot is None
     assert "--light" not in cleaned
 
 
 def test_extract_flag_vision():
-    cleaned, cat = proxy._extract_model_flag("--vision describe image")
+    cleaned, cat, slot = proxy._extract_model_flag("--vision describe image")
     assert cat == "vision"
+    assert slot is None
     assert "--vision" not in cleaned
 
 
 def test_extract_flag_local():
-    cleaned, cat = proxy._extract_model_flag("use --local for this")
+    cleaned, cat, slot = proxy._extract_model_flag("use --local for this")
     assert cat == "local"
+    assert slot is None
     assert "--local" not in cleaned
 
 
 def test_extract_flag_strong():
-    cleaned, cat = proxy._extract_model_flag("--strong architect task")
+    cleaned, cat, slot = proxy._extract_model_flag("--strong architect task")
     assert cat == "strong"
+    assert slot is None
     assert "--strong" not in cleaned
 
 
 def test_extract_flag_no_flag():
-    cleaned, cat = proxy._extract_model_flag("hello world no flag")
+    cleaned, cat, slot = proxy._extract_model_flag("hello world no flag")
     assert cat is None
+    assert slot is None
 
 
 def test_extract_flag_last_wins():
-    cleaned, cat = proxy._extract_model_flag("--light but really --strong")
+    cleaned, cat, slot = proxy._extract_model_flag("--light but really --strong")
     assert cat == "strong"
+    assert slot is None
     assert "--light" not in cleaned
     assert "--strong" not in cleaned
+
+
+def test_extract_flag_with_slot_number():
+    cleaned, cat, slot = proxy._extract_model_flag("--light 2 mach dies")
+    assert cat == "light"
+    assert slot == 2
+    assert "--light" not in cleaned
+    assert "2" not in cleaned
+
+
+def test_extract_flag_slot_3():
+    cleaned, cat, slot = proxy._extract_model_flag("test --strong 3 letzter slot")
+    assert cat == "strong"
+    assert slot == 3
+    assert "--strong" not in cleaned
+
+
+def test_extract_flag_slot_last_wins():
+    cleaned, cat, slot = proxy._extract_model_flag("--light 1 but --light 3")
+    assert cat == "light"
+    assert slot == 3
+    assert "--light" not in cleaned
+
+
+def test_extract_flag_invalid_slot_stripped():
+    cleaned, cat, slot = proxy._extract_model_flag("--light 5 ungültig")
+    assert cat == "light"
+    assert slot is None  # 5 nicht gültig (1-3)
+    assert "--light" not in cleaned
 
 
 def test_strip_flags_from_messages():

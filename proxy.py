@@ -395,38 +395,45 @@ _apply_config_file()
 # Prompt-Flag-Extraktion ── Modell-Kategorie-Auswahl via --flag
 # ═══════════════════════════════════════════════════════════════════════════
 
-_MODEL_FLAG_PATTERN = re.compile(r'--(local|light|strong|vision)\b', re.IGNORECASE)
+_MODEL_FLAG_PATTERN = re.compile(r'--(local|light|strong|vision)(?:\s+(\d+))?(?:\s|$)', re.IGNORECASE)
 _VALID_CATEGORIES: Set[str] = {"local", "light", "strong", "vision"}
 
 
-def _extract_model_flag(text: str) -> Tuple[str, Optional[str]]:
-    """Extrahiert --local/--light/--strong/--vision aus dem Text.
-    Returns: (bereinigter_text, category_string oder None)
+def _extract_model_flag(text: str) -> Tuple[str, Optional[str], Optional[int]]:
+    """Extrahiert --local/--light/--strong/--vision [1-3] aus dem Text.
+    Returns: (bereinigter_text, category_string oder None, slot_number oder None)
+    Slot-Nummer: 1=Primary, 2=Fallback 2, 3=Fallback 3. None = kein gültiger Slot angegeben.
     """
     found: Optional[str] = None
+    found_slot: Optional[int] = None
     for match in _MODEL_FLAG_PATTERN.finditer(text):
         cat = match.group(1).lower()
         if cat in _VALID_CATEGORIES:
             found = cat
+            if match.group(2):
+                slot_val = int(match.group(2))
+                found_slot = slot_val if 1 <= slot_val <= 3 else None
+            else:
+                found_slot = None
     cleaned = _MODEL_FLAG_PATTERN.sub("", text)
     cleaned = re.sub(r' {2,}', ' ', cleaned)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     cleaned = cleaned.strip()
-    return cleaned, found
+    return cleaned, found, found_slot
 
 
 def _strip_model_flags_from_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Entfernt --local/--light/--strong/--vision aus allen User-Messages (in-place)."""
+    """Entfernt --local/--light/--strong/--vision [1-3] aus allen User-Messages (in-place)."""
     for msg in messages:
         if isinstance(msg, dict) and msg.get("role") == "user":
             content = msg.get("content")
             if isinstance(content, str):
-                cleaned, _ = _extract_model_flag(content)
+                cleaned, _, _ = _extract_model_flag(content)
                 msg["content"] = cleaned
             elif isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
-                        cleaned, _ = _extract_model_flag(block.get("text", ""))
+                        cleaned, _, _ = _extract_model_flag(block.get("text", ""))
                         block["text"] = cleaned
     return messages
 
@@ -1118,9 +1125,10 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
 _ASYNC_CATEGORY_ACTIVE_IDX: Dict[str, int] = {}  # Lese-/Schreib-Cache fuer _CATEGORY_ACTIVE_IDX
 
 
-async def _call_model_with_fallbacks(body: Dict[str, Any], category: str) -> Dict[str, Any]:
+async def _call_model_with_fallbacks(body: Dict[str, Any], category: str,
+                                         force_start_idx: Optional[int] = None) -> Dict[str, Any]:
     """Versucht Modelle in Kategorie mit Fallback-Chain.
-    - Runde 1: Starte mit active_idx, dann alle anderen, überspringe Cooldowns
+    - Runde 1: Starte mit active_idx (oder force_start_idx), dann alle anderen, überspringe Cooldowns
     - Runde 2: Alle erneut (Cooldowns ignoriert)
     - Max 2 Runden, dann Fehler.
     """
@@ -1131,7 +1139,7 @@ async def _call_model_with_fallbacks(body: Dict[str, Any], category: str) -> Dic
                 "content": f"Kategorie '{category}' hat keine konfigurierten Modelle"},
                 "used_idx": 0, "used_model": "(none)", "attempts": []}
 
-    start_idx = _CATEGORY_ACTIVE_IDX.get(category, 0)
+    start_idx = force_start_idx if force_start_idx is not None else _CATEGORY_ACTIVE_IDX.get(category, 0)
     if start_idx >= len(defs):
         start_idx = 0
         _CATEGORY_ACTIVE_IDX[category] = 0
@@ -1594,28 +1602,38 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
 
-    cleaned, flag_category = _extract_model_flag(last_user)
+    cleaned, flag_category, flag_slot = _extract_model_flag(last_user)
     category = flag_category if flag_category else DEFAULT_CATEGORY
+
+    # Slot-Nummer in 0-basierten Index umrechnen (--light 2 → Idx 1)
+    force_start_idx: Optional[int] = None
+    if flag_slot is not None and category != "local":
+        force_start_idx = flag_slot - 1  # Slot 1=Idx 0, Slot 2=Idx 1, Slot 3=Idx 2
+        defs_validate = _model_defs(category)
+        if force_start_idx >= len(defs_validate) or force_start_idx < 0:
+            _log(f"Slot {flag_slot} ungültig für {category} (nur {len(defs_validate)} Slots), verwende active_idx")
+            force_start_idx = None
 
     _strip_model_flags_from_messages(msgs)
 
     # Log aktiven Index für die Kategorie
-    active_idx = _CATEGORY_ACTIVE_IDX.get(category, 0)
+    active_idx = force_start_idx if force_start_idx is not None else _CATEGORY_ACTIVE_IDX.get(category, 0)
     defs = _model_defs(category)
     active_model = defs[active_idx]["model_name"] if defs and active_idx < len(defs) else "?"
-    _log(f"Kategorie: {category} (Flag={'--'+category if flag_category else 'default'}), "
+    _log(f"Kategorie: {category} (Flag={'--'+category if flag_category else 'default'}"
+         f"{' Slot='+str(flag_slot) if flag_slot else ''}), "
          f"Idx={active_idx}, Modell={active_model}")
 
     if body.get("stream"):
         return StreamingResponse(
-            _stream_events(body, category),
+            _stream_events(body, category, force_start_idx),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
                      "X-Accel-Buffering": "no"},
         )
 
     # Non-Streaming: Fallback-Chain nutzen
-    outcome = await _call_model_with_fallbacks(body, category)
+    outcome = await _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
     result = outcome.get("result", {})
     content = result.get("content", "") or ""
 
@@ -1645,9 +1663,10 @@ async def chat_completions_no_v1(request: Request):
     return await _handle_chat_completion(body)
 
 
-async def _stream_events(body: Dict[str, Any], category: str) -> AsyncIterator[str]:
+async def _stream_events(body: Dict[str, Any], category: str,
+                          force_start_idx: Optional[int] = None) -> AsyncIterator[str]:
     """2-Pass-Streaming: Erst Backend-Call mit Fallback-Loop, dann OpenAI-SSE an Copilot."""
-    outcome = await _call_model_with_fallbacks(body, category)
+    outcome = await _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
     result = outcome.get("result", {})
     content = result.get("content", "") or ""
     used_model = outcome.get("used_model", category)
