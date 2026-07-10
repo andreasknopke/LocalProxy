@@ -179,20 +179,11 @@ COOLDOWN_DEFAULT_SECONDS: float = float(os.getenv("COOLDOWN_DEFAULT_SECONDS", "3
 
 
 def _model_defs(category: str) -> List[Dict[str, Any]]:
-    """Gibt Liste von Modell-Definitionen fuer eine Kategorie zurueck.
-    - Bei Array-Struktur (light/strong/vision): gefiltert auf konfigurierte (api_url+model_name nicht leer)
-    - Bei Single-Def (local): als 1-elementige Liste
-    - Bei nicht-konfiguriert: leere Liste
-    """
+    """Gibt Liste von Modell-Definitionen fuer eine Kategorie zurueck."""
     cat = _MODEL_CATEGORIES.get(category)
     if isinstance(cat, list):
-        result = [d for d in cat if isinstance(d, dict) and d.get("api_url") and d.get("model_name")]
-        # Safety-Net: Jede Def nochmal sanitizen
-        for d in result:
-            _sanitize_def_ascii(d)
-        return result
+        return [d for d in cat if isinstance(d, dict) and d.get("api_url") and d.get("model_name")]
     if isinstance(cat, dict) and cat.get("api_url"):
-        _sanitize_def_ascii(cat)
         return [cat]
     return []
 
@@ -259,35 +250,24 @@ def _retry_after_seconds(status: int, response_headers: Any) -> Optional[float]:
     return None
 
 
-def _sanitize_def_ascii(d: Dict[str, Any]) -> None:
-    """Erzwingt ASCII-only fuer api_key und model_name in-place.
-    httpx und Docker-stdout crashen sonst bei non-ASCII in Headers/Payloads.
-    ACHTUNG: Keys die U+2022 (Bullet = WebUI-Maskierung) enthalten, werden NICHT
-    veraendert — das sind Platzhalter, deren echte Werte webui.py verwaltet.
-    """
-    for field in ("api_key", "model_name"):
-        val = d.get(field)
-        if isinstance(val, str):
-            # Maskierte Keys der WebUI nie anfassen (Bullets = U+2022)
-            if "\u2022" in val:
-                continue
-            try:
-                val.encode("ascii")
-            except UnicodeEncodeError:
-                d[field] = val.encode("ascii", errors="replace").decode("ascii")
-
-
 # ═══════════════════════════════════════════════════════════════════════════
-# Alle initialen Model-Defs ascii-sanitizen
+# UTF-8 in stdout/stderr für Docker (kein Locale in slim-Images)
 # ═══════════════════════════════════════════════════════════════════════════
-for _catkey in ("local", "light", "strong", "vision"):
-    _catval = _MODEL_CATEGORIES.get(_catkey)
-    if isinstance(_catval, list):
-        for _d in _catval:
-            if isinstance(_d, dict):
-                _sanitize_def_ascii(_d)
-    elif isinstance(_catval, dict):
-        _sanitize_def_ascii(_catval)
+# Diese Bloecke laufen VOR der Konfiguration und VOR jedem print().
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+try:
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+# ── Alle initialen Model-Defs gegen non-ASCII in api_key/model_name haerten ─
+# Nur _api_headers() braucht diesen Schutz (HTTP-Header muessen ASCII sein).
+# config.json und _MODEL_CATEGORIES bleiben unberuehrt — Keys duerfen nie
+# veraendert werden, sonst werden sie invalide.
+# ═══════════════════════════════════════════════════════════════════════════
 
 # ── Proxy ──────────────────────────────────────────────────────────────────
 PROXY_PORT: int = int(os.getenv("PROXY_PORT", os.getenv("PORT", "9001")))
@@ -330,21 +310,6 @@ def _apply_config_file() -> None:
         cfg = _webui_load_config()
     except Exception:
         return
-
-    # ── VOR dem Anwenden: Rohdaten aus config.json ascii-sanitizen (nur in-memory) ──
-    # Non-ASCII in api_key/model_name crasht httpx (HTTP-Header) und stdout (Docker).
-    # Nur in-memory bereinigen, NIEMALS auf Platte schreiben —
-    # die WebUI hat eigene Maskierungslogik (U+2022 Bullets), die wir nicht zerstören duerfen.
-    _saved_cats = cfg.get("model_categories", {})
-    if isinstance(_saved_cats, dict):
-        for _k in ("local", "light", "strong", "vision"):
-            _sc = _saved_cats.get(_k)
-            if isinstance(_sc, list):
-                for _d in _sc:
-                    if isinstance(_d, dict):
-                        _sanitize_def_ascii(_d)
-            elif isinstance(_sc, dict):
-                _sanitize_def_ascii(_sc)
 
     global _MODEL_CATEGORIES, DEFAULT_CATEGORY
 
@@ -417,16 +382,6 @@ def _apply_config_file() -> None:
                             element[field] = val
                     cleaned_list.append(element)
                 _MODEL_CATEGORIES[key] = cleaned_list
-
-    # Alle geladenen Model-Defs ASCII-sanitizen (non-ASCII API-Keys crashen httpx/Docker-stdout)
-    for _k in ("local", "light", "strong", "vision"):
-        _v = _MODEL_CATEGORIES.get(_k)
-        if isinstance(_v, list):
-            for _d in _v:
-                if isinstance(_d, dict):
-                    _sanitize_def_ascii(_d)
-        elif isinstance(_v, dict):
-            _sanitize_def_ascii(_v)
 
     # Active-Indices nach Config-Update validieren
     for key in ("light", "strong", "vision"):
