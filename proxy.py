@@ -186,8 +186,13 @@ def _model_defs(category: str) -> List[Dict[str, Any]]:
     """
     cat = _MODEL_CATEGORIES.get(category)
     if isinstance(cat, list):
-        return [d for d in cat if isinstance(d, dict) and d.get("api_url") and d.get("model_name")]
+        result = [d for d in cat if isinstance(d, dict) and d.get("api_url") and d.get("model_name")]
+        # Safety-Net: Jede Def nochmal sanitizen
+        for d in result:
+            _sanitize_def_ascii(d)
+        return result
     if isinstance(cat, dict) and cat.get("api_url"):
+        _sanitize_def_ascii(cat)
         return [cat]
     return []
 
@@ -252,6 +257,32 @@ def _retry_after_seconds(status: int, response_headers: Any) -> Optional[float]:
     except (AttributeError, ValueError, TypeError):
         pass
     return None
+
+
+def _sanitize_def_ascii(d: Dict[str, Any]) -> None:
+    """Erzwingt ASCII-only fuer api_key und model_name in-place.
+    httpx und Docker-stdout crashen sonst bei non-ASCII in Headers/Payloads.
+    """
+    for field in ("api_key", "model_name"):
+        val = d.get(field)
+        if isinstance(val, str):
+            try:
+                val.encode("ascii")
+            except UnicodeEncodeError:
+                d[field] = val.encode("ascii", errors="replace").decode("ascii")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Alle initialen Model-Defs ascii-sanitizen
+# ═══════════════════════════════════════════════════════════════════════════
+for _catkey in ("local", "light", "strong", "vision"):
+    _catval = _MODEL_CATEGORIES.get(_catkey)
+    if isinstance(_catval, list):
+        for _d in _catval:
+            if isinstance(_d, dict):
+                _sanitize_def_ascii(_d)
+    elif isinstance(_catval, dict):
+        _sanitize_def_ascii(_catval)
 
 # ── Proxy ──────────────────────────────────────────────────────────────────
 PROXY_PORT: int = int(os.getenv("PROXY_PORT", os.getenv("PORT", "9001")))
@@ -366,6 +397,16 @@ def _apply_config_file() -> None:
                             element[field] = val
                     cleaned_list.append(element)
                 _MODEL_CATEGORIES[key] = cleaned_list
+
+    # Alle geladenen Model-Defs ASCII-sanitizen (non-ASCII API-Keys crashen httpx/Docker-stdout)
+    for _k in ("local", "light", "strong", "vision"):
+        _v = _MODEL_CATEGORIES.get(_k)
+        if isinstance(_v, list):
+            for _d in _v:
+                if isinstance(_d, dict):
+                    _sanitize_def_ascii(_d)
+        elif isinstance(_v, dict):
+            _sanitize_def_ascii(_v)
 
     # Active-Indices nach Config-Update validieren
     for key in ("light", "strong", "vision"):
