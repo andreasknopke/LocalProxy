@@ -359,7 +359,11 @@ section.active { display: block; }
   padding: 20px; margin-bottom: 16px;
 }
 .card h3 { font-size: 1rem; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
-.form-group { margin-bottom: 14px; }
+.form-group { margin-bottom: 14px; position: relative; }
+.pw-wrapper { position: relative; }
+.pw-wrapper input { width: 100%; padding-right: 36px; }
+.pw-toggle { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); background: none; border: none; color: var(--text2); cursor: pointer; font-size: 0.9rem; padding: 4px; line-height: 1; }
+.pw-toggle:hover { color: var(--text); }
 .form-group label { display: block; font-size: 0.82rem; color: var(--text2); margin-bottom: 4px; font-weight: 500; }
 .form-group .hint { font-size: 0.72rem; color: var(--text2); opacity: 0.7; margin-top: 2px; }
 input[type="text"], input[type="url"], input[type="number"], input[type="password"], select, textarea {
@@ -1152,8 +1156,29 @@ async function testCategory(key, slot) {
   }
 }
 
+// ============ PASSWORD TOGGLE ============
+function togglePw(btn) {
+  const input = btn.parentElement.querySelector('input');
+  const show = input.type === 'password';
+  input.type = show ? 'text' : 'password';
+  btn.textContent = show ? '🙈' : '👁';
+}
+
 // ============ INIT ============
 loadConfig();
+// Fuege Show/Hide-Buttons zu allen Passwortfeldern hinzu
+document.querySelectorAll('input[type=password]').forEach(function(inp) {
+  var wrapper = document.createElement('span');
+  wrapper.className = 'pw-wrapper';
+  inp.parentNode.insertBefore(wrapper, inp);
+  wrapper.appendChild(inp);
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'pw-toggle';
+  btn.textContent = '👁';
+  btn.onclick = function() { togglePw(btn); };
+  wrapper.appendChild(btn);
+});
 </script>
 </body>
 </html>"""
