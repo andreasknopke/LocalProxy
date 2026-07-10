@@ -240,14 +240,18 @@ def test_build_passthrough_payload_basic():
         "messages": [{"role": "user", "content": "hello --light"}],
     }
     payload = proxy._build_passthrough_payload(body, "light")
-    assert payload["model"] == proxy._MODEL_CATEGORIES["light"]["model_name"]
+    # _MODEL_CATEGORIES["light"] ist jetzt ein Array; nimm erstes Element
+    light_defs = proxy._model_defs("light")
+    assert light_defs, "light sollte mindestens eine konfigurierte Definition haben"
+    assert payload["model"] == light_defs[0]["model_name"]
     assert payload["stream"] is False
     assert payload["max_tokens"] > 0
 
 
 def test_build_passthrough_payload_vision_keeps_image():
-    if not proxy._MODEL_CATEGORIES.get("vision", {}).get("model_name"):
-        pytest.skip("vision category not configured")
+    vision_defs = proxy._model_defs("vision")
+    if not vision_defs or not vision_defs[0].get("is_vision"):
+        pytest.skip("vision category not configured with is_vision=True")
     body = {
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": "describe"},
@@ -259,3 +263,103 @@ def test_build_passthrough_payload_vision_keeps_image():
     content = payload["messages"][0]["content"]
     has_image = any(p.get("type") == "image_url" for p in (content if isinstance(content, list) else []))
     assert has_image is True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 8. Fallback-System — Model-Defs, Cooldown, Reset
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_model_defs_legacy_dict():
+    """local ist Single-Def Dict -> _model_defs gibt [dict] zurueck."""
+    defs = proxy._model_defs("local")
+    assert isinstance(defs, list)
+    assert len(defs) == 1
+    assert isinstance(defs[0], dict)
+    assert defs[0].get("api_url")
+
+
+def test_model_defs_array():
+    """light/strong/vision sind Arrays -> gibt konfigurierte Defs zurueck."""
+    for cat in ("light", "strong", "vision"):
+        defs = proxy._model_defs(cat)
+        assert isinstance(defs, list), f"{cat} sollte Liste sein"
+        assert len(defs) >= 1, f"{cat} sollte mind. 1 Def haben"
+        assert isinstance(defs[0], dict)
+        assert defs[0].get("model_name")
+
+
+def test_model_defs_skips_empty():
+    """Leere Fallback-Eintraege (api_url='') werden gefiltert."""
+    for cat in ("light", "strong", "vision"):
+        defs = proxy._model_defs(cat)
+        # Alle Defs muessen api_url + model_name haben
+        for d in defs:
+            assert d.get("api_url"), f"{cat} def hat leere api_url"
+            assert d.get("model_name"), f"{cat} def hat leeren model_name"
+
+
+def test_do_reset():
+    """Reset setzt alle Kategorien auf 0 und loescht Cooldowns."""
+    # Aktuelle Indices merken und setzen
+    old = dict(proxy._CATEGORY_ACTIVE_IDX)
+    proxy._CATEGORY_ACTIVE_IDX["light"] = 1
+    proxy._CATEGORY_ACTIVE_IDX["strong"] = 2
+    proxy._do_reset()
+    assert proxy._CATEGORY_ACTIVE_IDX["light"] == 0
+    assert proxy._CATEGORY_ACTIVE_IDX["strong"] == 0
+    assert proxy._CATEGORY_ACTIVE_IDX["vision"] == 0
+    # local bleibt auch 0
+    assert proxy._CATEGORY_ACTIVE_IDX["local"] == 0
+    # Wiederherstellen
+    proxy._CATEGORY_ACTIVE_IDX.update(old)
+
+
+def test_detect_reset_flag():
+    """--reset wird erkannt, --light nicht als Reset."""
+    assert proxy._detect_reset_flag("--reset")
+    assert proxy._detect_reset_flag("bitte --reset machen")
+    assert proxy._detect_reset_flag("--reset bitte --light")
+    assert not proxy._detect_reset_flag("--light")
+    assert not proxy._detect_reset_flag("kein flag")
+
+
+def test_retry_after_seconds():
+    """Retry-After Header wird korrekt extrahiert."""
+    from types import SimpleNamespace
+    headers = SimpleNamespace(get=lambda k: "60" if k.lower() == "retry-after" else None)
+    val = proxy._retry_after_seconds(429, headers)
+    assert val == 60.0
+
+    headers_no = SimpleNamespace(get=lambda k: None)
+    assert proxy._retry_after_seconds(429, headers_no) is None
+    assert proxy._retry_after_seconds(200, headers) is None
+    assert proxy._retry_after_seconds(503, headers) == 60.0
+
+
+def test_model_key():
+    """_model_key erzeugt stable ID category:model_name."""
+    key = proxy._model_key("light", 0)
+    assert key.startswith("light:")
+    assert len(key) > 6
+    assert "gpt" in key or "claude" in key or "Qwen" in key  # je nach Konfig
+
+
+def test_cooldown_roundtrip():
+    """Cooldown setzen und abfragen funktioniert."""
+    # Cleanup
+    if proxy.COOLDOWN_FILE.exists():
+        proxy.COOLDOWN_FILE.unlink()
+    assert not proxy._is_in_cooldown("light", 0)
+    # Starte mit default Duration (300s) — min 10s greift
+    proxy._start_cooldown("light", 0, duration_override=10.0)
+    assert proxy._is_in_cooldown("light", 0)
+    # Prüfe, ob Cooldown in Datei persistiert wurde
+    data = proxy._load_cooldowns()
+    key = proxy._model_key("light", 0)
+    assert key in data
+    assert data[key] > 0
+    # Löschen um Test sauber zu beenden
+    if proxy.COOLDOWN_FILE.exists():
+        proxy.COOLDOWN_FILE.unlink()
+    assert not proxy._is_in_cooldown("light", 0)

@@ -173,30 +173,45 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "is_vision": False,
             "timeout_seconds": 300,
         },
-        "light": {
-            "api_url": "https://api.openai.com/v1/chat/completions",
-            "api_key": "",
-            "model_name": "gpt-4.1-mini",
-            "max_tokens": 65536,
-            "is_vision": False,
-            "timeout_seconds": 180,
-        },
-        "strong": {
-            "api_url": "https://api.anthropic.com/v1/chat/completions",
-            "api_key": "",
-            "model_name": "claude-sonnet-4-20250514",
-            "max_tokens": 65536,
-            "is_vision": False,
-            "timeout_seconds": 300,
-        },
-        "vision": {
-            "api_url": "https://api.openai.com/v1/chat/completions",
-            "api_key": "",
-            "model_name": "gpt-4o",
-            "max_tokens": 65536,
-            "is_vision": True,
-            "timeout_seconds": 180,
-        },
+        "light": [
+            {
+                "label": "light primary",
+                "api_url": "https://api.openai.com/v1/chat/completions",
+                "api_key": "",
+                "model_name": "gpt-4.1-mini",
+                "max_tokens": 65536,
+                "is_vision": False,
+                "timeout_seconds": 180,
+            },
+            {"label": "light fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": False, "timeout_seconds": 180},
+            {"label": "light fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": False, "timeout_seconds": 180},
+        ],
+        "strong": [
+            {
+                "label": "strong primary",
+                "api_url": "https://api.anthropic.com/v1/chat/completions",
+                "api_key": "",
+                "model_name": "claude-sonnet-4-20250514",
+                "max_tokens": 65536,
+                "is_vision": False,
+                "timeout_seconds": 300,
+            },
+            {"label": "strong fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": False, "timeout_seconds": 300},
+            {"label": "strong fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": False, "timeout_seconds": 300},
+        ],
+        "vision": [
+            {
+                "label": "vision primary",
+                "api_url": "https://api.openai.com/v1/chat/completions",
+                "api_key": "",
+                "model_name": "gpt-4o",
+                "max_tokens": 65536,
+                "is_vision": True,
+                "timeout_seconds": 180,
+            },
+            {"label": "vision fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": True, "timeout_seconds": 180},
+            {"label": "vision fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": True, "timeout_seconds": 180},
+        ],
     },
     "default_category": "light",
     "proxy": {
@@ -381,6 +396,8 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .btn-primary:hover { background: #2ea043; }
 .btn-danger { background: var(--danger); color: #fff; }
 .btn-danger:hover { background: #e5534b; }
+.btn-small { padding: 6px 12px; border: 1px solid var(--border); border-radius: var(--radius); font-size: 0.78rem; cursor: pointer; font-family: var(--font); background: var(--bg2); color: var(--text); transition: background .15s; }
+.btn-small:hover { background: var(--bg3); }
 .toast {
   position: fixed; bottom: 24px; right: 24px; padding: 12px 20px;
   border-radius: var(--radius); font-size: 0.85rem; color: #fff;
@@ -400,6 +417,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .model-tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
 .model-card { display: none; }
 .model-card.active { display: block; }
+.model-slot { padding: 4px 0; }
 .status-line { font-size: 0.8rem; color: var(--text2); margin-top: 4px; }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
 .status-dot.ok { background: #3fb950; }
@@ -477,96 +495,348 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
       </div>
 
       <div id="modelCard_light" class="model-card">
-        <div class="form-group">
-          <label>API URL (OpenAI-kompatibel)</label>
-          <input type="url" id="light_api_url" placeholder="https://api.openai.com/v1/chat/completions">
-        </div>
-        <div class="form-group">
-          <label>API Key</label>
-          <input type="password" id="light_api_key" placeholder="sk-...">
-        </div>
-        <div class="form-group">
-          <label>Model Name</label>
-          <input type="text" id="light_model_name" placeholder="gpt-4.1-mini">
-        </div>
-        <div class="row">
+        <!-- ── Slot 1: Primary ── -->
+        <div class="model-slot">
+          <h4 style="margin:12px 0 8px;color:#58a6ff;font-size:0.85rem;text-transform:uppercase;letter-spacing:0.5px">Primary</h4>
           <div class="form-group">
-            <label>Max Tokens</label>
-            <input type="number" id="light_max_tokens" min="1" max="256000">
+            <label>Label</label>
+            <input type="text" id="light_label_1" placeholder="z.B. OpenAI GPT-4.1-mini">
           </div>
           <div class="form-group">
-            <label>Timeout (Sekunden)</label>
-            <input type="number" id="light_timeout_seconds" min="10" max="3600">
+            <label>API URL (OpenAI-kompatibel)</label>
+            <input type="url" id="light_api_url" placeholder="https://api.openai.com/v1/chat/completions">
           </div>
+          <div class="form-group">
+            <label>API Key</label>
+            <input type="password" id="light_api_key" placeholder="sk-...">
+          </div>
+          <div class="form-group">
+            <label>Model Name</label>
+            <input type="text" id="light_model_name" placeholder="gpt-4.1-mini">
+          </div>
+          <div class="row">
+            <div class="form-group">
+              <label>Max Tokens</label>
+              <input type="number" id="light_max_tokens" min="1" max="256000">
+            </div>
+            <div class="form-group">
+              <label>Timeout (Sekunden)</label>
+              <input type="number" id="light_timeout_seconds" min="10" max="3600">
+            </div>
+          </div>
+          <div class="toggle-row">
+            <span>Vision (image_url Support)</span>
+            <label class="toggle"><input type="checkbox" id="light_is_vision"><span class="slider"></span></label>
+          </div>
+          <button class="btn btn-small" onclick="testCategory('light',1)" style="margin-top:8px">Test Slot 1</button>
+          <div class="status-line" id="light_test_status"></div>
         </div>
-        <div class="toggle-row">
-          <span>Vision (image_url Support)</span>
-          <label class="toggle"><input type="checkbox" id="light_is_vision"><span class="slider"></span></label>
+
+        <!-- ── Slot 2: Fallback ── -->
+        <hr style="border-color:#30363d;margin:16px 0">
+        <div class="model-slot">
+          <h4 style="margin:0 0 8px;color:#f0883e;font-size:0.85rem;text-transform:uppercase;letter-spacing:0.5px">Fallback 2</h4>
+          <div class="form-group">
+            <label>Label</label>
+            <input type="text" id="light_label_2" placeholder="z.B. Gemini-2.5-flash">
+          </div>
+          <div class="form-group">
+            <label>API URL</label>
+            <input type="url" id="light_api_url_2" placeholder="https://api.openai.com/v1/chat/completions">
+          </div>
+          <div class="form-group">
+            <label>API Key</label>
+            <input type="password" id="light_api_key_2" placeholder="sk-...">
+          </div>
+          <div class="form-group">
+            <label>Model Name</label>
+            <input type="text" id="light_model_name_2" placeholder="gpt-4.1-mini">
+          </div>
+          <div class="row">
+            <div class="form-group">
+              <label>Max Tokens</label>
+              <input type="number" id="light_max_tokens_2" min="1" max="256000">
+            </div>
+            <div class="form-group">
+              <label>Timeout (Sekunden)</label>
+              <input type="number" id="light_timeout_seconds_2" min="10" max="3600">
+            </div>
+          </div>
+          <div class="toggle-row">
+            <span>Vision (image_url Support)</span>
+            <label class="toggle"><input type="checkbox" id="light_is_vision_2"><span class="slider"></span></label>
+          </div>
+          <button class="btn btn-small" onclick="testCategory('light',2)" style="margin-top:8px">Test Slot 2</button>
+          <div class="status-line" id="light_test_status_2"></div>
         </div>
-        <button class="btn btn-primary" onclick="testCategory('light')" style="margin-top:8px">Test-Endpunkt</button>
-        <div class="status-line" id="light_test_status"></div>
+
+        <!-- ── Slot 3: Fallback ── -->
+        <hr style="border-color:#30363d;margin:16px 0">
+        <div class="model-slot">
+          <h4 style="margin:0 0 8px;color:#f0883e;font-size:0.85rem;text-transform:uppercase;letter-spacing:0.5px">Fallback 3</h4>
+          <div class="form-group">
+            <label>Label</label>
+            <input type="text" id="light_label_3" placeholder="z.B. DeepSeek-Chat">
+          </div>
+          <div class="form-group">
+            <label>API URL</label>
+            <input type="url" id="light_api_url_3" placeholder="https://api.openai.com/v1/chat/completions">
+          </div>
+          <div class="form-group">
+            <label>API Key</label>
+            <input type="password" id="light_api_key_3" placeholder="sk-...">
+          </div>
+          <div class="form-group">
+            <label>Model Name</label>
+            <input type="text" id="light_model_name_3" placeholder="gpt-4.1-mini">
+          </div>
+          <div class="row">
+            <div class="form-group">
+              <label>Max Tokens</label>
+              <input type="number" id="light_max_tokens_3" min="1" max="256000">
+            </div>
+            <div class="form-group">
+              <label>Timeout (Sekunden)</label>
+              <input type="number" id="light_timeout_seconds_3" min="10" max="3600">
+            </div>
+          </div>
+          <div class="toggle-row">
+            <span>Vision (image_url Support)</span>
+            <label class="toggle"><input type="checkbox" id="light_is_vision_3"><span class="slider"></span></label>
+          </div>
+          <button class="btn btn-small" onclick="testCategory('light',3)" style="margin-top:8px">Test Slot 3</button>
+          <div class="status-line" id="light_test_status_3"></div>
+        </div>
       </div>
 
       <div id="modelCard_strong" class="model-card">
-        <div class="form-group">
-          <label>API URL (OpenAI-kompatibel)</label>
-          <input type="url" id="strong_api_url" placeholder="https://api.anthropic.com/v1/chat/completions">
-        </div>
-        <div class="form-group">
-          <label>API Key</label>
-          <input type="password" id="strong_api_key" placeholder="sk-ant-...">
-        </div>
-        <div class="form-group">
-          <label>Model Name</label>
-          <input type="text" id="strong_model_name" placeholder="claude-sonnet-4-20250514">
-        </div>
-        <div class="row">
+        <!-- ── Slot 1: Primary ── -->
+        <div class="model-slot">
+          <h4 style="margin:12px 0 8px;color:#58a6ff;font-size:0.85rem;text-transform:uppercase;letter-spacing:0.5px">Primary</h4>
           <div class="form-group">
-            <label>Max Tokens</label>
-            <input type="number" id="strong_max_tokens" min="1" max="256000">
+            <label>Label</label>
+            <input type="text" id="strong_label_1" placeholder="z.B. Claude Sonnet">
           </div>
           <div class="form-group">
-            <label>Timeout (Sekunden)</label>
-            <input type="number" id="strong_timeout_seconds" min="10" max="3600">
+            <label>API URL (OpenAI-kompatibel)</label>
+            <input type="url" id="strong_api_url" placeholder="https://api.anthropic.com/v1/chat/completions">
           </div>
+          <div class="form-group">
+            <label>API Key</label>
+            <input type="password" id="strong_api_key" placeholder="sk-ant-...">
+          </div>
+          <div class="form-group">
+            <label>Model Name</label>
+            <input type="text" id="strong_model_name" placeholder="claude-sonnet-4-20250514">
+          </div>
+          <div class="row">
+            <div class="form-group">
+              <label>Max Tokens</label>
+              <input type="number" id="strong_max_tokens" min="1" max="256000">
+            </div>
+            <div class="form-group">
+              <label>Timeout (Sekunden)</label>
+              <input type="number" id="strong_timeout_seconds" min="10" max="3600">
+            </div>
+          </div>
+          <div class="toggle-row">
+            <span>Vision (image_url Support)</span>
+            <label class="toggle"><input type="checkbox" id="strong_is_vision"><span class="slider"></span></label>
+          </div>
+          <button class="btn btn-small" onclick="testCategory('strong',1)" style="margin-top:8px">Test Slot 1</button>
+          <div class="status-line" id="strong_test_status"></div>
         </div>
-        <div class="toggle-row">
-          <span>Vision (image_url Support)</span>
-          <label class="toggle"><input type="checkbox" id="strong_is_vision"><span class="slider"></span></label>
+
+        <!-- ── Slot 2: Fallback ── -->
+        <hr style="border-color:#30363d;margin:16px 0">
+        <div class="model-slot">
+          <h4 style="margin:0 0 8px;color:#f0883e;font-size:0.85rem;text-transform:uppercase;letter-spacing:0.5px">Fallback 2</h4>
+          <div class="form-group">
+            <label>Label</label>
+            <input type="text" id="strong_label_2" placeholder="z.B. Gemini 2.5 Pro">
+          </div>
+          <div class="form-group">
+            <label>API URL</label>
+            <input type="url" id="strong_api_url_2" placeholder="https://api.anthropic.com/v1/chat/completions">
+          </div>
+          <div class="form-group">
+            <label>API Key</label>
+            <input type="password" id="strong_api_key_2" placeholder="sk-ant-...">
+          </div>
+          <div class="form-group">
+            <label>Model Name</label>
+            <input type="text" id="strong_model_name_2" placeholder="claude-sonnet-4-20250514">
+          </div>
+          <div class="row">
+            <div class="form-group">
+              <label>Max Tokens</label>
+              <input type="number" id="strong_max_tokens_2" min="1" max="256000">
+            </div>
+            <div class="form-group">
+              <label>Timeout (Sekunden)</label>
+              <input type="number" id="strong_timeout_seconds_2" min="10" max="3600">
+            </div>
+          </div>
+          <div class="toggle-row">
+            <span>Vision (image_url Support)</span>
+            <label class="toggle"><input type="checkbox" id="strong_is_vision_2"><span class="slider"></span></label>
+          </div>
+          <button class="btn btn-small" onclick="testCategory('strong',2)" style="margin-top:8px">Test Slot 2</button>
+          <div class="status-line" id="strong_test_status_2"></div>
         </div>
-        <button class="btn btn-primary" onclick="testCategory('strong')" style="margin-top:8px">Test-Endpunkt</button>
-        <div class="status-line" id="strong_test_status"></div>
+
+        <!-- ── Slot 3: Fallback ── -->
+        <hr style="border-color:#30363d;margin:16px 0">
+        <div class="model-slot">
+          <h4 style="margin:0 0 8px;color:#f0883e;font-size:0.85rem;text-transform:uppercase;letter-spacing:0.5px">Fallback 3</h4>
+          <div class="form-group">
+            <label>Label</label>
+            <input type="text" id="strong_label_3" placeholder="z.B. DeepSeek-V3">
+          </div>
+          <div class="form-group">
+            <label>API URL</label>
+            <input type="url" id="strong_api_url_3" placeholder="https://api.anthropic.com/v1/chat/completions">
+          </div>
+          <div class="form-group">
+            <label>API Key</label>
+            <input type="password" id="strong_api_key_3" placeholder="sk-ant-...">
+          </div>
+          <div class="form-group">
+            <label>Model Name</label>
+            <input type="text" id="strong_model_name_3" placeholder="claude-sonnet-4-20250514">
+          </div>
+          <div class="row">
+            <div class="form-group">
+              <label>Max Tokens</label>
+              <input type="number" id="strong_max_tokens_3" min="1" max="256000">
+            </div>
+            <div class="form-group">
+              <label>Timeout (Sekunden)</label>
+              <input type="number" id="strong_timeout_seconds_3" min="10" max="3600">
+            </div>
+          </div>
+          <div class="toggle-row">
+            <span>Vision (image_url Support)</span>
+            <label class="toggle"><input type="checkbox" id="strong_is_vision_3"><span class="slider"></span></label>
+          </div>
+          <button class="btn btn-small" onclick="testCategory('strong',3)" style="margin-top:8px">Test Slot 3</button>
+          <div class="status-line" id="strong_test_status_3"></div>
+        </div>
       </div>
 
       <div id="modelCard_vision" class="model-card">
-        <div class="form-group">
-          <label>API URL (OpenAI-kompatibel)</label>
-          <input type="url" id="vision_api_url" placeholder="https://api.openai.com/v1/chat/completions">
-        </div>
-        <div class="form-group">
-          <label>API Key</label>
-          <input type="password" id="vision_api_key" placeholder="sk-...">
-        </div>
-        <div class="form-group">
-          <label>Model Name</label>
-          <input type="text" id="vision_model_name" placeholder="gpt-4o">
-        </div>
-        <div class="row">
+        <!-- ── Slot 1: Primary ── -->
+        <div class="model-slot">
+          <h4 style="margin:12px 0 8px;color:#58a6ff;font-size:0.85rem;text-transform:uppercase;letter-spacing:0.5px">Primary</h4>
           <div class="form-group">
-            <label>Max Tokens</label>
-            <input type="number" id="vision_max_tokens" min="1" max="256000">
+            <label>Label</label>
+            <input type="text" id="vision_label_1" placeholder="z.B. GPT-4o">
           </div>
           <div class="form-group">
-            <label>Timeout (Sekunden)</label>
-            <input type="number" id="vision_timeout_seconds" min="10" max="3600">
+            <label>API URL (OpenAI-kompatibel)</label>
+            <input type="url" id="vision_api_url" placeholder="https://api.openai.com/v1/chat/completions">
           </div>
+          <div class="form-group">
+            <label>API Key</label>
+            <input type="password" id="vision_api_key" placeholder="sk-...">
+          </div>
+          <div class="form-group">
+            <label>Model Name</label>
+            <input type="text" id="vision_model_name" placeholder="gpt-4o">
+          </div>
+          <div class="row">
+            <div class="form-group">
+              <label>Max Tokens</label>
+              <input type="number" id="vision_max_tokens" min="1" max="256000">
+            </div>
+            <div class="form-group">
+              <label>Timeout (Sekunden)</label>
+              <input type="number" id="vision_timeout_seconds" min="10" max="3600">
+            </div>
+          </div>
+          <div class="toggle-row">
+            <span>Vision (image_url Support)</span>
+            <label class="toggle"><input type="checkbox" id="vision_is_vision"><span class="slider"></span></label>
+          </div>
+          <button class="btn btn-small" onclick="testCategory('vision',1)" style="margin-top:8px">Test Slot 1</button>
+          <div class="status-line" id="vision_test_status"></div>
         </div>
-        <div class="toggle-row">
-          <span>Vision (image_url Support)</span>
-          <label class="toggle"><input type="checkbox" id="vision_is_vision"><span class="slider"></span></label>
+
+        <!-- ── Slot 2: Fallback ── -->
+        <hr style="border-color:#30363d;margin:16px 0">
+        <div class="model-slot">
+          <h4 style="margin:0 0 8px;color:#f0883e;font-size:0.85rem;text-transform:uppercase;letter-spacing:0.5px">Fallback 2</h4>
+          <div class="form-group">
+            <label>Label</label>
+            <input type="text" id="vision_label_2" placeholder="z.B. Gemini Flash Vision">
+          </div>
+          <div class="form-group">
+            <label>API URL</label>
+            <input type="url" id="vision_api_url_2" placeholder="https://api.openai.com/v1/chat/completions">
+          </div>
+          <div class="form-group">
+            <label>API Key</label>
+            <input type="password" id="vision_api_key_2" placeholder="sk-...">
+          </div>
+          <div class="form-group">
+            <label>Model Name</label>
+            <input type="text" id="vision_model_name_2" placeholder="gpt-4o">
+          </div>
+          <div class="row">
+            <div class="form-group">
+              <label>Max Tokens</label>
+              <input type="number" id="vision_max_tokens_2" min="1" max="256000">
+            </div>
+            <div class="form-group">
+              <label>Timeout (Sekunden)</label>
+              <input type="number" id="vision_timeout_seconds_2" min="10" max="3600">
+            </div>
+          </div>
+          <div class="toggle-row">
+            <span>Vision (image_url Support)</span>
+            <label class="toggle"><input type="checkbox" id="vision_is_vision_2"><span class="slider"></span></label>
+          </div>
+          <button class="btn btn-small" onclick="testCategory('vision',2)" style="margin-top:8px">Test Slot 2</button>
+          <div class="status-line" id="vision_test_status_2"></div>
         </div>
-        <button class="btn btn-primary" onclick="testCategory('vision')" style="margin-top:8px">Test-Endpunkt</button>
-        <div class="status-line" id="vision_test_status"></div>
+
+        <!-- ── Slot 3: Fallback ── -->
+        <hr style="border-color:#30363d;margin:16px 0">
+        <div class="model-slot">
+          <h4 style="margin:0 0 8px;color:#f0883e;font-size:0.85rem;text-transform:uppercase;letter-spacing:0.5px">Fallback 3</h4>
+          <div class="form-group">
+            <label>Label</label>
+            <input type="text" id="vision_label_3" placeholder="z.B. Claude Vision">
+          </div>
+          <div class="form-group">
+            <label>API URL</label>
+            <input type="url" id="vision_api_url_3" placeholder="https://api.openai.com/v1/chat/completions">
+          </div>
+          <div class="form-group">
+            <label>API Key</label>
+            <input type="password" id="vision_api_key_3" placeholder="sk-...">
+          </div>
+          <div class="form-group">
+            <label>Model Name</label>
+            <input type="text" id="vision_model_name_3" placeholder="gpt-4o">
+          </div>
+          <div class="row">
+            <div class="form-group">
+              <label>Max Tokens</label>
+              <input type="number" id="vision_max_tokens_3" min="1" max="256000">
+            </div>
+            <div class="form-group">
+              <label>Timeout (Sekunden)</label>
+              <input type="number" id="vision_timeout_seconds_3" min="10" max="3600">
+            </div>
+          </div>
+          <div class="toggle-row">
+            <span>Vision (image_url Support)</span>
+            <label class="toggle"><input type="checkbox" id="vision_is_vision_3"><span class="slider"></span></label>
+          </div>
+          <button class="btn btn-small" onclick="testCategory('vision',3)" style="margin-top:8px">Test Slot 3</button>
+          <div class="status-line" id="vision_test_status_3"></div>
+        </div>
       </div>
     </div>
   </section>
@@ -701,13 +971,36 @@ async function loadConfig() {
     // Model categories
     const cats = cfg.model_categories || {};
     for (const key of ['local','light','strong','vision']) {
-      const c = cats[key] || {};
-      document.getElementById(key + '_api_url').value = c.api_url || '';
-      document.getElementById(key + '_api_key').value = c.api_key || '';
-      document.getElementById(key + '_model_name').value = c.model_name || '';
-      document.getElementById(key + '_max_tokens').value = c.max_tokens || 65536;
-      document.getElementById(key + '_timeout_seconds').value = c.timeout_seconds || 180;
-      document.getElementById(key + '_is_vision').checked = !!c.is_vision;
+      const c = cats[key];
+      if (Array.isArray(c)) {
+        // Array-Struktur (light/strong/vision): 3 Slots
+        for (let i = 0; i < 3; i++) {
+          const def = c[i] || {};
+          const suffix = i === 0 ? '' : '_' + (i+1);
+          const urlEl = document.getElementById(key + '_api_url' + suffix);
+          if (urlEl) {
+            urlEl.value = def.api_url || '';
+            document.getElementById(key + '_api_key' + suffix).value = def.api_key || '';
+            document.getElementById(key + '_model_name' + suffix).value = def.model_name || '';
+            document.getElementById(key + '_max_tokens' + suffix).value = def.max_tokens || 65536;
+            document.getElementById(key + '_timeout_seconds' + suffix).value = def.timeout_seconds || 180;
+            document.getElementById(key + '_is_vision' + suffix).checked = !!def.is_vision;
+            // Label ist optional
+            const labelEl = document.getElementById(key + '_label_' + (i+1));
+            if (labelEl) labelEl.value = def.label || '';
+          }
+        }
+      } else if (c) {
+        // Single-Def (local) oder legacy
+        document.getElementById(key + '_api_url').value = c.api_url || '';
+        document.getElementById(key + '_api_key').value = c.api_key || '';
+        document.getElementById(key + '_model_name').value = c.model_name || '';
+        document.getElementById(key + '_max_tokens').value = c.max_tokens || 65536;
+        document.getElementById(key + '_timeout_seconds').value = c.timeout_seconds || 180;
+        document.getElementById(key + '_is_vision').checked = !!c.is_vision;
+        const labelEl = document.getElementById(key + '_label_1');
+        if (labelEl) labelEl.value = c.label || key;
+      }
     }
 
     // Hindsight
@@ -746,14 +1039,34 @@ async function saveConfig() {
 
   cfg.model_categories = {};
   for (const key of ['local','light','strong','vision']) {
-    cfg.model_categories[key] = {
-      api_url: document.getElementById(key + '_api_url').value,
-      api_key: document.getElementById(key + '_api_key').value,
-      model_name: document.getElementById(key + '_model_name').value,
-      max_tokens: parseInt(document.getElementById(key + '_max_tokens').value) || 65536,
-      timeout_seconds: parseFloat(document.getElementById(key + '_timeout_seconds').value) || 180,
-      is_vision: document.getElementById(key + '_is_vision').checked,
-    };
+    if (key === 'local') {
+      // local bleibt Single-Def Dict
+      cfg.model_categories[key] = {
+        label: document.getElementById(key + '_label_1')?.value || key,
+        api_url: document.getElementById(key + '_api_url').value,
+        api_key: document.getElementById(key + '_api_key').value,
+        model_name: document.getElementById(key + '_model_name').value,
+        max_tokens: parseInt(document.getElementById(key + '_max_tokens').value) || 65536,
+        timeout_seconds: parseFloat(document.getElementById(key + '_timeout_seconds').value) || 180,
+        is_vision: document.getElementById(key + '_is_vision').checked,
+      };
+    } else {
+      // Array mit 3 Slots
+      const arr = [];
+      for (let i = 0; i < 3; i++) {
+        const suffix = i === 0 ? '' : '_' + (i+1);
+        arr.push({
+          label: document.getElementById(key + '_label_' + (i+1))?.value || (i === 0 ? key + ' primary' : key + ' fallback ' + (i+1)),
+          api_url: document.getElementById(key + '_api_url' + suffix).value,
+          api_key: document.getElementById(key + '_api_key' + suffix).value,
+          model_name: document.getElementById(key + '_model_name' + suffix).value,
+          max_tokens: parseInt(document.getElementById(key + '_max_tokens' + suffix).value) || 65536,
+          timeout_seconds: parseFloat(document.getElementById(key + '_timeout_seconds' + suffix).value) || 180,
+          is_vision: document.getElementById(key + '_is_vision' + suffix).checked,
+        });
+      }
+      cfg.model_categories[key] = arr;
+    }
   }
 
   cfg.hindsight = {
@@ -804,11 +1117,14 @@ async function restartProxy() {
 }
 
 // ============ TEST ENDPOINT ============
-async function testCategory(key) {
-  const apiUrl = document.getElementById(key + '_api_url').value;
-  const apiKey = document.getElementById(key + '_api_key').value;
-  const modelName = document.getElementById(key + '_model_name').value;
-  const statusEl = document.getElementById(key + '_test_status');
+async function testCategory(key, slot) {
+  slot = slot || 1;
+  const suffix = slot === 1 ? '' : '_' + slot;
+  const apiUrl = document.getElementById(key + '_api_url' + suffix).value;
+  const apiKey = document.getElementById(key + '_api_key' + suffix).value;
+  const modelName = document.getElementById(key + '_model_name' + suffix).value;
+  const statusEl = document.getElementById(key + '_test_status' + suffix);
+  if (!statusEl) return;
 
   if (!apiUrl || !modelName) {
     statusEl.innerHTML = '<span class="status-dot err"></span> URL und Model-Name erforderlich';

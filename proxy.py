@@ -94,7 +94,9 @@ except Exception:
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ── Modell-Kategorien (4 Slots) ────────────────────────────────────────────
-_MODEL_CATEGORIES: Dict[str, Dict[str, Any]] = {
+# local: Single-Def (keine Fallbacks)
+# light/strong/vision: Array mit bis zu 3 Slots [Primary, Fallback 2, Fallback 3]
+_MODEL_CATEGORIES: Dict[str, Any] = {
     "local": {
         "api_url": os.getenv("LOCAL_API_URL", "http://localhost:8000/v1/chat/completions"),
         "api_key": os.getenv("LOCAL_API_KEY", ""),
@@ -102,34 +104,133 @@ _MODEL_CATEGORIES: Dict[str, Dict[str, Any]] = {
         "max_tokens": int(os.getenv("LOCAL_MAX_TOKENS", "65536")),
         "is_vision": os.getenv("LOCAL_IS_VISION", "false").lower() in {"1", "true", "yes", "y", "on"},
         "timeout_seconds": float(os.getenv("LOCAL_TIMEOUT_SECONDS", "300")),
+        "label": "local primary",
     },
-    "light": {
-        "api_url": os.getenv("LIGHT_API_URL", "https://api.openai.com/v1/chat/completions"),
-        "api_key": os.getenv("LIGHT_API_KEY", ""),
-        "model_name": os.getenv("LIGHT_MODEL_NAME", "gpt-4.1-mini"),
-        "max_tokens": int(os.getenv("LIGHT_MAX_TOKENS", "65536")),
-        "is_vision": os.getenv("LIGHT_IS_VISION", "false").lower() in {"1", "true", "yes", "y", "on"},
-        "timeout_seconds": float(os.getenv("LIGHT_TIMEOUT_SECONDS", "180")),
-    },
-    "strong": {
-        "api_url": os.getenv("STRONG_API_URL", "https://api.anthropic.com/v1/chat/completions"),
-        "api_key": os.getenv("STRONG_API_KEY", ""),
-        "model_name": os.getenv("STRONG_MODEL_NAME", "claude-sonnet-4-20250514"),
-        "max_tokens": int(os.getenv("STRONG_MAX_TOKENS", "65536")),
-        "is_vision": os.getenv("STRONG_IS_VISION", "false").lower() in {"1", "true", "yes", "y", "on"},
-        "timeout_seconds": float(os.getenv("STRONG_TIMEOUT_SECONDS", "300")),
-    },
-    "vision": {
-        "api_url": os.getenv("VISION_API_URL", "https://api.openai.com/v1/chat/completions"),
-        "api_key": os.getenv("VISION_API_KEY", ""),
-        "model_name": os.getenv("VISION_MODEL_NAME", "gpt-4o"),
-        "max_tokens": int(os.getenv("VISION_MAX_TOKENS", "65536")),
-        "is_vision": os.getenv("VISION_IS_VISION", "true").lower() in {"1", "true", "yes", "y", "on"},
-        "timeout_seconds": float(os.getenv("VISION_TIMEOUT_SECONDS", "180")),
-    },
+    "light": [
+        {
+            "label": "light primary",
+            "api_url": os.getenv("LIGHT_API_URL", "https://api.openai.com/v1/chat/completions"),
+            "api_key": os.getenv("LIGHT_API_KEY", ""),
+            "model_name": os.getenv("LIGHT_MODEL_NAME", "gpt-4.1-mini"),
+            "max_tokens": int(os.getenv("LIGHT_MAX_TOKENS", "65536")),
+            "is_vision": os.getenv("LIGHT_IS_VISION", "false").lower() in {"1", "true", "yes", "y", "on"},
+            "timeout_seconds": float(os.getenv("LIGHT_TIMEOUT_SECONDS", "180")),
+        },
+        {"label": "light fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": False, "timeout_seconds": 180},
+        {"label": "light fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": False, "timeout_seconds": 180},
+    ],
+    "strong": [
+        {
+            "label": "strong primary",
+            "api_url": os.getenv("STRONG_API_URL", "https://api.anthropic.com/v1/chat/completions"),
+            "api_key": os.getenv("STRONG_API_KEY", ""),
+            "model_name": os.getenv("STRONG_MODEL_NAME", "claude-sonnet-4-20250514"),
+            "max_tokens": int(os.getenv("STRONG_MAX_TOKENS", "65536")),
+            "is_vision": os.getenv("STRONG_IS_VISION", "false").lower() in {"1", "true", "yes", "y", "on"},
+            "timeout_seconds": float(os.getenv("STRONG_TIMEOUT_SECONDS", "300")),
+        },
+        {"label": "strong fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": False, "timeout_seconds": 300},
+        {"label": "strong fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": False, "timeout_seconds": 300},
+    ],
+    "vision": [
+        {
+            "label": "vision primary",
+            "api_url": os.getenv("VISION_API_URL", "https://api.openai.com/v1/chat/completions"),
+            "api_key": os.getenv("VISION_API_KEY", ""),
+            "model_name": os.getenv("VISION_MODEL_NAME", "gpt-4o"),
+            "max_tokens": int(os.getenv("VISION_MAX_TOKENS", "65536")),
+            "is_vision": os.getenv("VISION_IS_VISION", "true").lower() in {"1", "true", "yes", "y", "on"},
+            "timeout_seconds": float(os.getenv("VISION_TIMEOUT_SECONDS", "180")),
+        },
+        {"label": "vision fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": True, "timeout_seconds": 180},
+        {"label": "vision fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": True, "timeout_seconds": 180},
+    ],
 }
 
 DEFAULT_CATEGORY: str = os.getenv("DEFAULT_CATEGORY", "light")
+
+# ── Fallback-System ─────────────────────────────────────────────────────────
+# Aktueller aktiver Index pro Kategorie (light/strong/vision)
+_CATEGORY_ACTIVE_IDX: Dict[str, int] = {"local": 0, "light": 0, "strong": 0, "vision": 0}
+
+COOLDOWN_FILE: Path = Path(os.getenv("COOLDOWN_FILE", str(Path(__file__).parent / "data" / "cooldowns.json")))
+COOLDOWN_DEFAULT_SECONDS: float = float(os.getenv("COOLDOWN_DEFAULT_SECONDS", "300"))
+
+
+def _model_defs(category: str) -> List[Dict[str, Any]]:
+    """Gibt Liste von Modell-Definitionen fuer eine Kategorie zurueck.
+    - Bei Array-Struktur (light/strong/vision): gefiltert auf konfigurierte (api_url+model_name nicht leer)
+    - Bei Single-Def (local): als 1-elementige Liste
+    - Bei nicht-konfiguriert: leere Liste
+    """
+    cat = _MODEL_CATEGORIES.get(category)
+    if isinstance(cat, list):
+        return [d for d in cat if isinstance(d, dict) and d.get("api_url") and d.get("model_name")]
+    if isinstance(cat, dict) and cat.get("api_url"):
+        return [cat]
+    return []
+
+
+def _model_key(category: str, idx: int) -> str:
+    """Stabile ID fuer Cooldown-Speicherung: 'category:model_name'."""
+    defs = _model_defs(category)
+    if 0 <= idx < len(defs):
+        return f"{category}:{defs[idx].get('model_name','idx'+str(idx))}"
+    return f"{category}:idx{idx}"
+
+
+def _load_cooldowns() -> Dict[str, float]:
+    """Liest Cooldown-Daten aus Datei. Mapping: model_key → expire_timestamp."""
+    try:
+        with open(COOLDOWN_FILE, "r") as f:
+            data = json.load(f)
+            return {k: float(v) for k, v in data.items()}
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
+        return {}
+
+
+def _save_cooldowns(data: Dict[str, float]) -> None:
+    """Schreibt Cooldown-Daten in Datei."""
+    try:
+        COOLDOWN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(COOLDOWN_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass  # Cooldown-Verlust ≠ Katastrophe
+
+
+def _is_in_cooldown(category: str, idx: int) -> bool:
+    """Prueft, ob eine Modell-Definition im Cooldown ist."""
+    expires_at = _load_cooldowns().get(_model_key(category, idx), 0)
+    return time.time() < expires_at
+
+
+def _start_cooldown(category: str, idx: int, duration_override: Optional[float] = None) -> None:
+    """Startet Cooldown fuer eine Modell-Definition (Default: 300s)."""
+    defs = _model_defs(category)
+    if idx >= len(defs):
+        return
+    duration = duration_override if duration_override is not None else COOLDOWN_DEFAULT_SECONDS
+    data = _load_cooldowns()
+    key = _model_key(category, idx)
+    expires_at = time.time() + max(10.0, float(duration))
+    data[key] = expires_at
+    _save_cooldowns(data)
+    model_name = defs[idx].get("model_name", "?")
+    _log(f"Cooldown: {category}[{idx}]={model_name} fuer {max(10.0, float(duration)):.0f}s (bis {time.strftime('%H:%M:%S', time.localtime(expires_at))})")
+
+
+def _retry_after_seconds(status: int, response_headers: Any) -> Optional[float]:
+    """Extrahiert Retry-After Header (nur Sekunden-Format)."""
+    if status not in (429, 503):
+        return None
+    try:
+        val = response_headers.get("retry-after") or response_headers.get("Retry-After")
+        if val is not None:
+            return float(val)
+    except (AttributeError, ValueError, TypeError):
+        pass
+    return None
 
 # ── Proxy ──────────────────────────────────────────────────────────────────
 PROXY_PORT: int = int(os.getenv("PROXY_PORT", os.getenv("PORT", "9001")))
@@ -178,24 +279,80 @@ def _apply_config_file() -> None:
     saved_cats = cfg.get("model_categories", {})
     if isinstance(saved_cats, dict):
         for key in ("local", "light", "strong", "vision"):
-            if key in saved_cats and isinstance(saved_cats[key], dict):
-                sc = saved_cats[key]
-                cat = _MODEL_CATEGORIES.setdefault(key, {})
-                for field in ("api_url", "api_key", "model_name", "max_tokens",
-                               "is_vision", "timeout_seconds"):
-                    if field in sc:
-                        val = sc[field]
-                        # Leere api_url / api_key duerfen Env-Var-Werte NIE ueberschreiben
-                        if field in ("api_url", "api_key") and isinstance(val, str) and val.strip() == "":
-                            continue
-                        if field == "max_tokens":
-                            val = int(val)
-                        elif field == "is_vision":
-                            val = bool(val) if not isinstance(val, str) else \
-                                str(val).lower() in {"1", "true", "yes", "y", "on"}
-                        elif field == "timeout_seconds":
-                            val = float(val)
-                        cat[field] = val
+            if key not in saved_cats:
+                continue
+            sc = saved_cats[key]
+
+            if isinstance(sc, dict):
+                # Legacy / local: Single-Def-Dict
+                existing = _MODEL_CATEGORIES.get(key)
+                if isinstance(existing, list):
+                    # Memory hat Array, config sagt Dict → als 1-elementiges Array behandeln
+                    merged: Dict[str, Any] = {}
+                    for field in ("label", "api_url", "api_key", "model_name", "max_tokens",
+                                   "is_vision", "timeout_seconds"):
+                        if field in sc:
+                            val = sc[field]
+                            if field in ("api_url", "api_key") and isinstance(val, str) and val.strip() == "":
+                                continue
+                            if field == "max_tokens":
+                                val = int(val)
+                            elif field == "is_vision":
+                                val = bool(val) if not isinstance(val, str) else \
+                                    str(val).lower() in {"1", "true", "yes", "y", "on"}
+                            elif field == "timeout_seconds":
+                                val = float(val)
+                            merged[field] = val
+                    merged.setdefault("label", key)
+                    _MODEL_CATEGORIES[key] = [merged]
+                else:
+                    cat = _MODEL_CATEGORIES.setdefault(key, {})
+                    for field in ("label", "api_url", "api_key", "model_name", "max_tokens",
+                                   "is_vision", "timeout_seconds"):
+                        if field in sc:
+                            val = sc[field]
+                            if field in ("api_url", "api_key") and isinstance(val, str) and val.strip() == "":
+                                continue
+                            if field == "max_tokens":
+                                val = int(val)
+                            elif field == "is_vision":
+                                val = bool(val) if not isinstance(val, str) else \
+                                    str(val).lower() in {"1", "true", "yes", "y", "on"}
+                            elif field == "timeout_seconds":
+                                val = float(val)
+                            cat[field] = val
+
+            elif isinstance(sc, list):
+                # Neue Array-Struktur (light/strong/vision)
+                cleaned_list: List[Dict[str, Any]] = []
+                for d in sc:
+                    if not isinstance(d, dict):
+                        continue
+                    element: Dict[str, Any] = {}
+                    for field in ("label", "api_url", "api_key", "model_name", "max_tokens",
+                                   "is_vision", "timeout_seconds"):
+                        if field in d:
+                            val = d[field]
+                            if field in ("api_url", "api_key") and isinstance(val, str) and val.strip() == "":
+                                continue
+                            if field == "max_tokens":
+                                val = int(val)
+                            elif field == "is_vision":
+                                val = (bool(val) if not isinstance(val, str) else
+                                       str(val).lower() in {"1", "true", "yes", "y", "on"})
+                            elif field == "timeout_seconds":
+                                val = float(val)
+                            element[field] = val
+                    cleaned_list.append(element)
+                _MODEL_CATEGORIES[key] = cleaned_list
+
+    # Active-Indices nach Config-Update validieren
+    for key in ("light", "strong", "vision"):
+        defs = _model_defs(key)
+        if not defs:
+            _CATEGORY_ACTIVE_IDX[key] = 0
+        elif _CATEGORY_ACTIVE_IDX[key] >= len(defs):
+            _CATEGORY_ACTIVE_IDX[key] = 0
 
     dc = cfg.get("default_category", "")
     if dc in ("local", "light", "strong", "vision"):
@@ -272,6 +429,31 @@ def _strip_model_flags_from_messages(messages: List[Dict[str, Any]]) -> List[Dic
                         cleaned, _ = _extract_model_flag(block.get("text", ""))
                         block["text"] = cleaned
     return messages
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Reset-Flag ── --reset setzt alle Kategorien auf Primary (Idx=0)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_RESET_FLAG_PATTERN = re.compile(r'--reset\b', re.IGNORECASE)
+
+
+def _detect_reset_flag(text: str) -> bool:
+    """Prueft, ob --reset im Text vorkommt."""
+    return bool(_RESET_FLAG_PATTERN.search(text))
+
+
+def _do_reset() -> None:
+    """Setzt alle Kategorien auf Primary (Idx=0). Loescht Cooldowns."""
+    for key in ("light", "strong", "vision"):
+        _CATEGORY_ACTIVE_IDX[key] = 0
+    # Cooldowns leeren
+    try:
+        if COOLDOWN_FILE.exists():
+            COOLDOWN_FILE.unlink()
+    except OSError:
+        pass
+    _log("Reset: alle Kategorien auf Primary (Idx=0), Cooldowns geleert")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -759,8 +941,9 @@ def _api_headers(api_key: str) -> Dict[str, str]:
 # Payload-Builder ── Pass-Through
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _build_passthrough_payload(body: Dict[str, Any], category: str) -> Dict[str, Any]:
-    cat = _MODEL_CATEGORIES.get(category, _MODEL_CATEGORIES["light"])
+def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int = 0) -> Dict[str, Any]:
+    defs = _model_defs(category)
+    cat = defs[def_idx] if defs and def_idx < len(defs) else _model_defs("light")[0]
     payload = copy.deepcopy(body)
     payload["model"] = cat["model_name"]
     payload["max_tokens"] = int(cat.get("max_tokens", 65536))
@@ -805,11 +988,16 @@ def _inject_hindsight_context(messages: List[Dict[str, Any]]) -> None:
 # Modell-Call ── Single Model Request
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def _call_single_model(body: Dict[str, Any], category: str) -> Dict[str, Any]:
-    cat = _MODEL_CATEGORIES.get(category, _MODEL_CATEGORIES["light"])
+async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int = 0) -> Dict[str, Any]:
+    defs = _model_defs(category)
+    if not defs or def_idx >= len(defs):
+        return {"category": category, "status": "error", "def_idx": def_idx,
+                "content": f"Keine gueltige Modell-Definition fuer {category}[{def_idx}]",
+                "trigger_fallback": False}
+    cat = defs[def_idx]
     started = time.perf_counter()
 
-    payload = _build_passthrough_payload(body, category)
+    payload = _build_passthrough_payload(body, category, def_idx=def_idx)
 
     messages = payload.get("messages", [])
     if isinstance(messages, list):
@@ -822,23 +1010,23 @@ async def _call_single_model(body: Dict[str, Any], category: str) -> Dict[str, A
 
     msg_count = len(messages) if isinstance(messages, list) else 0
     total_chars = sum(len(str(m.get("content", ""))) for m in (messages if isinstance(messages, list) else []))
-    _log(f"Single-Model call cat={category} model={model} "
+    _log(f"Single-Model call cat={category}[{def_idx}] model={model} "
          f"api_key={_truncate_key(api_key)} "
          f"messages={msg_count} chars={total_chars} timeout={timeout:.0f}s")
 
-    req_id = f"model_{category}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-    _dump_debug_payload(req_id, f"model_{category}", payload, extra={
-        "category": category, "model": model,
+    req_id = f"model_{category}_{def_idx}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    _dump_debug_payload(req_id, f"model_{category}_{def_idx}", payload, extra={
+        "category": category, "def_idx": def_idx, "model": model,
         "timeout": timeout, "messages_count": msg_count,
     })
     _register_debug_request(req_id, {
         "type": "model_call_start",
-        "category": category, "model": model,
+        "category": category, "def_idx": def_idx, "model": model,
         "messages_count": msg_count, "chars": total_chars,
         "timeout": timeout,
     })
     _register_active_call(req_id, {
-        "agent_key": category, "model": model,
+        "agent_key": category, "def_idx": def_idx, "model": model,
         "phase": "passthrough",
     })
 
@@ -860,14 +1048,16 @@ async def _call_single_model(body: Dict[str, Any], category: str) -> Dict[str, A
                 _log(f"Model returned structured tool_calls: {len(tool_calls)}")
             if reasoning_content:
                 _log(f"Model returned reasoning_content: {len(reasoning_content)} chars")
-            _log(f"Model OK cat={category} duration={duration:.1f}s content_len={len(content)}")
+            _log(f"Model OK cat={category}[{def_idx}] duration={duration:.1f}s content_len={len(content)}")
             return {
-                "category": category, "status": "ok",
+                "category": category, "def_idx": def_idx, "status": "ok",
                 "content": content, "message": message,
                 "tool_calls": tool_calls, "reasoning_content": reasoning_content,
                 "duration_seconds": duration, "usage": result.get("usage"),
+                "trigger_fallback": False,
             }
 
+        # Fehlerhafter Status-Code
         err_detail = ""
         try:
             err_body = response.json()
@@ -877,12 +1067,29 @@ async def _call_single_model(body: Dict[str, Any], category: str) -> Dict[str, A
                 err_detail = _safe_str(err_body["error"])
         except Exception:
             err_detail = f"HTTP {response.status_code}"
-        _log(f"Model STATUS {response.status_code} cat={category} "
+        _log(f"Model STATUS {response.status_code} cat={category}[{def_idx}] "
              f"duration={duration:.1f}s: {err_detail}")
+
+        # Cooldown-Logik
+        should_fallback = True
+        if response.status_code == 400:
+            # 400 ist Payload-Problem → kein Fallback
+            should_fallback = False
+        elif response.status_code == 429:
+            ra = _retry_after_seconds(response.status_code, getattr(response, "headers", {}))
+            _start_cooldown(category, def_idx, duration_override=ra)
+            _log(f"   → Rate-Limit: Cooldown fuer {category}[{def_idx}]={model}")
+        elif response.status_code in (401, 403):
+            _log(f"   → Auth-Fehler, kein Cooldown (Config-Fehler)")
+        elif response.status_code >= 500:
+            _start_cooldown(category, def_idx, duration_override=60.0)
+            _log(f"   → Server-Fehler: Cooldown (60s) fuer {category}[{def_idx}]={model}")
+
         return {
-            "category": category, "status": "failed",
+            "category": category, "def_idx": def_idx, "status": "failed",
             "content": _safe_str(f"Model status {response.status_code}: {err_detail}"),
             "duration_seconds": duration, "usage": None,
+            "trigger_fallback": should_fallback,
         }
 
     except Exception as exc:
@@ -890,12 +1097,109 @@ async def _call_single_model(body: Dict[str, Any], category: str) -> Dict[str, A
         exc_type = type(exc).__name__
         exc_msg = _safe_str(exc)
         _finish_active_call(req_id, "error", {"duration_seconds": duration, "error": exc_msg})
-        _log(f"Model ERROR cat={category} duration={duration:.1f}s type={exc_type}: {exc_msg}")
+        _log(f"Model ERROR cat={category}[{def_idx}] duration={duration:.1f}s type={exc_type}: {exc_msg}")
+        should_fallback = True
+        # Timeout/ConnectionError: kurzer Cooldown
+        if "timeout" in exc_type.lower() or "connect" in exc_type.lower():
+            _start_cooldown(category, def_idx, duration_override=30.0)
+            _log(f"   → Timeout/ConnError: Cooldown (30s) fuer {category}[{def_idx}]={model}")
         return {
-            "category": category, "status": "error",
+            "category": category, "def_idx": def_idx, "status": "error",
             "content": _safe_str(f"Model error nach {duration:.0f}s ({exc_type}): {exc_msg}"),
             "duration_seconds": duration, "usage": None,
+            "trigger_fallback": should_fallback,
         }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fallback-Orchestrierung ── Mit Fallback-Chain, Cooldown und 2 Runden
+# ═══════════════════════════════════════════════════════════════════════════
+
+_ASYNC_CATEGORY_ACTIVE_IDX: Dict[str, int] = {}  # Lese-/Schreib-Cache fuer _CATEGORY_ACTIVE_IDX
+
+
+async def _call_model_with_fallbacks(body: Dict[str, Any], category: str) -> Dict[str, Any]:
+    """Versucht Modelle in Kategorie mit Fallback-Chain.
+    - Runde 1: Starte mit active_idx, dann alle anderen, überspringe Cooldowns
+    - Runde 2: Alle erneut (Cooldowns ignoriert)
+    - Max 2 Runden, dann Fehler.
+    """
+    defs = _model_defs(category)
+    if not defs:
+        _log(f"Fallback: Kategorie '{category}' hat keine konfigurierten Modelle")
+        return {"all_failed": True, "result": {"status": "error", "category": category,
+                "content": f"Kategorie '{category}' hat keine konfigurierten Modelle"},
+                "used_idx": 0, "used_model": "(none)", "attempts": []}
+
+    start_idx = _CATEGORY_ACTIVE_IDX.get(category, 0)
+    if start_idx >= len(defs):
+        start_idx = 0
+        _CATEGORY_ACTIVE_IDX[category] = 0
+
+    attempted: List[Dict[str, Any]] = []
+    last_error_result: Optional[Dict[str, Any]] = None
+    last_used_idx: Optional[int] = None
+
+    for round_num in (1, 2):
+        # Reihenfolge: start_idx zuerst, dann alle anderen in Array-Reihenfolge
+        indices_to_try: List[int] = []
+        indices_to_try.append(start_idx)
+        for i in range(len(defs)):
+            if i != start_idx:
+                indices_to_try.append(i)
+
+        for curr_idx in indices_to_try:
+            # Runde 1: Cooldowns überspringen
+            if round_num == 1 and _is_in_cooldown(category, curr_idx):
+                _log(f"Fallback skip R1: {category}[{curr_idx}] = cooldown")
+                continue
+
+            _log(f"Fallback try R{round_num}: {category}[{curr_idx}] = {defs[curr_idx].get('model_name', '?')}")
+            result = await _call_single_model(body, category, def_idx=curr_idx)
+            attempted.append({"idx": curr_idx, "model": defs[curr_idx].get("model_name", "?"), "status": result.get("status")})
+            last_used_idx = curr_idx
+
+            if result.get("status") == "ok":
+                _log(f"Fallback SUCCESS: {category}[{curr_idx}] = {defs[curr_idx].get('model_name', '?')}")
+                # Bei Erfolg: active_idx auf dieses Modell setzen (permanent)
+                if curr_idx != start_idx:
+                    _CATEGORY_ACTIVE_IDX[category] = curr_idx
+                    _log(f"   → neues active primary idx={curr_idx} fuer {category}")
+
+                # model für Hindsight korrekt setzen
+                body["model"] = defs[curr_idx].get("model_name", body.get("model", ""))
+
+                return {
+                    "result": result,
+                    "used_idx": curr_idx,
+                    "used_model": defs[curr_idx].get("model_name", "?"),
+                    "attempts": attempted,
+                    "all_failed": False,
+                }
+
+            last_error_result = result
+
+            # Wenn trigger_fallback=False (z.B. 400): weitermachen bringt nichts
+            if not result.get("trigger_fallback", True):
+                _log(f"   → trigger_fallback=False, breche Fallback-Kette ab")
+                break
+
+        # Nach Runde 1: Prüfen ob ein Cooldown-Modell jetzt verwendbar wäre
+        # (trotzdem Runde 2 machen)
+
+    # Nach 2 Runden: alle fehlgeschlagen
+    _log(f"Fallback EXHAUSTED fuer {category}: {len(attempted)} Versuche fehlgeschlagen")
+    err_idx = last_used_idx if last_used_idx is not None else start_idx
+    err_def = defs[err_idx] if err_idx < len(defs) else {}
+    body["model"] = err_def.get("model_name", body.get("model", ""))
+    return {
+        "result": last_error_result or {"status": "error", "category": category,
+                "content": "Alle Fallbacks fehlgeschlagen"},
+        "used_idx": err_idx,
+        "used_model": err_def.get("model_name", "(none)"),
+        "attempts": attempted,
+        "all_failed": True,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1176,34 +1480,35 @@ async def _run_startup_health_checks() -> None:
             return f"HTTP {r.status_code}"
 
     for key in ("local", "light", "strong", "vision"):
-        cat = _MODEL_CATEGORIES.get(key, {})
-        api_url = str(cat.get("api_url", "")).rstrip("/")
-        if not api_url:
-            continue
-        _log(f"   {key} '{cat.get('model_name','?')}' @ {api_url} "
-             f"api_key={_truncate_key(str(cat.get('api_key', '')))} ...")
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0)) as hc:
-                r = await hc.post(
-                    api_url,
-                    json={"model": cat.get("model_name", ""),
-                          "messages": [{"role": "user", "content": "ping"}],
-                          "max_tokens": 1},
-                    headers=_api_headers(str(cat.get("api_key", ""))),
-                )
-            if r.status_code in (200, 201):
-                _log(f"   {key}: OK ({cat.get('model_name')})")
-            elif r.status_code in (401, 403):
-                err = _parse_error(r) or "AUTH-DENIED"
-                _log(f"   {key}: AUTH-FEHLER {r.status_code} - {err}")
-            elif r.status_code == 404:
-                err = _parse_error(r) or "Modell nicht gefunden"
-                _log(f"   {key}: 404 - {err}")
-            else:
-                err = _parse_error(r) or f"HTTP {r.status_code}"
-                _log(f"   {key}: {err}")
-        except Exception as exc:
-            _log(f"   {key}: nicht erreichbar - {type(exc).__name__}: {exc}")
+        defs = _model_defs(key)
+        for i, cat in enumerate(defs):
+            api_url = str(cat.get("api_url", "")).rstrip("/")
+            if not api_url:
+                continue
+            _log(f"   {key}[{i}] '{cat.get('model_name','?')}' @ {api_url} "
+                 f"api_key={_truncate_key(str(cat.get('api_key', '')))} ...")
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0)) as hc:
+                    r = await hc.post(
+                        api_url,
+                        json={"model": cat.get("model_name", ""),
+                              "messages": [{"role": "user", "content": "ping"}],
+                              "max_tokens": 1},
+                        headers=_api_headers(str(cat.get("api_key", ""))),
+                    )
+                if r.status_code in (200, 201):
+                    _log(f"   {key}[{i}]: OK ({cat.get('model_name')})")
+                elif r.status_code in (401, 403):
+                    err = _parse_error(r) or "AUTH-DENIED"
+                    _log(f"   {key}[{i}]: AUTH-FEHLER {r.status_code} - {err}")
+                elif r.status_code == 404:
+                    err = _parse_error(r) or "Modell nicht gefunden"
+                    _log(f"   {key}[{i}]: 404 - {err}")
+                else:
+                    err = _parse_error(r) or f"HTTP {r.status_code}"
+                    _log(f"   {key}[{i}]: {err}")
+            except Exception as exc:
+                _log(f"   {key}[{i}]: nicht erreichbar - {type(exc).__name__}: {exc}")
 
     _log("Health-Checks abgeschlossen")
 
@@ -1212,8 +1517,11 @@ async def _run_startup_health_checks() -> None:
 async def _startup_event() -> None:
     _log(f"LocalProxy v3.0 starting on port {PROXY_PORT}")
     _log(f"   Default:  {DEFAULT_CATEGORY}")
-    for key, cat in _MODEL_CATEGORIES.items():
-        _log(f"   {key}: {cat['model_name']} @ {cat['api_url']}")
+    for key in ("local", "light", "strong", "vision"):
+        defs = _model_defs(key)
+        if defs:
+            for i, d in enumerate(defs):
+                _log(f"   {key}[{i}]: {d.get('model_name','?')} @ {d.get('api_url','?')}")
     _log(f"   Memory:  {'Qdrant' if _hindsight._use_qdrant else 'JSONL' if HINDSIGHT_ENABLED else 'disabled'}")
     _log(f"   Auth:    {'enabled' if PROXY_AUTH_ENABLED else 'disabled'}")
     _log(f"   Debug:   {'enabled' if DEBUG_ENABLED else 'disabled'}")
@@ -1271,14 +1579,32 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
          f"tool_cont={_is_tool_continuation(msgs)}")
 
     last_user = _last_user_text(msgs)
+
+    # --reset Flag abfangen
+    if _detect_reset_flag(last_user):
+        _do_reset()
+        return JSONResponse(content={
+            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "system",
+            "choices": [{"index": 0, "message": {"role": "assistant",
+                          "content": "[Proxy Reset] Alle Kategorien auf Primary (Idx=0) zurückgesetzt."},
+                          "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        })
+
     cleaned, flag_category = _extract_model_flag(last_user)
     category = flag_category if flag_category else DEFAULT_CATEGORY
 
     _strip_model_flags_from_messages(msgs)
 
+    # Log aktiven Index für die Kategorie
+    active_idx = _CATEGORY_ACTIVE_IDX.get(category, 0)
+    defs = _model_defs(category)
+    active_model = defs[active_idx]["model_name"] if defs and active_idx < len(defs) else "?"
     _log(f"Kategorie: {category} (Flag={'--'+category if flag_category else 'default'}), "
-         f"Modell: {_MODEL_CATEGORIES.get(category, {}).get('model_name', '?')}, "
-         f"api_key={_truncate_key(_MODEL_CATEGORIES.get(category, {}).get('api_key', ''))}")
+         f"Idx={active_idx}, Modell={active_model}")
 
     if body.get("stream"):
         return StreamingResponse(
@@ -1288,9 +1614,17 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
                      "X-Accel-Buffering": "no"},
         )
 
-    result = await _call_single_model(body, category)
-    response_payload = _build_response_payload(body, result.get("content", ""), [result])
-    asyncio.ensure_future(_hindsight.retain_async(body, result.get("content", "")))
+    # Non-Streaming: Fallback-Chain nutzen
+    outcome = await _call_model_with_fallbacks(body, category)
+    result = outcome.get("result", {})
+    content = result.get("content", "") or ""
+
+    # Bei totalem Fehlschlag: Fehler-Text mit Prefx
+    if outcome.get("all_failed"):
+        content = f"[Proxy: ALLE Fallbacks fehlgeschlagen]\n{content}"
+
+    response_payload = _build_response_payload(body, content, [result])
+    asyncio.ensure_future(_hindsight.retain_async(body, content))
     return JSONResponse(content=response_payload)
 
 
@@ -1312,13 +1646,19 @@ async def chat_completions_no_v1(request: Request):
 
 
 async def _stream_events(body: Dict[str, Any], category: str) -> AsyncIterator[str]:
-    model = _MODEL_CATEGORIES.get(category, {}).get("model_name", category)
-    result = await _call_single_model(body, category)
-    asyncio.ensure_future(_hindsight.retain_async(body, result.get("content", "")))
+    """2-Pass-Streaming: Erst Backend-Call mit Fallback-Loop, dann OpenAI-SSE an Copilot."""
+    outcome = await _call_model_with_fallbacks(body, category)
+    result = outcome.get("result", {})
+    content = result.get("content", "") or ""
+    used_model = outcome.get("used_model", category)
+
+    asyncio.ensure_future(_hindsight.retain_async(body, content))
 
     tool_calls = result.get("tool_calls")
     reasoning_content = result.get("reasoning_content")
-    text_content = result.get("content", "")
+
+    if outcome.get("all_failed"):
+        content = f"[Proxy: ALLE Fallbacks fehlgeschlagen]\n{content}"
 
     if tool_calls:
         tool_calls = _normalize_tool_calls(tool_calls) or tool_calls
@@ -1339,16 +1679,16 @@ async def _stream_events(body: Dict[str, Any], category: str) -> AsyncIterator[s
                 "function": {"name": func.get("name", ""), "arguments": args},
             })
         yield _format_openai_stream_chunk(
-            model, include_role=True, tool_calls=first_tcs,
+            used_model, include_role=True, tool_calls=first_tcs,
             reasoning_content=reasoning_content, chunk_id=stream_id,
         )
-        yield _format_openai_stream_chunk(model, finish_reason="tool_calls", chunk_id=stream_id)
+        yield _format_openai_stream_chunk(used_model, finish_reason="tool_calls", chunk_id=stream_id)
     else:
         yield _format_openai_stream_chunk(
-            model, content=text_content, include_role=True,
+            used_model, content=content, include_role=True,
             reasoning_content=reasoning_content,
         )
-        yield _format_openai_stream_chunk(model, "", finish_reason="stop")
+        yield _format_openai_stream_chunk(used_model, "", finish_reason="stop")
 
 
 # ── /v1/models ─────────────────────────────────────────────────────────────
@@ -1359,12 +1699,14 @@ async def list_models(request: Request):
         return JSONResponse(content=await _get_logs_handler(lines=int(logs_str)))
     await _auth_or_raise(request)
     models = []
-    for key, cat in _MODEL_CATEGORIES.items():
-        models.append({
-            "id": cat["model_name"],
-            "object": "model",
-            "owned_by": f"category:{key}",
-        })
+    for key in ("local", "light", "strong", "vision"):
+        defs = _model_defs(key)
+        for i, d in enumerate(defs):
+            models.append({
+                "id": d.get("model_name", "?"),
+                "object": "model",
+                "owned_by": f"category:{key}[{i}]",
+            })
     return JSONResponse(content={"object": "list", "data": models})
 
 
@@ -1376,12 +1718,19 @@ async def healthz(request: Request):
         "version": "3.0.0",
         "default_category": DEFAULT_CATEGORY,
         "categories": {
-            key: {
-                "model_name": cat["model_name"],
-                "is_vision": cat.get("is_vision", False),
-                "api_url": cat["api_url"],
-            }
-            for key, cat in _MODEL_CATEGORIES.items()
+            key: [{
+                "model_name": d.get("model_name", "?"),
+                "is_vision": d.get("is_vision", False),
+                "api_url": d.get("api_url", ""),
+                "active": (i == _CATEGORY_ACTIVE_IDX.get(key, 0)
+                           if key in ("light", "strong", "vision") else i == 0),
+            } for i, d in enumerate(defs)]
+            for key, defs in {
+                "local": _model_defs("local"),
+                "light": _model_defs("light"),
+                "strong": _model_defs("strong"),
+                "vision": _model_defs("vision"),
+            }.items() if defs
         },
         "proxy_auth_enabled": PROXY_AUTH_ENABLED,
         "hindsight_enabled": HINDSIGHT_ENABLED,
