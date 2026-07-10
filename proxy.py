@@ -105,7 +105,7 @@ def _safe_str(val: object) -> str:
 
 # ── Webinterface ───────────────────────────────────────────────────────────
 try:
-    from webui import mount_webui, _load_config as _webui_load_config
+    from webui import mount_webui, _load_config as _webui_load_config, _save_config as _webui_save_config
     _WEBUI_AVAILABLE = True
 except Exception:
     _WEBUI_AVAILABLE = False
@@ -325,6 +325,30 @@ def _apply_config_file() -> None:
         cfg = _webui_load_config()
     except Exception:
         return
+
+    # ── VOR dem Anwenden: Rohdaten aus config.json ascii-sanitizen ─────────
+    # Non-ASCII in api_key/model_name crasht httpx (HTTP-Header) und stdout (Docker).
+    # Wir bereinigen cfg direkt UND speichern es zurück, damit config.json selbst sauber wird.
+    _cfg_changed = False
+    _saved_cats = cfg.get("model_categories", {})
+    if isinstance(_saved_cats, dict):
+        for _k in ("local", "light", "strong", "vision"):
+            _sc = _saved_cats.get(_k)
+            if isinstance(_sc, list):
+                for _d in _sc:
+                    if isinstance(_d, dict):
+                        _sanitize_def_ascii(_d)
+                        _cfg_changed = True
+            elif isinstance(_sc, dict):
+                _sanitize_def_ascii(_sc)
+                _cfg_changed = True
+
+    if _cfg_changed:
+        try:
+            _webui_save_config(cfg)
+            _log("config.json: non-ASCII Zeichen in api_key/model_name bereinigt + gespeichert")
+        except Exception as _e:
+            _log(f"config.json: Bereinigung gespeichert-Fehler (ungefaehrlich): {_safe_str(_e)}")
 
     global _MODEL_CATEGORIES, DEFAULT_CATEGORY
 
