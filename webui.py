@@ -306,6 +306,8 @@ def _deep_merge(base: Dict, override: Dict) -> None:
 
 
 def _mask_key(key: str) -> str:
+    if os.getenv("PROXY_MASK_KEYS", "true").lower() in {"0", "false", "no", "off", "n"}:
+        return key  # Debug-Mode: Keys im Klartext zeigen
     if not key or len(key) < 8:
         return key
     return key[:4] + "\u2022" * (len(key) - 8) + key[-4:]
