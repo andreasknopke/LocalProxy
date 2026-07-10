@@ -1275,10 +1275,12 @@ async def _call_model_with_fallbacks(body: Dict[str, Any], category: str,
 
             last_error_result = result
 
-            # Wenn trigger_fallback=False (z.B. 400): weitermachen bringt nichts
+            # trigger_fallback=False (z.B. 400): kein Cooldown, aber trotzdem
+            # naechsten Fallback probieren — ein anderes Modell kann andere
+            # Parameter-Erwartungen haben und erfolgreich sein.
             if not result.get("trigger_fallback", True):
-                _log(f"   → trigger_fallback=False, breche Fallback-Kette ab")
-                break
+                _log(f"   → trigger_fallback=False, probiere trotzdem naechsten Fallback")
+                continue
 
         # Nach Runde 1: Prüfen ob ein Cooldown-Modell jetzt verwendbar wäre
         # (trotzdem Runde 2 machen)
