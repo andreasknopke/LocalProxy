@@ -1235,6 +1235,9 @@ async def _call_model_with_fallbacks(body: Dict[str, Any], category: str,
     attempted: List[Dict[str, Any]] = []
     last_error_result: Optional[Dict[str, Any]] = None
     last_used_idx: Optional[int] = None
+    # Modelle, die trigger_fallback=False lieferten (z.B. Gemini bei Tool-Continuations):
+    # in Runde 2 ueberspringen — kennen das Format grundsaetzlich nicht.
+    _skip_r2: Set[int] = set()
 
     for round_num in (1, 2):
         # Reihenfolge: start_idx zuerst, dann alle anderen in Array-Reihenfolge
@@ -1248,6 +1251,10 @@ async def _call_model_with_fallbacks(body: Dict[str, Any], category: str,
             # Runde 1: Cooldowns überspringen
             if round_num == 1 and _is_in_cooldown(category, curr_idx):
                 _log(f"Fallback skip R1: {category}[{curr_idx}] = cooldown")
+                continue
+            # Runde 2: Modelle mit known incompatibility überspringen
+            if round_num == 2 and curr_idx in _skip_r2:
+                _log(f"Fallback skip R2: {category}[{curr_idx}] = known-incompatible (trigger_fallback=False)")
                 continue
 
             _log(f"Fallback try R{round_num}: {category}[{curr_idx}] = {defs[curr_idx].get('model_name', '?')}")
@@ -1280,6 +1287,7 @@ async def _call_model_with_fallbacks(body: Dict[str, Any], category: str,
             # Parameter-Erwartungen haben und erfolgreich sein.
             if not result.get("trigger_fallback", True):
                 _log(f"   → trigger_fallback=False, probiere trotzdem naechsten Fallback")
+                _skip_r2.add(curr_idx)  # Runde 2 ueberspringen — Modell kann Format nicht
                 continue
 
         # Nach Runde 1: Prüfen ob ein Cooldown-Modell jetzt verwendbar wäre
