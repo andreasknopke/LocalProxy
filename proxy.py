@@ -73,13 +73,22 @@ def _truncate_key(key: str) -> str:
 
 
 def _safe_str(val: object) -> str:
-    """Konvertiert zu str mit ASCII-safe Fallback."""
+    """Konvertiert zu str mit ASCII-safe Fallback. Fangt ALLE Exceptions, NIEMALS crashen."""
     try:
         s = str(val)
-        s.encode("ascii")
-        return s
-    except UnicodeEncodeError:
-        return str(val).encode("ascii", errors="replace").decode("ascii")
+        try:
+            s.encode("ascii")
+            return s
+        except UnicodeEncodeError:
+            # Enthaelt non-ASCII: mit replace konvertieren
+            return s.encode("ascii", errors="replace").decode("ascii")
+    except Exception:
+        # Letzter Ausweg: repr und dann ASCII-safe
+        try:
+            r = repr(val)
+            return r.encode("ascii", errors="replace").decode("ascii")
+        except Exception:
+            return "(unbeschreiblich)"
 
 
 # ── Webinterface ───────────────────────────────────────────────────────────
