@@ -1235,8 +1235,12 @@ def create_webui_app() -> FastAPI:
         cfg = _load_config()
         # API keys maskieren
         for key in ("local", "light", "strong", "vision"):
-            cat = cfg.get("model_categories", {}).get(key, {})
-            if cat.get("api_key"):
+            cat = cfg.get("model_categories", {}).get(key)
+            if isinstance(cat, list):
+                for d in cat:
+                    if isinstance(d, dict) and d.get("api_key"):
+                        d["api_key"] = _mask_key(d["api_key"])
+            elif isinstance(cat, dict) and cat.get("api_key"):
                 cat["api_key"] = _mask_key(cat["api_key"])
         return JSONResponse(content=cfg)
 
@@ -1251,10 +1255,19 @@ def create_webui_app() -> FastAPI:
 
         # API-Keys: wenn maskiert (enthaelt bullet), alten Wert behalten
         for key in ("local", "light", "strong", "vision"):
-            nc = new_cfg.get("model_categories", {}).get(key, {})
-            cc = current.get("model_categories", {}).get(key, {})
-            if nc and cc and "\u2022" in str(nc.get("api_key", "")):
-                nc["api_key"] = cc.get("api_key", "")
+            nc = new_cfg.get("model_categories", {}).get(key)
+            cc = current.get("model_categories", {}).get(key)
+            if nc is None or cc is None:
+                continue
+            if isinstance(nc, list) and isinstance(cc, list):
+                for i in range(min(len(nc), len(cc))):
+                    nd = nc[i] if isinstance(nc[i], dict) else {}
+                    cd = cc[i] if isinstance(cc[i], dict) else {}
+                    if nd and cd and "\u2022" in str(nd.get("api_key", "")):
+                        nd["api_key"] = cd.get("api_key", "")
+            elif isinstance(nc, dict) and isinstance(cc, dict):
+                if "\u2022" in str(nc.get("api_key", "")):
+                    nc["api_key"] = cc.get("api_key", "")
 
         _deep_merge(current, new_cfg)
         _save_config(current)
