@@ -105,7 +105,7 @@ def _safe_str(val: object) -> str:
 
 # ── Webinterface ───────────────────────────────────────────────────────────
 try:
-    from webui import mount_webui, _load_config as _webui_load_config, _save_config as _webui_save_config
+    from webui import mount_webui, _load_config as _webui_load_config
     _WEBUI_AVAILABLE = True
 except Exception:
     _WEBUI_AVAILABLE = False
@@ -262,10 +262,15 @@ def _retry_after_seconds(status: int, response_headers: Any) -> Optional[float]:
 def _sanitize_def_ascii(d: Dict[str, Any]) -> None:
     """Erzwingt ASCII-only fuer api_key und model_name in-place.
     httpx und Docker-stdout crashen sonst bei non-ASCII in Headers/Payloads.
+    ACHTUNG: Keys die U+2022 (Bullet = WebUI-Maskierung) enthalten, werden NICHT
+    veraendert — das sind Platzhalter, deren echte Werte webui.py verwaltet.
     """
     for field in ("api_key", "model_name"):
         val = d.get(field)
         if isinstance(val, str):
+            # Maskierte Keys der WebUI nie anfassen (Bullets = U+2022)
+            if "\u2022" in val:
+                continue
             try:
                 val.encode("ascii")
             except UnicodeEncodeError:
@@ -326,10 +331,10 @@ def _apply_config_file() -> None:
     except Exception:
         return
 
-    # ── VOR dem Anwenden: Rohdaten aus config.json ascii-sanitizen ─────────
+    # ── VOR dem Anwenden: Rohdaten aus config.json ascii-sanitizen (nur in-memory) ──
     # Non-ASCII in api_key/model_name crasht httpx (HTTP-Header) und stdout (Docker).
-    # Wir bereinigen cfg direkt UND speichern es zurück, damit config.json selbst sauber wird.
-    _cfg_changed = False
+    # Nur in-memory bereinigen, NIEMALS auf Platte schreiben —
+    # die WebUI hat eigene Maskierungslogik (U+2022 Bullets), die wir nicht zerstören duerfen.
     _saved_cats = cfg.get("model_categories", {})
     if isinstance(_saved_cats, dict):
         for _k in ("local", "light", "strong", "vision"):
@@ -338,17 +343,8 @@ def _apply_config_file() -> None:
                 for _d in _sc:
                     if isinstance(_d, dict):
                         _sanitize_def_ascii(_d)
-                        _cfg_changed = True
             elif isinstance(_sc, dict):
                 _sanitize_def_ascii(_sc)
-                _cfg_changed = True
-
-    if _cfg_changed:
-        try:
-            _webui_save_config(cfg)
-            _log("config.json: non-ASCII Zeichen in api_key/model_name bereinigt + gespeichert")
-        except Exception as _e:
-            _log(f"config.json: Bereinigung gespeichert-Fehler (ungefaehrlich): {_safe_str(_e)}")
 
     global _MODEL_CATEGORIES, DEFAULT_CATEGORY
 
