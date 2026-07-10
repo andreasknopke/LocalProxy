@@ -1298,8 +1298,13 @@ def create_webui_app() -> FastAPI:
         if "\u2022" in api_key and len(api_key) > 8:
             cfg = _load_config()
             for cat_key in ("local", "light", "strong", "vision"):
-                cat = cfg.get("model_categories", {}).get(cat_key, {})
-                if cat.get("api_url", "").strip() == api_url:
+                cat = cfg.get("model_categories", {}).get(cat_key)
+                if isinstance(cat, list):
+                    for d in cat:
+                        if isinstance(d, dict) and d.get("api_url", "").strip() == api_url:
+                            api_key = d.get("api_key", "")
+                            break
+                elif isinstance(cat, dict) and cat.get("api_url", "").strip() == api_url:
                     api_key = cat.get("api_key", "")
                     break
 
