@@ -432,6 +432,12 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
 .status-dot.ok { background: #3fb950; }
 .status-dot.err { background: var(--danger); }
+/* Log-Viewer Farbcodierung */
+.log-error { color: #f85149; }
+.log-warn { color: #d2991d; }
+.log-ok { color: #3fb950; }
+.log-webui { color: #a371f7; }
+.log-req { color: #79c0ff; }
 </style>
 </head>
 <body>
@@ -446,6 +452,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
   <button data-section="models" class="active">Modelle</button>
   <button data-section="hindsight">Hindsight</button>
   <button data-section="proxy">Proxy</button>
+  <button data-section="logs">Logs</button>
 </nav>
 <main>
 
@@ -970,6 +977,36 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
     </div>
   </section>
 
+  <!-- ====== SEKTION: LOGS ====== -->
+  <section id="section-logs">
+    <div class="card" style="padding:12px">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px">
+        <h3 style="margin:0">Proxy-Logs <span style="font-size:0.75rem;color:var(--text2);font-weight:400" id="logFileLabel"></span></h3>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input type="text" id="logSearch" placeholder="Filter..." style="width:180px;padding:5px 10px;font-size:0.8rem" oninput="refreshLogs()">
+          <select id="logLines" style="width:90px;padding:5px 8px;font-size:0.8rem" onchange="refreshLogs()">
+            <option value="100">100</option>
+            <option value="200" selected>200</option>
+            <option value="500">500</option>
+            <option value="1000">1000</option>
+            <option value="5000">5000</option>
+          </select>
+          <button class="btn-small" id="logPauseBtn" onclick="toggleLogPause()" title="Auto-Refresh pausieren">⏸</button>
+          <button class="btn-small" onclick="refreshLogs()" title="Manuell aktualisieren">🔄</button>
+          <button class="btn-small" onclick="copyLogs()" title="In Zwischenablage kopieren">📋</button>
+          <span style="font-size:0.75rem;color:var(--text2)" id="logStatus"></span>
+        </div>
+      </div>
+      <pre id="logViewer" style="
+        background:var(--bg);border:1px solid var(--border);border-radius:6px;
+        padding:10px 14px;margin:0;overflow:auto;max-height:70vh;
+        font-family:'Cascadia Code','Fira Code','JetBrains Mono','Consolas',monospace;
+        font-size:0.78rem;line-height:1.55;white-space:pre-wrap;word-break:break-all;
+        color:var(--text2);
+      ">Lade Logs...</pre>
+    </div>
+  </section>
+
   <div class="actions">
     <button class="btn btn-primary" onclick="saveConfig()">Konfiguration speichern</button>
     <button class="btn btn-danger" onclick="restartProxy()">Proxy neustarten</button>
@@ -1203,6 +1240,154 @@ async function testCategory(key, slot) {
     statusEl.innerHTML = '<span class="status-dot err"></span> ' + e.message;
   }
 }
+
+// ============ LOG VIEWER ============
+let _logAutoRefresh = true;
+let _logTimer = null;
+let _logScrolledToBottom = true;
+
+function toggleLogPause() {
+  _logAutoRefresh = !_logAutoRefresh;
+  const btn = document.getElementById('logPauseBtn');
+  btn.textContent = _logAutoRefresh ? '\u23F8' : '\u25B6';
+  btn.title = _logAutoRefresh ? 'Auto-Refresh pausieren' : 'Auto-Refresh fortsetzen';
+  if (_logAutoRefresh) { refreshLogs(); }
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function colorizeLogLine(line) {
+  // Farbcodierung fuer verschiedene Log-Level und Keywords
+  let cls = '';
+  const lower = line.toLowerCase();
+  if (/\b(error|fail|exception|traceback|fehlgeschlagen|ungültig)\b/i.test(line)) {
+    cls = 'log-error';
+  } else if (/\b(warn|warning|achtung|warnung)\b/i.test(line)) {
+    cls = 'log-warn';
+  } else if (/\b(success|ok\b|erfolg|bestanden)\b/i.test(line)) {
+    cls = 'log-ok';
+  } else if (/\b(model ok|fallback success|auth-ok)\b/i.test(line)) {
+    cls = 'log-ok';
+  } else if (/\b(auth-fail|401|403|429|5\d\d)\b/i.test(line)) {
+    cls = 'log-error';
+  } else if (/\b\[webui\]/i.test(line)) {
+    cls = 'log-webui';
+  } else if (/\b(req-in|req-out)\b/i.test(line)) {
+    cls = 'log-req';
+  }
+  return cls;
+}
+
+async function refreshLogs() {
+  const viewer = document.getElementById('logViewer');
+  const statusEl = document.getElementById('logStatus');
+  const lines = document.getElementById('logLines').value;
+  const search = document.getElementById('logSearch').value;
+
+  // Scroll-Position merken
+  const wasAtBottom = viewer.scrollHeight - viewer.scrollTop - viewer.clientHeight < 40;
+  _logScrolledToBottom = wasAtBottom;
+
+  try {
+    statusEl.textContent = 'Lade...';
+    const params = new URLSearchParams({lines: lines});
+    if (search) params.set('search', search);
+    const r = await fetch('/webui/api/logs?' + params.toString());
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+
+    if (data.error) {
+      viewer.innerHTML = '<span style="color:var(--danger)">Fehler: ' + escapeHtml(data.error) + '</span>';
+      statusEl.textContent = 'Fehler';
+      return;
+    }
+
+    document.getElementById('logFileLabel').textContent = data.file ? ' — ' + data.file.split('/').pop().split('\\').pop() : '';
+
+    if (data.lines.length === 0) {
+      viewer.innerHTML = '<span style="color:var(--text2);font-style:italic">(keine Logs' + (search ? ' fuer Filter "' + escapeHtml(search) + '"' : '') + ')</span>';
+      statusEl.textContent = '0 Zeilen';
+      return;
+    }
+
+    // Zeilen mit Farbcodierung rendern
+    let html = '';
+    for (const line of data.lines) {
+      const cls = colorizeLogLine(line);
+      const escaped = escapeHtml(line);
+      if (cls) {
+        html += '<span class="' + cls + '">' + escaped + '</span>\n';
+      } else {
+        html += escaped + '\n';
+      }
+    }
+    viewer.innerHTML = html;
+
+    // Auto-scroll wenn vorher am Ende
+    if (_logScrolledToBottom) {
+      viewer.scrollTop = viewer.scrollHeight;
+    }
+
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString('de-DE', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+    statusEl.textContent = data.total + ' Zeilen @ ' + timeStr;
+  } catch(e) {
+    viewer.innerHTML = '<span style="color:var(--danger)">Fehler: ' + escapeHtml(e.message) + '</span>';
+    statusEl.textContent = 'Fehler';
+  }
+
+  // Auto-Refresh Timer
+  if (_logTimer) clearTimeout(_logTimer);
+  if (_logAutoRefresh) {
+    _logTimer = setTimeout(refreshLogs, 3000);
+  }
+}
+
+async function copyLogs() {
+  const viewer = document.getElementById('logViewer');
+  try {
+    await navigator.clipboard.writeText(viewer.textContent);
+    showToast('Logs in Zwischenablage kopiert', 'success');
+  } catch(e) {
+    // Fallback: Selection
+    const range = document.createRange();
+    range.selectNodeContents(viewer);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    showToast('Logs selektiert — bitte Strg+C druecken', 'success');
+  }
+}
+
+// Log-Viewer beim Tab-Wechsel starten/stoppen
+const logObserver = new MutationObserver(() => {
+  const logsSection = document.getElementById('section-logs');
+  if (logsSection && logsSection.classList.contains('active')) {
+    if (!_logTimer) refreshLogs();
+  } else {
+    if (_logTimer) { clearTimeout(_logTimer); _logTimer = null; }
+  }
+});
+document.querySelectorAll('nav button').forEach(btn => {
+  logObserver.observe(btn.parentElement, {attributes: false, childList: false, subtree: false});
+});
+// Einfacher: beim Tab-Klick triggern
+document.querySelectorAll('nav button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    setTimeout(() => {
+      const logsSection = document.getElementById('section-logs');
+      if (logsSection && logsSection.classList.contains('active')) {
+        if (!_logTimer) refreshLogs();
+      } else {
+        if (_logTimer) { clearTimeout(_logTimer); _logTimer = null; }
+      }
+    }, 50);
+  });
+});
 
 // ============ PASSWORD TOGGLE ============
 function togglePw(btn) {
@@ -1469,6 +1654,50 @@ def create_webui_app() -> FastAPI:
         except Exception as exc:
             duration = f"{time.perf_counter() - started:.1f}s"
             return JSONResponse(content={"ok": False, "duration": duration, "error": _safe_str(exc)})
+
+    @webapp.get("/api/logs")
+    async def api_logs(request: Request, lines: int = 200, search: str = ""):
+        """Gibt die letzten N Zeilen aus der Logdatei zurueck.
+        Optional: search filtert Zeilen (case-insensitive substring).
+        """
+        max_lines = min(max(lines, 10), 5000)
+        try:
+            log_path = Path(LOG_FILE)
+            if not log_path.exists():
+                return JSONResponse(content={"lines": [], "total": 0, "file": str(log_path), "error": "Logdatei nicht gefunden"})
+
+            # Dateigroesse checken, nur das Ende lesen
+            file_size = log_path.stat().st_size
+            # Rough estimate: ~200 bytes per line, read enough to cover max_lines * 2
+            read_size = min(file_size, max_lines * 400 + 8192)
+            with open(log_path, "rb") as f:
+                if file_size > read_size:
+                    f.seek(file_size - read_size)
+                raw = f.read()
+
+            # Decode mit UTF-8 Fallback
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                text = raw.decode("utf-8", errors="replace")
+
+            all_lines = text.splitlines()
+            # Nur die letzten max_lines behalten
+            if len(all_lines) > max_lines:
+                all_lines = all_lines[-max_lines:]
+
+            # Optional: Suche/Filter
+            if search:
+                search_lower = search.lower()
+                all_lines = [l for l in all_lines if search_lower in l.lower()]
+
+            return JSONResponse(content={
+                "lines": all_lines,
+                "total": len(all_lines),
+                "file": str(log_path),
+            })
+        except Exception as e:
+            return JSONResponse(content={"lines": [], "total": 0, "file": str(LOG_FILE), "error": _safe_str(e)})
 
     return webapp
 

@@ -450,28 +450,36 @@ _apply_config_file()
 # Prompt-Flag-Extraktion ── Modell-Kategorie-Auswahl via --flag
 # ═══════════════════════════════════════════════════════════════════════════
 
-_MODEL_FLAG_PATTERN = re.compile(r'--(local|light|strong|vision)(?:\s+(\d+))?\s*$', re.IGNORECASE)
+_MODEL_FLAG_PATTERN = re.compile(r'--(local|light|strong|vision)(?:\s+(\d+))?\s*$', re.IGNORECASE | re.MULTILINE)
 _VALID_CATEGORIES: Set[str] = {"local", "light", "strong", "vision"}
+_FLAG_PROXIMITY_MAX_CHARS = 300  # Flag muss in den letzten 300 Zeichen des Texts stehen
 
 
 def _extract_model_flag(text: str) -> Tuple[str, Optional[str], Optional[int]]:
-    """Extrahiert --local/--light/--strong/--vision [1-3] NUR am ENDE des Texts.
-    Flags mitten im Text oder am Anfang werden ignoriert (bleiben als normaler Content).
+    """Extrahiert --local/--light/--strong/--vision [1-3] nahe am ENDE des Texts.
+    MULTILINE: $ matcht am Ende jeder Zeile, damit XML-Wrapping (z.B. </userRequest>)
+    nach dem Flag die Erkennung nicht verhindert.
+    Proximity-Check: Nur Matches innerhalb der letzten 300 Zeichen werden akzeptiert,
+    um False-Positives in Code-Blöcken zu vermeiden.
     Returns: (bereinigter_text, category_string oder None, slot_number oder None)
     Slot-Nummer: 1=Primary, 2=Fallback 2, 3=Fallback 3. None = kein gültiger Slot angegeben.
     """
     found: Optional[str] = None
     found_slot: Optional[int] = None
-    match = _MODEL_FLAG_PATTERN.search(text)
-    if match:
-        cat = match.group(1).lower()
-        if cat in _VALID_CATEGORIES:
-            found = cat
-            if match.group(2):
-                slot_val = int(match.group(2))
-                found_slot = slot_val if 1 <= slot_val <= 3 else None
-            # Flag nur am Ende entfernen (vorherigen Whitespace mitnehmen)
-            text = text[:match.start()].rstrip()
+    # Alle Matches finden, letzten gueltigen nahe am Text-Ende nehmen
+    best_match = None
+    for m in _MODEL_FLAG_PATTERN.finditer(text):
+        cat = m.group(1).lower()
+        if cat in _VALID_CATEGORIES and (len(text) - m.end()) <= _FLAG_PROXIMITY_MAX_CHARS:
+            best_match = m
+    if best_match:
+        m = best_match
+        found = m.group(1).lower()
+        if m.group(2):
+            slot_val = int(m.group(2))
+            found_slot = slot_val if 1 <= slot_val <= 3 else None
+        # Flag nur am Ende entfernen (vorherigen Whitespace mitnehmen)
+        text = text[:m.start()].rstrip()
     cleaned = re.sub(r' {2,}', ' ', text)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     cleaned = cleaned.strip()
@@ -730,7 +738,15 @@ def _normalize_text(text: Any) -> str:
 
 
 def _message_text(message: Dict[str, Any]) -> str:
-    return _normalize_text(message.get("content", ""))
+    content = message.get("content", "")
+    if isinstance(content, list):
+        # Array-Content (z.B. von VS Code Copilot mit Attachments): extrahiere Text-Blöcke
+        texts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                texts.append(block.get("text", ""))
+        return "\n".join(texts)
+    return _normalize_text(content)
 
 
 def _last_user_text(messages: Sequence[Dict[str, Any]]) -> str:

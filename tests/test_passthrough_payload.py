@@ -47,28 +47,28 @@ pytestmark = pytest.mark.skipif(not HAS_PROXY, reason=SKIP_REASON)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def test_extract_flag_light():
-    cleaned, cat, slot = proxy._extract_model_flag("hello --light test")
+    cleaned, cat, slot = proxy._extract_model_flag("hello world\n--light")
     assert cat == "light"
     assert slot is None
     assert "--light" not in cleaned
 
 
 def test_extract_flag_vision():
-    cleaned, cat, slot = proxy._extract_model_flag("--vision describe image")
+    cleaned, cat, slot = proxy._extract_model_flag("describe image\n--vision 1")
     assert cat == "vision"
-    assert slot is None
+    assert slot == 1
     assert "--vision" not in cleaned
 
 
 def test_extract_flag_local():
-    cleaned, cat, slot = proxy._extract_model_flag("use --local for this")
+    cleaned, cat, slot = proxy._extract_model_flag("nutze lokales modell\n--local")
     assert cat == "local"
     assert slot is None
     assert "--local" not in cleaned
 
 
 def test_extract_flag_strong():
-    cleaned, cat, slot = proxy._extract_model_flag("--strong architect task")
+    cleaned, cat, slot = proxy._extract_model_flag("architect task\n--strong")
     assert cat == "strong"
     assert slot is None
     assert "--strong" not in cleaned
@@ -81,45 +81,67 @@ def test_extract_flag_no_flag():
 
 
 def test_extract_flag_last_wins():
-    cleaned, cat, slot = proxy._extract_model_flag("--light but really --strong")
+    cleaned, cat, slot = proxy._extract_model_flag("some text\n--light\n--strong")
     assert cat == "strong"
     assert slot is None
-    assert "--light" not in cleaned
     assert "--strong" not in cleaned
+    # Nur das letzte Flag (--strong) wird entfernt, --light bleibt als Content
 
 
 def test_extract_flag_with_slot_number():
-    cleaned, cat, slot = proxy._extract_model_flag("--light 2 mach dies")
+    cleaned, cat, slot = proxy._extract_model_flag("mach dies\n--light 2")
     assert cat == "light"
     assert slot == 2
     assert "--light" not in cleaned
-    assert "2" not in cleaned
 
 
 def test_extract_flag_slot_3():
-    cleaned, cat, slot = proxy._extract_model_flag("test --strong 3 letzter slot")
+    cleaned, cat, slot = proxy._extract_model_flag("test text\n--strong 3")
     assert cat == "strong"
     assert slot == 3
     assert "--strong" not in cleaned
 
 
 def test_extract_flag_slot_last_wins():
-    cleaned, cat, slot = proxy._extract_model_flag("--light 1 but --light 3")
+    cleaned, cat, slot = proxy._extract_model_flag("some text\n--light 1\n--light 2")
     assert cat == "light"
-    assert slot == 3
-    assert "--light" not in cleaned
+    assert slot == 2
+    # Nur --light 2 wird als Flag erkannt & entfernt; --light 1 ist Content
 
 
 def test_extract_flag_invalid_slot_stripped():
-    cleaned, cat, slot = proxy._extract_model_flag("--light 5 ungültig")
+    cleaned, cat, slot = proxy._extract_model_flag("text\n--light 5")
     assert cat == "light"
     assert slot is None  # 5 nicht gültig (1-3)
     assert "--light" not in cleaned
 
 
+def test_extract_flag_xml_wrapped():
+    """Flag mit XML-Wrapping (Copilot <userRequest>)"""
+    cleaned, cat, slot = proxy._extract_model_flag("<userRequest>\nBaue ein Log-View\n--light 2\n</userRequest>")
+    assert cat == "light"
+    assert slot == 2
+    assert "--light" not in cleaned
+
+
+def test_extract_flag_proximity_guard():
+    """Flag weit vor Text-Ende wird ignoriert (False-Positive-Schutz)"""
+    long_suffix = "x" * 400
+    cleaned, cat, slot = proxy._extract_model_flag(f"--light\n{long_suffix}")
+    assert cat is None  # Zu weit vom Ende entfernt
+    assert "--light" in cleaned  # Wurde nicht entfernt (bleibt als Content)
+
+
+def test_extract_flag_multiline_last_valid():
+    """Nur das letzte gueltige Flag nahe am Ende zaehlt"""
+    cleaned, cat, slot = proxy._extract_model_flag("code with --light inside\nmore text here\n--strong 2")
+    assert cat == "strong"
+    assert slot == 2
+
+
 def test_strip_flags_from_messages():
     msgs = [
-        {"role": "user", "content": "hello --light world"},
+        {"role": "user", "content": "hello world\n--light"},
         {"role": "assistant", "content": "ok"},
     ]
     proxy._strip_model_flags_from_messages(msgs)
@@ -280,7 +302,9 @@ def test_build_passthrough_payload_basic():
     assert light_defs, "light sollte mindestens eine konfigurierte Definition haben"
     assert payload["model"] == light_defs[0]["model_name"]
     assert payload["stream"] is False
-    assert payload["max_tokens"] > 0
+    # auto-detect kann max_tokens → max_completion_tokens konvertieren
+    token_key = "max_completion_tokens" if "max_completion_tokens" in payload else "max_tokens"
+    assert payload[token_key] > 0
 
 
 def test_build_passthrough_payload_vision_keeps_image():
