@@ -178,6 +178,9 @@ DEFAULT_CATEGORY: str = os.getenv("DEFAULT_CATEGORY", "light")
 # Aktueller aktiver Index pro Kategorie (light/strong/vision)
 _CATEGORY_ACTIVE_IDX: Dict[str, int] = {"local": 0, "light": 0, "strong": 0, "vision": 0}
 
+# Zuletzt per --flag gewaehlte Kategorie (bleibt erhalten bis naechstes Flag oder --reset)
+_LAST_FLAG_CATEGORY: Optional[str] = None
+
 COOLDOWN_FILE: Path = Path(os.getenv("COOLDOWN_FILE", str(Path(__file__).parent / "data" / "cooldowns.json")))
 COOLDOWN_DEFAULT_SECONDS: float = float(os.getenv("COOLDOWN_DEFAULT_SECONDS", "300"))
 
@@ -506,16 +509,18 @@ def _detect_reset_flag(text: str) -> bool:
 
 
 def _do_reset() -> None:
-    """Setzt alle Kategorien auf Primary (Idx=0). Loescht Cooldowns."""
+    """Setzt alle Kategorien auf Primary (Idx=0). Loescht Cooldowns und Flag-Merker."""
+    global _LAST_FLAG_CATEGORY
     for key in ("light", "strong", "vision"):
         _CATEGORY_ACTIVE_IDX[key] = 0
+    _LAST_FLAG_CATEGORY = None
     # Cooldowns leeren
     try:
         if COOLDOWN_FILE.exists():
             COOLDOWN_FILE.unlink()
     except OSError:
         pass
-    _log("Reset: alle Kategorien auf Primary (Idx=0), Cooldowns geleert")
+    _log("Reset: alle Kategorien auf Primary (Idx=0), Cooldowns und Flag-Merker geleert")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1837,7 +1842,18 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
         })
 
     cleaned, flag_category, flag_slot = _extract_model_flag(last_user)
-    category = flag_category if flag_category else DEFAULT_CATEGORY
+
+    global _LAST_FLAG_CATEGORY
+    if flag_category:
+        # Flag gefunden → Kategorie merken und verwenden
+        category = flag_category
+        _LAST_FLAG_CATEGORY = flag_category
+    elif _is_tool_continuation(msgs):
+        # Tool-Continuation: letzte per Flag gewaehlte Kategorie verwenden, sonst Default
+        category = _LAST_FLAG_CATEGORY if _LAST_FLAG_CATEGORY else DEFAULT_CATEGORY
+    else:
+        # Neuer Request ohne Flag: letzte per Flag gewaehlte Kategorie verwenden, sonst Default
+        category = _LAST_FLAG_CATEGORY if _LAST_FLAG_CATEGORY else DEFAULT_CATEGORY
 
     # Slot-Nummer in 0-basierten Index umrechnen (--light 2 → Idx 1)
     force_start_idx: Optional[int] = None
