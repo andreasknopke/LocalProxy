@@ -178,9 +178,6 @@ DEFAULT_CATEGORY: str = os.getenv("DEFAULT_CATEGORY", "light")
 # Aktueller aktiver Index pro Kategorie (light/strong/vision)
 _CATEGORY_ACTIVE_IDX: Dict[str, int] = {"local": 0, "light": 0, "strong": 0, "vision": 0}
 
-# Zuletzt per --flag gewaehlte Kategorie (bleibt erhalten bis naechstes Flag oder --reset)
-_LAST_FLAG_CATEGORY: Optional[str] = None
-
 COOLDOWN_FILE: Path = Path(os.getenv("COOLDOWN_FILE", str(Path(__file__).parent / "data" / "cooldowns.json")))
 COOLDOWN_DEFAULT_SECONDS: float = float(os.getenv("COOLDOWN_DEFAULT_SECONDS", "300"))
 
@@ -517,18 +514,16 @@ def _detect_reset_flag(text: str) -> bool:
 
 
 def _do_reset() -> None:
-    """Setzt alle Kategorien auf Primary (Idx=0). Loescht Cooldowns und Flag-Merker."""
-    global _LAST_FLAG_CATEGORY
+    """Setzt alle Kategorien auf Primary (Idx=0). Loescht Cooldowns."""
     for key in ("light", "strong", "vision"):
         _CATEGORY_ACTIVE_IDX[key] = 0
-    _LAST_FLAG_CATEGORY = None
     # Cooldowns leeren
     try:
         if COOLDOWN_FILE.exists():
             COOLDOWN_FILE.unlink()
     except OSError:
         pass
-    _log("Reset: alle Kategorien auf Primary (Idx=0), Cooldowns und Flag-Merker geleert")
+    _log("Reset: alle Kategorien auf Primary (Idx=0), Cooldowns geleert")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1831,6 +1826,38 @@ async def _auth_or_raise(request: Request) -> None:
     _log(f"AUTH-OK path={request.url.path}")
 
 
+def _find_category_in_messages(messages: Sequence[Dict[str, Any]], default: str) -> str:
+    """Durchsucht ALLE User-Nachrichten (von hinten nach vorne) nach --flag.
+    Session-spezifisch: Jeder Request traegt seine Historie selbst → kein globaler State.
+    """
+    for msg in reversed(messages):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        text = _message_text(msg)
+        _, flag_cat, _ = _extract_model_flag(text)
+        if flag_cat:
+            return flag_cat
+    return default
+
+
+def _find_best_idx(category: str, preferred_idx: int) -> int:
+    """Findet den besten Start-Index: preferred_idx wenn nicht im Cooldown,
+    sonst der erste nicht-cooldown Index. Updated _CATEGORY_ACTIVE_IDX."""
+    defs = _model_defs(category)
+    if not defs:
+        return 0
+    if preferred_idx < len(defs) and not _is_in_cooldown(category, preferred_idx):
+        return preferred_idx
+    for i in range(len(defs)):
+        if not _is_in_cooldown(category, i):
+            if i != preferred_idx:
+                _log(f"   → preferred idx {preferred_idx} im Cooldown, weiche zu idx {i} aus")
+            _CATEGORY_ACTIVE_IDX[category] = i
+            return i
+    # Alle im Cooldown → preferred nehmen (Fallback-Chain probiert dann trotzdem alle)
+    return preferred_idx
+
+
 # ── Shared Chat-Completion Handler ─────────────────────────────────────────
 async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | StreamingResponse:
     """Gemeinsame Logik fuer /v1/chat/completions und /chat/completions."""
@@ -1859,17 +1886,15 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
 
     cleaned, flag_category, flag_slot = _extract_model_flag(last_user)
 
-    global _LAST_FLAG_CATEGORY
     if flag_category:
-        # Flag gefunden → Kategorie merken und verwenden
+        # Flag in der aktuellen Message → explizite Wahl
         category = flag_category
-        _LAST_FLAG_CATEGORY = flag_category
     elif _is_tool_continuation(msgs):
-        # Tool-Continuation: letzte per Flag gewaehlte Kategorie verwenden, sonst Default
-        category = _LAST_FLAG_CATEGORY if _LAST_FLAG_CATEGORY else DEFAULT_CATEGORY
+        # Tool-Continuation: Flag in der Nachrichten-Historie suchen
+        category = _find_category_in_messages(msgs, DEFAULT_CATEGORY)
     else:
-        # Neuer Request ohne Flag: letzte per Flag gewaehlte Kategorie verwenden, sonst Default
-        category = _LAST_FLAG_CATEGORY if _LAST_FLAG_CATEGORY else DEFAULT_CATEGORY
+        # Neuer Request ohne Flag: Default
+        category = DEFAULT_CATEGORY
 
     # Slot-Nummer in 0-basierten Index umrechnen (--light 2 → Idx 1)
     force_start_idx: Optional[int] = None
@@ -1880,10 +1905,20 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
             _log(f"Slot {flag_slot} ungültig für {category} (nur {len(defs_validate)} Slots), verwende active_idx")
             force_start_idx = None
 
+    # Aktiven Index ermitteln + Cooldown-Check (nach Rate-Limit automatisch naechsten Slot)
+    if force_start_idx is not None:
+        # Expliziter Slot per --flag → keinen Cooldown-Skip (User-Wunsch respektieren)
+        active_idx = force_start_idx
+    else:
+        preferred_idx = _CATEGORY_ACTIVE_IDX.get(category, 0)
+        active_idx = _find_best_idx(category, preferred_idx)
+        if active_idx != preferred_idx:
+            _CATEGORY_ACTIVE_IDX[category] = active_idx
+            _log(f"   → active_idx auf {active_idx} aktualisiert (Cooldown-Umgehung)")
+
     _strip_model_flags_from_messages(msgs)
 
     # Log aktiven Index für die Kategorie
-    active_idx = force_start_idx if force_start_idx is not None else _CATEGORY_ACTIVE_IDX.get(category, 0)
     defs = _model_defs(category)
     active_model = defs[active_idx]["model_name"] if defs and active_idx < len(defs) else "?"
     _log(f"Kategorie: {category} (Flag={'--'+category if flag_category else 'default'}"
