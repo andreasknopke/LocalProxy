@@ -447,35 +447,38 @@ _apply_config_file()
 # Prompt-Flag-Extraktion ── Modell-Kategorie-Auswahl via --flag
 # ═══════════════════════════════════════════════════════════════════════════
 
-_MODEL_FLAG_PATTERN = re.compile(r'--(local|light|strong|vision)(?:\s+(\d+))?(?:\s|$)', re.IGNORECASE)
+_MODEL_FLAG_PATTERN = re.compile(r'--(local|light|strong|vision)(?:\s+(\d+))?\s*$', re.IGNORECASE)
 _VALID_CATEGORIES: Set[str] = {"local", "light", "strong", "vision"}
 
 
 def _extract_model_flag(text: str) -> Tuple[str, Optional[str], Optional[int]]:
-    """Extrahiert --local/--light/--strong/--vision [1-3] aus dem Text.
+    """Extrahiert --local/--light/--strong/--vision [1-3] NUR am ENDE des Texts.
+    Flags mitten im Text oder am Anfang werden ignoriert (bleiben als normaler Content).
     Returns: (bereinigter_text, category_string oder None, slot_number oder None)
     Slot-Nummer: 1=Primary, 2=Fallback 2, 3=Fallback 3. None = kein gültiger Slot angegeben.
     """
     found: Optional[str] = None
     found_slot: Optional[int] = None
-    for match in _MODEL_FLAG_PATTERN.finditer(text):
+    match = _MODEL_FLAG_PATTERN.search(text)
+    if match:
         cat = match.group(1).lower()
         if cat in _VALID_CATEGORIES:
             found = cat
             if match.group(2):
                 slot_val = int(match.group(2))
                 found_slot = slot_val if 1 <= slot_val <= 3 else None
-            else:
-                found_slot = None
-    cleaned = _MODEL_FLAG_PATTERN.sub("", text)
-    cleaned = re.sub(r' {2,}', ' ', cleaned)
+            # Flag nur am Ende entfernen (vorherigen Whitespace mitnehmen)
+            text = text[:match.start()].rstrip()
+    cleaned = re.sub(r' {2,}', ' ', text)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     cleaned = cleaned.strip()
     return cleaned, found, found_slot
 
 
 def _strip_model_flags_from_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Entfernt --local/--light/--strong/--vision [1-3] aus allen User-Messages (in-place)."""
+    """Entfernt --local/--light/--strong/--vision [1-3] NUR am ENDE jeder User-Message (in-place).
+    Flags mitten im Text oder am Anfang werden ignoriert.
+    """
     for msg in messages:
         if isinstance(msg, dict) and msg.get("role") == "user":
             content = msg.get("content")
