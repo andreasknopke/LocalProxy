@@ -1247,33 +1247,37 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
             # Pruefen ob reasoning_effort mit tools inkompatibel ist (gpt-5 Serie)
             if "reasoning_effort" in err_detail.lower() and "tools" in err_detail.lower():
                 _log(f"   → 400 deutet auf reasoning_effort-Tools-Inkompatibilitaet hin: {err_detail}")
-                if "reasoning_effort" in payload and (payload.get("tools") or payload.get("tool_choice")):
-                    _log("   → Retry ohne reasoning_effort...")
-                    payload_retry = copy.deepcopy(payload)
-                    payload_retry.pop("reasoning_effort", None)
-                    try:
-                        async with httpx.AsyncClient(timeout=timeout) as client:
-                            response2 = await client.post(
-                                api_url, json=payload_retry, headers=_api_headers(api_key), timeout=timeout,
-                            )
-                        if response2.status_code == 200:
-                            result = response2.json()
-                            message = _extract_choice_message(result)
-                            tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
-                            reasoning_content = message.get("reasoning_content") if isinstance(message, dict) else None
-                            content = _extract_choice_content(result)
-                            _log(f"   → Retry ohne reasoning_effort ERFOLGREICH!")
-                            return {
-                                "category": category, "def_idx": def_idx, "status": "ok",
-                                "content": content, "message": message,
-                                "tool_calls": tool_calls, "reasoning_content": reasoning_content,
-                                "duration_seconds": time.perf_counter() - started, "usage": result.get("usage"),
-                                "trigger_fallback": False,
-                            }
-                        else:
-                            _log(f"   → Retry ohne reasoning_effort auch fehlgeschlagen: HTTP {response2.status_code}")
-                    except Exception as retry_exc2:
-                        _log(f"   → Retry ohne reasoning_effort Exception: {_safe_str(retry_exc2)}")
+                # Kein Check auf "reasoning_effort in payload" noetig — dieses Feld
+                # wurde ggf. bereits durch _patch_reasoning_effort_payload entfernt,
+                # aber der Fehler zeigt, dass das Backend es noch im Request sieht
+                # (z.B. wenn ein anderer Teil des Systems es wieder hinzufuegt oder
+                # die Erkennung nicht griff). Einfach sicherheitshalber entfernen + Retry.
+                _log("   → Retry ohne reasoning_effort...")
+                payload_retry = copy.deepcopy(payload)
+                payload_retry.pop("reasoning_effort", None)
+                try:
+                    async with httpx.AsyncClient(timeout=timeout) as client:
+                        response2 = await client.post(
+                            api_url, json=payload_retry, headers=_api_headers(api_key), timeout=timeout,
+                        )
+                    if response2.status_code == 200:
+                        result = response2.json()
+                        message = _extract_choice_message(result)
+                        tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+                        reasoning_content = message.get("reasoning_content") if isinstance(message, dict) else None
+                        content = _extract_choice_content(result)
+                        _log(f"   → Retry ohne reasoning_effort ERFOLGREICH!")
+                        return {
+                            "category": category, "def_idx": def_idx, "status": "ok",
+                            "content": content, "message": message,
+                            "tool_calls": tool_calls, "reasoning_content": reasoning_content,
+                            "duration_seconds": time.perf_counter() - started, "usage": result.get("usage"),
+                            "trigger_fallback": False,
+                        }
+                    else:
+                        _log(f"   → Retry ohne reasoning_effort auch fehlgeschlagen: HTTP {response2.status_code}")
+                except Exception as retry_exc2:
+                    _log(f"   → Retry ohne reasoning_effort Exception: {_safe_str(retry_exc2)}")
         elif response.status_code == 429:
             ra = _retry_after_seconds(response.status_code, getattr(response, "headers", {}))
             _start_cooldown(category, def_idx, duration_override=ra)
