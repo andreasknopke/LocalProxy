@@ -274,6 +274,55 @@ def _env_to_config_val(env_val: str, default_val: Any) -> Any:
     return env_val
 
 
+def _normalize_model_categories(cfg: Dict[str, Any]) -> None:
+    """Stellt sicher, dass light/strong/vision immer Arrays sind (auch bei Legacy-Dict-Format).
+    Fehlende Felder werden mit Defaults aus DEFAULT_CONFIG aufgefuellt."""
+    cats = cfg.get("model_categories")
+    if not isinstance(cats, dict):
+        return
+    default_cats = DEFAULT_CONFIG.get("model_categories", {})
+    for key in ("light", "strong", "vision"):
+        cat = cats.get(key)
+        if isinstance(cat, dict):
+            # Legacy single-dict → in Array wandeln
+            cats[key] = [cat]
+        elif not isinstance(cat, list) or len(cat) == 0:
+            # Kein Array oder leeres Array → Default-Array aus DEFAULT_CONFIG
+            default_arr = default_cats.get(key, [])
+            cats[key] = json.loads(json.dumps(default_arr))
+        else:
+            # Array vorhanden: fehlende Felder pro Slot mit Defaults auffuellen
+            default_arr = default_cats.get(key, [])
+            for i, slot in enumerate(cat):
+                if not isinstance(slot, dict):
+                    cat[i] = json.loads(json.dumps(default_arr[0] if default_arr else {}))
+                    continue
+                defaults_for_slot = default_arr[i] if i < len(default_arr) else (default_arr[0] if default_arr else {})
+                for field in ("label", "api_url", "api_key", "model_name", "max_tokens",
+                               "use_max_completion_tokens", "is_vision", "timeout_seconds"):
+                    if field not in slot:
+                        slot[field] = defaults_for_slot.get(field)
+                # Typ-Garantien
+                slot["max_tokens"] = int(slot.get("max_tokens", 65536))
+                slot["timeout_seconds"] = float(slot.get("timeout_seconds", 180))
+                slot["use_max_completion_tokens"] = bool(slot.get("use_max_completion_tokens", False))
+                slot["is_vision"] = bool(slot.get("is_vision", False))
+    # local bleibt Single-Dict (kann aber auch schon Array sein → normalisieren)
+    local_cat = cats.get("local")
+    if isinstance(local_cat, list):
+        cats["local"] = local_cat[0] if local_cat and isinstance(local_cat[0], dict) else cats.get("local")
+    if isinstance(cats.get("local"), dict):
+        loc = cats["local"]
+        loc.setdefault("label", "local")
+        loc.setdefault("api_url", "")
+        loc.setdefault("api_key", "")
+        loc.setdefault("model_name", "")
+        loc.setdefault("max_tokens", 65536)
+        loc.setdefault("timeout_seconds", 300)
+        loc.setdefault("use_max_completion_tokens", False)
+        loc.setdefault("is_vision", False)
+
+
 def _load_config() -> Dict[str, Any]:
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     if CONFIG_PATH.exists():
@@ -283,6 +332,7 @@ def _load_config() -> Dict[str, Any]:
             _deep_merge(cfg, saved)
         except (json.JSONDecodeError, OSError):
             pass
+        _normalize_model_categories(cfg)
         return cfg
 
     for env_name, (section, key) in _ENV_TO_CONFIG.items():
@@ -1363,19 +1413,7 @@ async function copyLogs() {
   }
 }
 
-// Log-Viewer beim Tab-Wechsel starten/stoppen
-const logObserver = new MutationObserver(() => {
-  const logsSection = document.getElementById('section-logs');
-  if (logsSection && logsSection.classList.contains('active')) {
-    if (!_logTimer) refreshLogs();
-  } else {
-    if (_logTimer) { clearTimeout(_logTimer); _logTimer = null; }
-  }
-});
-document.querySelectorAll('nav button').forEach(btn => {
-  logObserver.observe(btn.parentElement, {attributes: false, childList: false, subtree: false});
-});
-// Einfacher: beim Tab-Klick triggern
+// Tab-Klick triggern
 document.querySelectorAll('nav button').forEach(btn => {
   btn.addEventListener('click', () => {
     setTimeout(() => {
