@@ -170,6 +170,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "api_key": "",
             "model_name": "Qwen/Qwen3-Next-80B",
             "max_tokens": 65536,
+            "use_max_completion_tokens": False,
             "is_vision": False,
             "timeout_seconds": 300,
         },
@@ -180,11 +181,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "api_key": "",
                 "model_name": "gpt-4.1-mini",
                 "max_tokens": 65536,
+                "use_max_completion_tokens": False,
                 "is_vision": False,
                 "timeout_seconds": 180,
             },
-            {"label": "light fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": False, "timeout_seconds": 180},
-            {"label": "light fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": False, "timeout_seconds": 180},
+            {"label": "light fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "use_max_completion_tokens": False, "is_vision": False, "timeout_seconds": 180},
+            {"label": "light fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "use_max_completion_tokens": False, "is_vision": False, "timeout_seconds": 180},
         ],
         "strong": [
             {
@@ -193,11 +195,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "api_key": "",
                 "model_name": "claude-sonnet-4-20250514",
                 "max_tokens": 65536,
+                "use_max_completion_tokens": False,
                 "is_vision": False,
                 "timeout_seconds": 300,
             },
-            {"label": "strong fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": False, "timeout_seconds": 300},
-            {"label": "strong fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": False, "timeout_seconds": 300},
+            {"label": "strong fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "use_max_completion_tokens": False, "is_vision": False, "timeout_seconds": 300},
+            {"label": "strong fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "use_max_completion_tokens": False, "is_vision": False, "timeout_seconds": 300},
         ],
         "vision": [
             {
@@ -206,11 +209,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "api_key": "",
                 "model_name": "gpt-4o",
                 "max_tokens": 65536,
+                "use_max_completion_tokens": False,
                 "is_vision": True,
                 "timeout_seconds": 180,
             },
-            {"label": "vision fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": True, "timeout_seconds": 180},
-            {"label": "vision fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": True, "timeout_seconds": 180},
+            {"label": "vision fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "use_max_completion_tokens": False, "is_vision": True, "timeout_seconds": 180},
+            {"label": "vision fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "use_max_completion_tokens": False, "is_vision": True, "timeout_seconds": 180},
         ],
     },
     "default_category": "light",
@@ -493,6 +497,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
           </div>
         </div>
         <div class="toggle-row">
+          <span>max_completion_tokens (statt max_tokens)</span>
+          <label class="toggle"><input type="checkbox" id="local_use_max_completion_tokens"><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
           <span>Vision (image_url Support)</span>
           <label class="toggle"><input type="checkbox" id="local_is_vision"><span class="slider"></span></label>
         </div>
@@ -529,6 +537,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
               <label>Timeout (Sekunden)</label>
               <input type="number" id="light_timeout_seconds" min="10" max="3600">
             </div>
+          </div>
+          <div class="toggle-row">
+            <span>max_completion_tokens (statt max_tokens)</span>
+            <label class="toggle"><input type="checkbox" id="light_use_max_completion_tokens"><span class="slider"></span></label>
           </div>
           <div class="toggle-row">
             <span>Vision (image_url Support)</span>
@@ -569,6 +581,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
             </div>
           </div>
           <div class="toggle-row">
+            <span>max_completion_tokens (statt max_tokens)</span>
+            <label class="toggle"><input type="checkbox" id="light_use_max_completion_tokens_2"><span class="slider"></span></label>
+          </div>
+          <div class="toggle-row">
             <span>Vision (image_url Support)</span>
             <label class="toggle"><input type="checkbox" id="light_is_vision_2"><span class="slider"></span></label>
           </div>
@@ -605,6 +621,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
               <label>Timeout (Sekunden)</label>
               <input type="number" id="light_timeout_seconds_3" min="10" max="3600">
             </div>
+          </div>
+          <div class="toggle-row">
+            <span>max_completion_tokens (statt max_tokens)</span>
+            <label class="toggle"><input type="checkbox" id="light_use_max_completion_tokens_3"><span class="slider"></span></label>
           </div>
           <div class="toggle-row">
             <span>Vision (image_url Support)</span>
@@ -646,6 +666,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
             </div>
           </div>
           <div class="toggle-row">
+            <span>max_completion_tokens (statt max_tokens)</span>
+            <label class="toggle"><input type="checkbox" id="strong_use_max_completion_tokens"><span class="slider"></span></label>
+          </div>
+          <div class="toggle-row">
             <span>Vision (image_url Support)</span>
             <label class="toggle"><input type="checkbox" id="strong_is_vision"><span class="slider"></span></label>
           </div>
@@ -684,6 +708,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
             </div>
           </div>
           <div class="toggle-row">
+            <span>max_completion_tokens (statt max_tokens)</span>
+            <label class="toggle"><input type="checkbox" id="strong_use_max_completion_tokens_2"><span class="slider"></span></label>
+          </div>
+          <div class="toggle-row">
             <span>Vision (image_url Support)</span>
             <label class="toggle"><input type="checkbox" id="strong_is_vision_2"><span class="slider"></span></label>
           </div>
@@ -720,6 +748,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
               <label>Timeout (Sekunden)</label>
               <input type="number" id="strong_timeout_seconds_3" min="10" max="3600">
             </div>
+          </div>
+          <div class="toggle-row">
+            <span>max_completion_tokens (statt max_tokens)</span>
+            <label class="toggle"><input type="checkbox" id="strong_use_max_completion_tokens_3"><span class="slider"></span></label>
           </div>
           <div class="toggle-row">
             <span>Vision (image_url Support)</span>
@@ -761,6 +793,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
             </div>
           </div>
           <div class="toggle-row">
+            <span>max_completion_tokens (statt max_tokens)</span>
+            <label class="toggle"><input type="checkbox" id="vision_use_max_completion_tokens"><span class="slider"></span></label>
+          </div>
+          <div class="toggle-row">
             <span>Vision (image_url Support)</span>
             <label class="toggle"><input type="checkbox" id="vision_is_vision"><span class="slider"></span></label>
           </div>
@@ -799,6 +835,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
             </div>
           </div>
           <div class="toggle-row">
+            <span>max_completion_tokens (statt max_tokens)</span>
+            <label class="toggle"><input type="checkbox" id="vision_use_max_completion_tokens_2"><span class="slider"></span></label>
+          </div>
+          <div class="toggle-row">
             <span>Vision (image_url Support)</span>
             <label class="toggle"><input type="checkbox" id="vision_is_vision_2"><span class="slider"></span></label>
           </div>
@@ -835,6 +875,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
               <label>Timeout (Sekunden)</label>
               <input type="number" id="vision_timeout_seconds_3" min="10" max="3600">
             </div>
+          </div>
+          <div class="toggle-row">
+            <span>max_completion_tokens (statt max_tokens)</span>
+            <label class="toggle"><input type="checkbox" id="vision_use_max_completion_tokens_3"><span class="slider"></span></label>
           </div>
           <div class="toggle-row">
             <span>Vision (image_url Support)</span>
@@ -990,6 +1034,7 @@ async function loadConfig() {
             document.getElementById(key + '_model_name' + suffix).value = def.model_name || '';
             document.getElementById(key + '_max_tokens' + suffix).value = def.max_tokens || 65536;
             document.getElementById(key + '_timeout_seconds' + suffix).value = def.timeout_seconds || 180;
+            document.getElementById(key + '_use_max_completion_tokens' + suffix).checked = !!def.use_max_completion_tokens;
             document.getElementById(key + '_is_vision' + suffix).checked = !!def.is_vision;
             // Label ist optional
             const labelEl = document.getElementById(key + '_label_' + (i+1));
@@ -1003,6 +1048,7 @@ async function loadConfig() {
         document.getElementById(key + '_model_name').value = c.model_name || '';
         document.getElementById(key + '_max_tokens').value = c.max_tokens || 65536;
         document.getElementById(key + '_timeout_seconds').value = c.timeout_seconds || 180;
+        document.getElementById(key + '_use_max_completion_tokens').checked = !!c.use_max_completion_tokens;
         document.getElementById(key + '_is_vision').checked = !!c.is_vision;
         const labelEl = document.getElementById(key + '_label_1');
         if (labelEl) labelEl.value = c.label || key;
@@ -1054,6 +1100,7 @@ async function saveConfig() {
         model_name: document.getElementById(key + '_model_name').value,
         max_tokens: parseInt(document.getElementById(key + '_max_tokens').value) || 65536,
         timeout_seconds: parseFloat(document.getElementById(key + '_timeout_seconds').value) || 180,
+        use_max_completion_tokens: document.getElementById(key + '_use_max_completion_tokens').checked,
         is_vision: document.getElementById(key + '_is_vision').checked,
       };
     } else {
@@ -1068,6 +1115,7 @@ async function saveConfig() {
           model_name: document.getElementById(key + '_model_name' + suffix).value,
           max_tokens: parseInt(document.getElementById(key + '_max_tokens' + suffix).value) || 65536,
           timeout_seconds: parseFloat(document.getElementById(key + '_timeout_seconds' + suffix).value) || 180,
+          use_max_completion_tokens: document.getElementById(key + '_use_max_completion_tokens' + suffix).checked,
           is_vision: document.getElementById(key + '_is_vision' + suffix).checked,
         });
       }
@@ -1344,21 +1392,68 @@ def create_webui_app() -> FastAPI:
 
         _log(f"Test-Endpoint: model={model_name} api_key={_trunc} url={api_url}")
 
+        # Auto-Erkennung ob Model max_completion_tokens braucht (o1-, o3-, o4-, gpt-4.1, gpt-4.5, etc.)
+        _needs_mct = bool(re.match(r'^(o[1349]|o[1349]-|o-series|gpt-4\.(?:1|5|o|.5)|gpt-5)', model_name, re.IGNORECASE))
+
         import httpx
         started = time.perf_counter()
         headers = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         try:
+            # Versuche zuerst den korrekten Parameter
+            payload: Dict[str, Any] = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": "ping"}],
+            }
+            if _needs_mct:
+                payload["max_completion_tokens"] = 1
+            else:
+                payload["max_tokens"] = 1
+
             async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as hc:
-                r = await hc.post(
-                    api_url,
-                    json={"model": model_name,
-                          "messages": [{"role": "user", "content": "ping"}],
-                          "max_tokens": 1},
-                    headers=headers,
-                )
+                r = await hc.post(api_url, json=payload, headers=headers)
             duration = f"{time.perf_counter() - started:.1f}s"
+
+            # Bei 400: ggf. mit alternativem Parameter wiederholen
+            if r.status_code == 400:
+                err_body_text = ""
+                try:
+                    err_body = r.json()
+                    if isinstance(err_body.get("error"), dict):
+                        err_body_text = str(err_body["error"].get("message", ""))
+                    elif isinstance(err_body.get("error"), str):
+                        err_body_text = str(err_body["error"])
+                except Exception:
+                    pass
+                # Wenn Fehler auf max_tokens hindeutet, mit max_completion_tokens versuchen
+                if "max_completion_tokens" in err_body_text.lower() or "max_tokens" in err_body_text.lower():
+                    _log(f"Test-Endpoint 400: {err_body_text[:200]}, retry mit max_completion_tokens")
+                    payload2: Dict[str, Any] = {
+                        "model": model_name,
+                        "messages": [{"role": "user", "content": "ping"}],
+                        "max_completion_tokens": 1,
+                    }
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as hc2:
+                        r2 = await hc2.post(api_url, json=payload2, headers=headers)
+                    if r2.status_code in (200, 201):
+                        duration2 = f"{time.perf_counter() - started:.1f}s"
+                        return JSONResponse(content={"ok": True, "duration": duration2,
+                                                       "note": "max_completion_tokens statt max_tokens"})
+                    else:
+                        try:
+                            err_body2 = r2.json()
+                            if isinstance(err_body2.get("error"), dict):
+                                err = _safe_str(err_body2["error"].get("message", ""))
+                            elif isinstance(err_body2.get("error"), str):
+                                err = _safe_str(err_body2["error"])
+                            else:
+                                err = f"HTTP {r2.status_code}"
+                        except Exception:
+                            err = f"HTTP {r2.status_code}"
+                        return JSONResponse(content={"ok": False, "duration": f"{time.perf_counter() - started:.1f}s",
+                                                       "error": err or f"HTTP {r2.status_code}"})
+
             if r.status_code in (200, 201):
                 return JSONResponse(content={"ok": True, "duration": duration})
             err = ""

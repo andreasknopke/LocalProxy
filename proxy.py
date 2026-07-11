@@ -123,6 +123,7 @@ _MODEL_CATEGORIES: Dict[str, Any] = {
         "api_key": os.getenv("LOCAL_API_KEY", ""),
         "model_name": os.getenv("LOCAL_MODEL_NAME", "Qwen/Qwen3-Next-80B"),
         "max_tokens": int(os.getenv("LOCAL_MAX_TOKENS", "65536")),
+        "use_max_completion_tokens": os.getenv("LOCAL_USE_MAX_COMPLETION_TOKENS", "false").lower() in {"1", "true", "yes", "y", "on"},
         "is_vision": os.getenv("LOCAL_IS_VISION", "false").lower() in {"1", "true", "yes", "y", "on"},
         "timeout_seconds": float(os.getenv("LOCAL_TIMEOUT_SECONDS", "300")),
         "label": "local primary",
@@ -134,11 +135,12 @@ _MODEL_CATEGORIES: Dict[str, Any] = {
             "api_key": os.getenv("LIGHT_API_KEY", ""),
             "model_name": os.getenv("LIGHT_MODEL_NAME", "gpt-4.1-mini"),
             "max_tokens": int(os.getenv("LIGHT_MAX_TOKENS", "65536")),
+            "use_max_completion_tokens": os.getenv("LIGHT_USE_MAX_COMPLETION_TOKENS", "false").lower() in {"1", "true", "yes", "y", "on"},
             "is_vision": os.getenv("LIGHT_IS_VISION", "false").lower() in {"1", "true", "yes", "y", "on"},
             "timeout_seconds": float(os.getenv("LIGHT_TIMEOUT_SECONDS", "180")),
         },
-        {"label": "light fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": False, "timeout_seconds": 180},
-        {"label": "light fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": False, "timeout_seconds": 180},
+        {"label": "light fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "use_max_completion_tokens": False, "is_vision": False, "timeout_seconds": 180},
+        {"label": "light fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "use_max_completion_tokens": False, "is_vision": False, "timeout_seconds": 180},
     ],
     "strong": [
         {
@@ -147,11 +149,12 @@ _MODEL_CATEGORIES: Dict[str, Any] = {
             "api_key": os.getenv("STRONG_API_KEY", ""),
             "model_name": os.getenv("STRONG_MODEL_NAME", "claude-sonnet-4-20250514"),
             "max_tokens": int(os.getenv("STRONG_MAX_TOKENS", "65536")),
+            "use_max_completion_tokens": os.getenv("STRONG_USE_MAX_COMPLETION_TOKENS", "false").lower() in {"1", "true", "yes", "y", "on"},
             "is_vision": os.getenv("STRONG_IS_VISION", "false").lower() in {"1", "true", "yes", "y", "on"},
             "timeout_seconds": float(os.getenv("STRONG_TIMEOUT_SECONDS", "300")),
         },
-        {"label": "strong fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": False, "timeout_seconds": 300},
-        {"label": "strong fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": False, "timeout_seconds": 300},
+        {"label": "strong fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "use_max_completion_tokens": False, "is_vision": False, "timeout_seconds": 300},
+        {"label": "strong fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "use_max_completion_tokens": False, "is_vision": False, "timeout_seconds": 300},
     ],
     "vision": [
         {
@@ -160,11 +163,12 @@ _MODEL_CATEGORIES: Dict[str, Any] = {
             "api_key": os.getenv("VISION_API_KEY", ""),
             "model_name": os.getenv("VISION_MODEL_NAME", "gpt-4o"),
             "max_tokens": int(os.getenv("VISION_MAX_TOKENS", "65536")),
+            "use_max_completion_tokens": os.getenv("VISION_USE_MAX_COMPLETION_TOKENS", "false").lower() in {"1", "true", "yes", "y", "on"},
             "is_vision": os.getenv("VISION_IS_VISION", "true").lower() in {"1", "true", "yes", "y", "on"},
             "timeout_seconds": float(os.getenv("VISION_TIMEOUT_SECONDS", "180")),
         },
-        {"label": "vision fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": True, "timeout_seconds": 180},
-        {"label": "vision fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "is_vision": True, "timeout_seconds": 180},
+        {"label": "vision fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "use_max_completion_tokens": False, "is_vision": True, "timeout_seconds": 180},
+        {"label": "vision fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "use_max_completion_tokens": False, "is_vision": True, "timeout_seconds": 180},
     ],
 }
 
@@ -327,13 +331,16 @@ def _apply_config_file() -> None:
                     # Memory hat Array, config sagt Dict → als 1-elementiges Array behandeln
                     merged: Dict[str, Any] = {}
                     for field in ("label", "api_url", "api_key", "model_name", "max_tokens",
-                                   "is_vision", "timeout_seconds"):
+                                   "use_max_completion_tokens", "is_vision", "timeout_seconds"):
                         if field in sc:
                             val = sc[field]
                             if field in ("api_url", "api_key") and isinstance(val, str) and val.strip() == "":
                                 continue
                             if field == "max_tokens":
                                 val = int(val)
+                            elif field == "use_max_completion_tokens":
+                                val = bool(val) if not isinstance(val, str) else \
+                                    str(val).lower() in {"1", "true", "yes", "y", "on"}
                             elif field == "is_vision":
                                 val = bool(val) if not isinstance(val, str) else \
                                     str(val).lower() in {"1", "true", "yes", "y", "on"}
@@ -345,13 +352,16 @@ def _apply_config_file() -> None:
                 else:
                     cat = _MODEL_CATEGORIES.setdefault(key, {})
                     for field in ("label", "api_url", "api_key", "model_name", "max_tokens",
-                                   "is_vision", "timeout_seconds"):
+                                   "use_max_completion_tokens", "is_vision", "timeout_seconds"):
                         if field in sc:
                             val = sc[field]
                             if field in ("api_url", "api_key") and isinstance(val, str) and val.strip() == "":
                                 continue
                             if field == "max_tokens":
                                 val = int(val)
+                            elif field == "use_max_completion_tokens":
+                                val = bool(val) if not isinstance(val, str) else \
+                                    str(val).lower() in {"1", "true", "yes", "y", "on"}
                             elif field == "is_vision":
                                 val = bool(val) if not isinstance(val, str) else \
                                     str(val).lower() in {"1", "true", "yes", "y", "on"}
@@ -367,13 +377,16 @@ def _apply_config_file() -> None:
                         continue
                     element: Dict[str, Any] = {}
                     for field in ("label", "api_url", "api_key", "model_name", "max_tokens",
-                                   "is_vision", "timeout_seconds"):
+                                   "use_max_completion_tokens", "is_vision", "timeout_seconds"):
                         if field in d:
                             val = d[field]
                             if field in ("api_url", "api_key") and isinstance(val, str) and val.strip() == "":
                                 continue
                             if field == "max_tokens":
                                 val = int(val)
+                            elif field == "use_max_completion_tokens":
+                                val = (bool(val) if not isinstance(val, str) else
+                                       str(val).lower() in {"1", "true", "yes", "y", "on"})
                             elif field == "is_vision":
                                 val = (bool(val) if not isinstance(val, str) else
                                        str(val).lower() in {"1", "true", "yes", "y", "on"})
@@ -390,6 +403,8 @@ def _apply_config_file() -> None:
             _CATEGORY_ACTIVE_IDX[key] = 0
         elif _CATEGORY_ACTIVE_IDX[key] >= len(defs):
             _CATEGORY_ACTIVE_IDX[key] = 0
+
+    _log("Config aus config.json neu geladen")
 
     dc = cfg.get("default_category", "")
     if dc in ("local", "light", "strong", "vision"):
@@ -931,6 +946,38 @@ def _sanitize_image_urls_inplace(messages: List[Dict[str, Any]], label: str = "P
     return removed
 
 
+# ── Regex fuer Model-Namen, die max_completion_tokens statt max_tokens benoetigen ────
+_MODEL_NEEDS_MAX_COMPLETION_TOKENS_RE = re.compile(
+    r'^(o[1349]|o[1349]-|o-series|gpt-4\.(?:1|5|o|.5)|gpt-5)', re.IGNORECASE
+)
+
+
+def _needs_max_completion_tokens(model_name: str) -> bool:
+    """Ermittelt ob ein Model max_completion_tokens statt max_tokens benoetigt.
+    Erkennung via Modell-Namen-Praefix (o1-, o3-, o4-, o-series, gpt-4.1, gpt-4.5, etc.).
+    """
+    if not model_name:
+        return False
+    return bool(_MODEL_NEEDS_MAX_COMPLETION_TOKENS_RE.match(model_name))
+
+
+def _patch_max_tokens_payload(payload: Dict[str, Any], cat: Dict[str, Any]) -> None:
+    """Wandelt max_tokens in max_completion_tokens um, wenn das Modell es erfordert.
+    Entscheidungsreihenfolge:
+      1. cat['use_max_completion_tokens'] == True  → explizite Config
+      2. _needs_max_completion_tokens(model_name)   → Auto-Detect via Modell-Praefix
+    """
+    model_name = str(cat.get("model_name", payload.get("model", "")))
+    use_mct = bool(cat.get("use_max_completion_tokens", False))
+    if not use_mct and not _needs_max_completion_tokens(model_name):
+        return
+    # max_tokens steht bereits im payload, umbenennen
+    if "max_tokens" in payload:
+        val = payload.pop("max_tokens")
+        payload["max_completion_tokens"] = val
+        _log(f"max_tokens → max_completion_tokens fuer Model '{model_name}' (config={use_mct}, auto={not use_mct})")
+
+
 def _patch_moonshot_payload(payload: Dict[str, Any], api_url: str) -> None:
     """Erzwingt Moonshot-kompatible Parameter — NUR wenn api_url moonshot-ai enthaelt."""
     url_lower = api_url.lower()
@@ -1010,6 +1057,7 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
         _sanitize_image_urls_inplace(messages, "Passthrough")
 
     _patch_moonshot_payload(payload, cat.get("api_url", ""))
+    _patch_max_tokens_payload(payload, cat)
 
     return _clean_payload(payload, keep_tools=True)
 
@@ -1125,6 +1173,42 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
         if response.status_code == 400:
             # 400 ist Payload-Problem → kein Fallback
             should_fallback = False
+            # Pruefen ob max_tokens → max_completion_tokens noetig ist
+            if "max_completion_tokens" in err_detail.lower() or "max_tokens" in err_detail.lower():
+                _log(f"   → 400 deutet auf max_tokens-Problem hin: {err_detail}")
+                if "max_tokens" in payload and "max_completion_tokens" not in payload:
+                    # Wir versuchen es nochmal mit max_completion_tokens
+                    model_name = cat.get("model_name", "")
+                    if not _needs_max_completion_tokens(model_name):
+                        _log(f"   → Model '{model_name}' wurde nicht als max_completion_tokens-Kandidat erkannt, aber wir versuchen es trotzdem")
+                    _log("   → Retry mit max_completion_tokens...")
+                    payload_retry = copy.deepcopy(payload)
+                    val = payload_retry.pop("max_tokens", None)
+                    if val is not None:
+                        payload_retry["max_completion_tokens"] = val
+                    try:
+                        async with httpx.AsyncClient(timeout=timeout) as client:
+                            response2 = await client.post(
+                                api_url, json=payload_retry, headers=_api_headers(api_key), timeout=timeout,
+                            )
+                        if response2.status_code == 200:
+                            result = response2.json()
+                            message = _extract_choice_message(result)
+                            tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+                            reasoning_content = message.get("reasoning_content") if isinstance(message, dict) else None
+                            content = _extract_choice_content(result)
+                            _log(f"   → Retry mit max_completion_tokens ERFOLGREICH! Model={model_name}")
+                            return {
+                                "category": category, "def_idx": def_idx, "status": "ok",
+                                "content": content, "message": message,
+                                "tool_calls": tool_calls, "reasoning_content": reasoning_content,
+                                "duration_seconds": time.perf_counter() - started, "usage": result.get("usage"),
+                                "trigger_fallback": False,
+                            }
+                        else:
+                            _log(f"   → Retry mit max_completion_tokens auch fehlgeschlagen: HTTP {response2.status_code}")
+                    except Exception as retry_exc:
+                        _log(f"   → Retry mit max_completion_tokens Exception: {_safe_str(retry_exc)}")
         elif response.status_code == 429:
             ra = _retry_after_seconds(response.status_code, getattr(response, "headers", {}))
             _start_cooldown(category, def_idx, duration_override=ra)
@@ -1568,6 +1652,31 @@ async def _run_startup_health_checks() -> None:
                 else:
                     err = _parse_error(r) or f"HTTP {r.status_code}"
                     _log(f"   {key}[{i}]: {err}")
+                # Bei 400: max_tokens ggf. durch max_completion_tokens ersetzen
+                if r.status_code == 400:
+                    try:
+                        err_body = r.json()
+                        err_msg = str(err_body.get("error", {}).get("message", "")) if isinstance(err_body.get("error"), dict) else str(err_body.get("error", ""))
+                    except Exception:
+                        err_msg = ""
+                    if "max_completion_tokens" in err_msg.lower() or "max_tokens" in err_msg.lower():
+                        _log(f"   {key}[{i}]: max_tokens-Problem erkannt, versuche max_completion_tokens...")
+                        try:
+                            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0)) as hc:
+                                r2 = await hc.post(
+                                    api_url,
+                                    json={"model": cat.get("model_name", ""),
+                                          "messages": [{"role": "user", "content": "ping"}],
+                                          "max_completion_tokens": 1},
+                                    headers=_api_headers(str(cat.get("api_key", ""))),
+                                )
+                            if r2.status_code in (200, 201):
+                                _log(f"   {key}[{i}]: OK (mit max_completion_tokens) ({cat.get('model_name')})")
+                            else:
+                                err = _parse_error(r2) or f"HTTP {r2.status_code}"
+                                _log(f"   {key}[{i}]: auch mit max_completion_tokens fehlgeschlagen: {err}")
+                        except Exception as exc2:
+                            _log(f"   {key}[{i}]: Retry-Fehler - {type(exc2).__name__}: {_safe_str(exc2)}")
             except Exception as exc:
                 _log(f"   {key}[{i}]: nicht erreichbar - {type(exc).__name__}: {_safe_str(exc)}")
 
