@@ -978,6 +978,40 @@ def _patch_max_tokens_payload(payload: Dict[str, Any], cat: Dict[str, Any]) -> N
         _log(f"max_tokens → max_completion_tokens fuer Model '{model_name}' (config={use_mct}, auto={not use_mct})")
 
 
+# Regex fuer Modelle, bei denen reasoning_effort NICHT mit function tools zusammen verwendet werden darf
+_MODEL_REASONING_EFFORT_STRIP_RE = re.compile(
+    r'^(gpt-5)', re.IGNORECASE
+)
+
+
+def _needs_reasoning_effort_strip(model_name: str, payload: Dict[str, Any]) -> bool:
+    """Ermittelt, ob reasoning_effort aus dem Payload entfernt werden muss.
+    Das ist der Fall, wenn das Modell reasoning_effort nicht in Kombination
+    mit function tools im /v1/chat/completions-Endpunkt unterstuetzt.
+    """
+    if not model_name:
+        return False
+    # Nur relevant wenn reasoning_effort UND tools vorhanden sind
+    if "reasoning_effort" not in payload:
+        return False
+    has_tools = bool(payload.get("tools")) or bool(payload.get("tool_choice"))
+    if not has_tools:
+        return False
+    return bool(_MODEL_REASONING_EFFORT_STRIP_RE.match(model_name))
+
+
+def _patch_reasoning_effort_payload(payload: Dict[str, Any], cat: Dict[str, Any]) -> None:
+    """Entfernt reasoning_effort aus dem Payload, wenn das Modell es nicht
+    zusammen mit function tools unterstuetzt.
+    """
+    model_name = str(cat.get("model_name", payload.get("model", "")))
+    if not _needs_reasoning_effort_strip(model_name, payload):
+        return
+    if "reasoning_effort" in payload:
+        old_val = payload.pop("reasoning_effort")
+        _log(f"reasoning_effort='{old_val}' entfernt fuer Model '{model_name}' (tools + reasoning_effort inkompatibel)")
+
+
 def _patch_moonshot_payload(payload: Dict[str, Any], api_url: str) -> None:
     """Erzwingt Moonshot-kompatible Parameter — NUR wenn api_url moonshot-ai enthaelt."""
     url_lower = api_url.lower()
@@ -1058,6 +1092,7 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
 
     _patch_moonshot_payload(payload, cat.get("api_url", ""))
     _patch_max_tokens_payload(payload, cat)
+    _patch_reasoning_effort_payload(payload, cat)
 
     return _clean_payload(payload, keep_tools=True)
 
@@ -1209,6 +1244,36 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
                             _log(f"   → Retry mit max_completion_tokens auch fehlgeschlagen: HTTP {response2.status_code}")
                     except Exception as retry_exc:
                         _log(f"   → Retry mit max_completion_tokens Exception: {_safe_str(retry_exc)}")
+            # Pruefen ob reasoning_effort mit tools inkompatibel ist (gpt-5 Serie)
+            if "reasoning_effort" in err_detail.lower() and "tools" in err_detail.lower():
+                _log(f"   → 400 deutet auf reasoning_effort-Tools-Inkompatibilitaet hin: {err_detail}")
+                if "reasoning_effort" in payload and (payload.get("tools") or payload.get("tool_choice")):
+                    _log("   → Retry ohne reasoning_effort...")
+                    payload_retry = copy.deepcopy(payload)
+                    payload_retry.pop("reasoning_effort", None)
+                    try:
+                        async with httpx.AsyncClient(timeout=timeout) as client:
+                            response2 = await client.post(
+                                api_url, json=payload_retry, headers=_api_headers(api_key), timeout=timeout,
+                            )
+                        if response2.status_code == 200:
+                            result = response2.json()
+                            message = _extract_choice_message(result)
+                            tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+                            reasoning_content = message.get("reasoning_content") if isinstance(message, dict) else None
+                            content = _extract_choice_content(result)
+                            _log(f"   → Retry ohne reasoning_effort ERFOLGREICH!")
+                            return {
+                                "category": category, "def_idx": def_idx, "status": "ok",
+                                "content": content, "message": message,
+                                "tool_calls": tool_calls, "reasoning_content": reasoning_content,
+                                "duration_seconds": time.perf_counter() - started, "usage": result.get("usage"),
+                                "trigger_fallback": False,
+                            }
+                        else:
+                            _log(f"   → Retry ohne reasoning_effort auch fehlgeschlagen: HTTP {response2.status_code}")
+                    except Exception as retry_exc2:
+                        _log(f"   → Retry ohne reasoning_effort Exception: {_safe_str(retry_exc2)}")
         elif response.status_code == 429:
             ra = _retry_after_seconds(response.status_code, getattr(response, "headers", {}))
             _start_cooldown(category, def_idx, duration_override=ra)
