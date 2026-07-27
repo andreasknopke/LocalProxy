@@ -127,6 +127,8 @@ _MODEL_CATEGORIES: Dict[str, Any] = {
         "is_vision": os.getenv("LOCAL_IS_VISION", "false").lower() in {"1", "true", "yes", "y", "on"},
         "timeout_seconds": float(os.getenv("LOCAL_TIMEOUT_SECONDS", "300")),
         "read_timeout_seconds": float(os.getenv("LOCAL_READ_TIMEOUT_SECONDS", "120")),
+        "retry_on_timeout": int(os.getenv("LOCAL_RETRY_ON_TIMEOUT", "2")),
+        "retry_delay_seconds": float(os.getenv("LOCAL_RETRY_DELAY_SECONDS", "5")),
         "label": "local primary",
     },
     "light": [
@@ -354,7 +356,7 @@ def _apply_config_file() -> None:
                     merged: Dict[str, Any] = {}
                     for field in ("label", "api_url", "api_key", "model_name", "max_tokens",
                                    "use_max_completion_tokens", "is_vision", "timeout_seconds",
-                                   "read_timeout_seconds"):
+                                   "read_timeout_seconds", "retry_on_timeout", "retry_delay_seconds"):
                         if field in sc:
                             val = sc[field]
                             if field in ("api_url", "api_key") and isinstance(val, str) and val.strip() == "":
@@ -367,8 +369,10 @@ def _apply_config_file() -> None:
                             elif field == "is_vision":
                                 val = bool(val) if not isinstance(val, str) else \
                                     str(val).lower() in {"1", "true", "yes", "y", "on"}
-                            elif field in ("timeout_seconds", "read_timeout_seconds"):
+                            elif field in ("timeout_seconds", "read_timeout_seconds", "retry_delay_seconds"):
                                 val = float(val)
+                            elif field == "retry_on_timeout":
+                                val = int(val)
                             merged[field] = val
                     merged.setdefault("label", key)
                     _MODEL_CATEGORIES[key] = [merged]
@@ -376,7 +380,7 @@ def _apply_config_file() -> None:
                     cat = _MODEL_CATEGORIES.setdefault(key, {})
                     for field in ("label", "api_url", "api_key", "model_name", "max_tokens",
                                    "use_max_completion_tokens", "is_vision", "timeout_seconds",
-                                   "read_timeout_seconds"):
+                                   "read_timeout_seconds", "retry_on_timeout", "retry_delay_seconds"):
                         if field in sc:
                             val = sc[field]
                             if field in ("api_url", "api_key") and isinstance(val, str) and val.strip() == "":
@@ -389,8 +393,10 @@ def _apply_config_file() -> None:
                             elif field == "is_vision":
                                 val = bool(val) if not isinstance(val, str) else \
                                     str(val).lower() in {"1", "true", "yes", "y", "on"}
-                            elif field in ("timeout_seconds", "read_timeout_seconds"):
+                            elif field in ("timeout_seconds", "read_timeout_seconds", "retry_delay_seconds"):
                                 val = float(val)
+                            elif field == "retry_on_timeout":
+                                val = int(val)
                             cat[field] = val
 
             elif isinstance(sc, list):
@@ -401,8 +407,7 @@ def _apply_config_file() -> None:
                         continue
                     element: Dict[str, Any] = {}
                     for field in ("label", "api_url", "api_key", "model_name", "max_tokens",
-                                   "use_max_completion_tokens", "is_vision", "timeout_seconds",
-                                   "read_timeout_seconds"):
+                                   "use_max_completion_tokens", "is_vision", "timeout_seconds"):
                         if field in d:
                             val = d[field]
                             if field in ("api_url", "api_key") and isinstance(val, str) and val.strip() == "":
@@ -415,7 +420,7 @@ def _apply_config_file() -> None:
                             elif field == "is_vision":
                                 val = (bool(val) if not isinstance(val, str) else
                                        str(val).lower() in {"1", "true", "yes", "y", "on"})
-                            elif field in ("timeout_seconds", "read_timeout_seconds"):
+                            elif field == "timeout_seconds":
                                 val = float(val)
                             element[field] = val
                     cleaned_list.append(element)
@@ -1346,12 +1351,52 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
         "phase": "passthrough",
     })
 
+    # Retry-Loop fuer Timeout/ConnectionError (lokales Modell haengt manchmal)
+    max_retries = int(cat.get("retry_on_timeout", 0))
+    retry_delay = float(cat.get("retry_delay_seconds", 5))
+    _http_timeout = httpx.Timeout(timeout, read=read_timeout)
+
+    response = None
+    last_exc: Optional[Exception] = None
+    for attempt in range(1 + max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=_http_timeout) as client:
+                response = await client.post(
+                    api_url, json=payload, headers=_api_headers(api_key),
+                )
+            last_exc = None
+            break  # Erfolg — kein Retry noetig
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError, OSError) as exc:
+            last_exc = exc
+            duration_so_far = time.perf_counter() - started
+            exc_type = type(exc).__name__
+            if attempt < max_retries:
+                _log(f"Model TIMEOUT/CONN cat={category}[{def_idx}] attempt={attempt+1}/{1+max_retries} "
+                     f"duration={duration_so_far:.1f}s type={exc_type}: {_safe_str(exc)}")
+                _log(f"   → Auto-Retry in {retry_delay:.0f}s...")
+                await asyncio.sleep(retry_delay)
+            else:
+                _log(f"Model TIMEOUT/CONN cat={category}[{def_idx}] attempt={attempt+1}/{1+max_retries} "
+                     f"duration={duration_so_far:.1f}s type={exc_type}: {_safe_str(exc)} — KEINE Retries mehr")
+
+    if last_exc is not None:
+        # Alle Retries erschoepft — Timeout/ConnectionError
+        duration = time.perf_counter() - started
+        exc_type = type(last_exc).__name__
+        exc_msg = _safe_str(last_exc)
+        _finish_active_call(req_id, "error", {"duration_seconds": duration, "error": exc_msg,
+                                               "attempts": 1 + max_retries})
+        _log(f"Model ERROR cat={category}[{def_idx}] duration={duration:.1f}s type={exc_type}: {exc_msg} "
+             f"(nach {1+max_retries} Versuchen)")
+        _start_cooldown(category, def_idx, duration_override=30.0)
+        return {
+            "category": category, "def_idx": def_idx, "status": "error",
+            "content": _safe_str(f"Model error nach {duration:.0f}s ({exc_type}, {1+max_retries} attempts): {exc_msg}"),
+            "duration_seconds": duration, "usage": None,
+            "trigger_fallback": True,
+        }
+
     try:
-        _http_timeout = httpx.Timeout(timeout, read=read_timeout)
-        async with httpx.AsyncClient(timeout=_http_timeout) as client:
-            response = await client.post(
-                api_url, json=payload, headers=_api_headers(api_key),
-            )
         duration = time.perf_counter() - started
         _finish_active_call(req_id, "done", {"duration_seconds": duration})
 
@@ -1485,16 +1530,11 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
         exc_msg = _safe_str(exc)
         _finish_active_call(req_id, "error", {"duration_seconds": duration, "error": exc_msg})
         _log(f"Model ERROR cat={category}[{def_idx}] duration={duration:.1f}s type={exc_type}: {exc_msg}")
-        should_fallback = True
-        # Timeout/ConnectionError: kurzer Cooldown
-        if "timeout" in exc_type.lower() or "connect" in exc_type.lower():
-            _start_cooldown(category, def_idx, duration_override=30.0)
-            _log(f"   → Timeout/ConnError: Cooldown (30s) fuer {category}[{def_idx}]={model}")
         return {
             "category": category, "def_idx": def_idx, "status": "error",
             "content": _safe_str(f"Model error nach {duration:.0f}s ({exc_type}): {exc_msg}"),
             "duration_seconds": duration, "usage": None,
-            "trigger_fallback": should_fallback,
+            "trigger_fallback": True,
         }
 
 

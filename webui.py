@@ -174,6 +174,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "is_vision": False,
             "timeout_seconds": 300,
             "read_timeout_seconds": 120,
+            "retry_on_timeout": 2,
+            "retry_delay_seconds": 5,
         },
         "light": [
             {
@@ -307,14 +309,12 @@ def _normalize_model_categories(cfg: Dict[str, Any]) -> None:
                     continue
                 defaults_for_slot = default_arr[i] if i < len(default_arr) else (default_arr[0] if default_arr else {})
                 for field in ("label", "api_url", "api_key", "model_name", "max_tokens",
-                               "use_max_completion_tokens", "is_vision", "timeout_seconds",
-                               "read_timeout_seconds"):
+                               "use_max_completion_tokens", "is_vision", "timeout_seconds"):
                     if field not in slot:
                         slot[field] = defaults_for_slot.get(field)
                 # Typ-Garantien
                 slot["max_tokens"] = int(slot.get("max_tokens", 65536))
                 slot["timeout_seconds"] = float(slot.get("timeout_seconds", 180))
-                slot["read_timeout_seconds"] = float(slot.get("read_timeout_seconds", slot.get("timeout_seconds", 180)))
                 slot["use_max_completion_tokens"] = bool(slot.get("use_max_completion_tokens", False))
                 slot["is_vision"] = bool(slot.get("is_vision", False))
     # local bleibt Single-Dict (kann aber auch schon Array sein → normalisieren)
@@ -330,6 +330,8 @@ def _normalize_model_categories(cfg: Dict[str, Any]) -> None:
         loc.setdefault("max_tokens", 65536)
         loc.setdefault("timeout_seconds", 300)
         loc.setdefault("read_timeout_seconds", 120)
+        loc.setdefault("retry_on_timeout", 2)
+        loc.setdefault("retry_delay_seconds", 5)
         loc.setdefault("use_max_completion_tokens", False)
         loc.setdefault("is_vision", False)
 
@@ -569,6 +571,15 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
             <label>Read-Timeout (Sekunden)</label>
             <input type="number" id="local_read_timeout_seconds" min="10" max="3600">
             <div class="hint">Max. Wartezeit auf Antwort-Daten. Bei Haengern: hier niedriger setzen.</div>
+          </div>
+          <div class="form-group">
+            <label>Auto-Retries bei Timeout</label>
+            <input type="number" id="local_retry_on_timeout" min="0" max="10">
+            <div class="hint">Wie oft automatisch erneut versucht wird (0=aus).</div>
+          </div>
+          <div class="form-group">
+            <label>Retry-Verzoegerung (s)</label>
+            <input type="number" id="local_retry_delay_seconds" min="1" max="120">
           </div>
         </div>
         <div class="toggle-row">
@@ -1165,6 +1176,10 @@ async function loadConfig() {
         document.getElementById(key + '_timeout_seconds').value = c.timeout_seconds || 180;
         const rtEl = document.getElementById(key + '_read_timeout_seconds');
         if (rtEl) rtEl.value = c.read_timeout_seconds || c.timeout_seconds || 120;
+        const retryEl = document.getElementById(key + '_retry_on_timeout');
+        if (retryEl) retryEl.value = c.retry_on_timeout != null ? c.retry_on_timeout : 2;
+        const retryDelayEl = document.getElementById(key + '_retry_delay_seconds');
+        if (retryDelayEl) retryDelayEl.value = c.retry_delay_seconds || 5;
         document.getElementById(key + '_use_max_completion_tokens').checked = !!c.use_max_completion_tokens;
         document.getElementById(key + '_is_vision').checked = !!c.is_vision;
         const labelEl = document.getElementById(key + '_label_1');
@@ -1216,6 +1231,8 @@ async function saveConfig() {
         label: document.getElementById(key + '_label_1')?.value || key,
         api_url: document.getElementById(key + '_api_url').value,
         api_key: document.getElementById(key + '_api_key').value,
+        retry_on_timeout: parseInt(document.getElementById(key + '_retry_on_timeout')?.value) || 0,
+        retry_delay_seconds: parseFloat(document.getElementById(key + '_retry_delay_seconds')?.value) || 5,
         model_name: document.getElementById(key + '_model_name').value,
         max_tokens: parseInt(document.getElementById(key + '_max_tokens').value) || 65536,
         timeout_seconds: parseFloat(document.getElementById(key + '_timeout_seconds').value) || 180,
