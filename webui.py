@@ -239,6 +239,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "tool_result_cap": 0,
         "read_loop_threshold": 3,
         "read_loop_intervention": "",
+        "read_loop_file_threshold": 8,
+        "read_loop_file_window": 12,
+        "read_loop_file_intervention": "",
     },
 }
 

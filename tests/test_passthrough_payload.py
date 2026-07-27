@@ -482,7 +482,7 @@ def test_detect_read_loop_below_threshold():
     old_threshold = proxy.READ_LOOP_THRESHOLD
     proxy.READ_LOOP_THRESHOLD = 3
     try:
-        result = proxy._detect_read_loop_inplace(msgs)
+        result = proxy._detect_read_loop_inplace(msgs, category="local")
         assert result is False
         assert len(msgs) == 7  # keine Intervention, 7 Messages unveraendert
     finally:
@@ -505,13 +505,33 @@ def test_detect_read_loop_triggers():
     old_threshold = proxy.READ_LOOP_THRESHOLD
     proxy.READ_LOOP_THRESHOLD = 3
     try:
-        result = proxy._detect_read_loop_inplace(msgs)
+        result = proxy._detect_read_loop_inplace(msgs, category="local")
         assert result is True
         assert len(msgs) == 10  # +1 Intervention
         last = msgs[-1]
         assert last["role"] == "user"
-        assert "STOP LOOPING" in last["content"]
+        assert "STOP" in last["content"]
         assert "4" in last["content"]
+    finally:
+        proxy.READ_LOOP_THRESHOLD = old_threshold
+
+
+def test_detect_read_loop_cloud_model_ignored():
+    """Cloud-Modelle (light/strong/vision) → keine Detection."""
+    msgs = [
+        _make_read_msg("/a.py", 1, 10),
+        _make_read_msg("/a.py", 1, 10),
+        _make_read_msg("/a.py", 1, 10),
+        _make_read_msg("/a.py", 1, 10),
+        _make_read_msg("/a.py", 1, 10),
+    ]
+    old_threshold = proxy.READ_LOOP_THRESHOLD
+    proxy.READ_LOOP_THRESHOLD = 3
+    try:
+        assert proxy._detect_read_loop_inplace(msgs, category="light") is False
+        assert proxy._detect_read_loop_inplace(msgs, category="strong") is False
+        assert proxy._detect_read_loop_inplace(msgs, category="vision") is False
+        assert proxy._detect_read_loop_inplace(msgs, category="") is False
     finally:
         proxy.READ_LOOP_THRESHOLD = old_threshold
 
@@ -528,13 +548,13 @@ def test_detect_read_loop_different_files_no_trigger():
     old_threshold = proxy.READ_LOOP_THRESHOLD
     proxy.READ_LOOP_THRESHOLD = 3
     try:
-        assert proxy._detect_read_loop_inplace(msgs) is False
+        assert proxy._detect_read_loop_inplace(msgs, category="local") is False
     finally:
         proxy.READ_LOOP_THRESHOLD = old_threshold
 
 
 def test_detect_read_loop_different_lines_no_trigger():
-    """Gleiche Datei aber andere Zeilen → kein Loop."""
+    """Gleiche Datei aber andere Zeilen → kein exact Loop (aber file-crawl pruefen)."""
     msgs = [
         _make_read_msg("/a.py", 1, 10),
         _make_read_msg("/a.py", 11, 20),
@@ -542,11 +562,14 @@ def test_detect_read_loop_different_lines_no_trigger():
         _make_read_msg("/a.py", 31, 40),
     ]
     old_threshold = proxy.READ_LOOP_THRESHOLD
+    old_file_threshold = proxy.READ_LOOP_FILE_THRESHOLD
     proxy.READ_LOOP_THRESHOLD = 3
+    proxy.READ_LOOP_FILE_THRESHOLD = 8
     try:
-        assert proxy._detect_read_loop_inplace(msgs) is False
+        assert proxy._detect_read_loop_inplace(msgs, category="local") is False
     finally:
         proxy.READ_LOOP_THRESHOLD = old_threshold
+        proxy.READ_LOOP_FILE_THRESHOLD = old_file_threshold
 
 
 def test_detect_read_loop_disabled():
@@ -561,7 +584,7 @@ def test_detect_read_loop_disabled():
     old_threshold = proxy.READ_LOOP_THRESHOLD
     proxy.READ_LOOP_THRESHOLD = 0
     try:
-        assert proxy._detect_read_loop_inplace(msgs) is False
+        assert proxy._detect_read_loop_inplace(msgs, category="local") is False
     finally:
         proxy.READ_LOOP_THRESHOLD = old_threshold
 
@@ -576,9 +599,58 @@ def test_detect_read_loop_interrupted_sequence():
         _make_read_msg("/a.py", 1, 10),
     ]
     old_threshold = proxy.READ_LOOP_THRESHOLD
+    old_file_threshold = proxy.READ_LOOP_FILE_THRESHOLD
     proxy.READ_LOOP_THRESHOLD = 3
+    proxy.READ_LOOP_FILE_THRESHOLD = 8
     try:
-        # max consecutive = 2, nicht > 3
-        assert proxy._detect_read_loop_inplace(msgs) is False
+        # max consecutive = 2, nicht > 3; file-crawl: 4x /a.py in 5, nicht > 8
+        assert proxy._detect_read_loop_inplace(msgs, category="local") is False
     finally:
         proxy.READ_LOOP_THRESHOLD = old_threshold
+        proxy.READ_LOOP_FILE_THRESHOLD = old_file_threshold
+
+
+def test_detect_file_crawl_triggers():
+    """Gleiche Datei mit verschiedenen Zeilen >N mal im Fenster → file-crawl Intervention."""
+    # 9 Reads der gleichen Datei mit verschiedenen Zeilen im Fenster von 12
+    msgs = []
+    for i in range(9):
+        msgs.append(_make_read_msg("/big.tsx", i * 100 + 1, (i + 1) * 100))
+        msgs.append({"role": "tool", "content": "content"})
+    old_threshold = proxy.READ_LOOP_THRESHOLD
+    old_file_threshold = proxy.READ_LOOP_FILE_THRESHOLD
+    old_file_window = proxy.READ_LOOP_FILE_WINDOW
+    proxy.READ_LOOP_THRESHOLD = 3
+    proxy.READ_LOOP_FILE_THRESHOLD = 8
+    proxy.READ_LOOP_FILE_WINDOW = 12
+    try:
+        result = proxy._detect_read_loop_inplace(msgs, category="local")
+        assert result is True
+        last = msgs[-1]
+        assert last["role"] == "user"
+        assert "crawling" in last["content"]
+        assert "/big.tsx" in last["content"]
+    finally:
+        proxy.READ_LOOP_THRESHOLD = old_threshold
+        proxy.READ_LOOP_FILE_THRESHOLD = old_file_threshold
+        proxy.READ_LOOP_FILE_WINDOW = old_file_window
+
+
+def test_detect_file_crawl_below_threshold():
+    """7 Reads der gleichen Datei im Fenster → kein file-crawl (threshold=8)."""
+    msgs = []
+    for i in range(7):
+        msgs.append(_make_read_msg("/big.tsx", i * 100 + 1, (i + 1) * 100))
+        msgs.append({"role": "tool", "content": "content"})
+    old_threshold = proxy.READ_LOOP_THRESHOLD
+    old_file_threshold = proxy.READ_LOOP_FILE_THRESHOLD
+    old_file_window = proxy.READ_LOOP_FILE_WINDOW
+    proxy.READ_LOOP_THRESHOLD = 3
+    proxy.READ_LOOP_FILE_THRESHOLD = 8
+    proxy.READ_LOOP_FILE_WINDOW = 12
+    try:
+        assert proxy._detect_read_loop_inplace(msgs, category="local") is False
+    finally:
+        proxy.READ_LOOP_THRESHOLD = old_threshold
+        proxy.READ_LOOP_FILE_THRESHOLD = old_file_threshold
+        proxy.READ_LOOP_FILE_WINDOW = old_file_window

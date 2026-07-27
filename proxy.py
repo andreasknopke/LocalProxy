@@ -299,17 +299,25 @@ HINDSIGHT_DIR: Path = Path(os.getenv("HINDSIGHT_DIR", "./data/.hindsight_memory"
 # ── Tool-Result-Capping ────────────────────────────────────────────────────
 TOOL_RESULT_CAP: int = int(os.getenv("TOOL_RESULT_CAP", "0"))
 
-# ── Read-Loop-Detection ─────────────────────────────────────────────────────
+# ── Read-Loop-Detection (NUR lokales Modell) ───────────────────────────────
 # Erkennt wenn ein Modell dieselbe Datei mit denselben Zeilen >N mal liest
 # und injiziert eine Interventions-Message.
 READ_LOOP_THRESHOLD: int = int(os.getenv("READ_LOOP_THRESHOLD", "3"))
+# File-Crawl-Detection: gleiche Datei >N mal in den letzten M Reads (auch verschiedene Zeilen)
+READ_LOOP_FILE_THRESHOLD: int = int(os.getenv("READ_LOOP_FILE_THRESHOLD", "8"))
+READ_LOOP_FILE_WINDOW: int = int(os.getenv("READ_LOOP_FILE_WINDOW", "12"))
 READ_LOOP_INTERVENTION: str = os.getenv(
     "READ_LOOP_INTERVENTION",
-    "STOP LOOPING! You have read the same file with the same line range more than "
-    "{count} times consecutively. This is a read loop. Stop reading and proceed "
-    "with your task using the information you already have. If you need different "
-    "information, read a DIFFERENT file or DIFFERENT lines. Do NOT repeat the same "
-    "read_file call again."
+    "STOP! You are looping. You have already read this file/range {count} times. "
+    "You have all the information you need. STOP READING NOW and proceed with the "
+    "next step of your task (edit, build, run, or respond). Do NOT issue another "
+    "read_file call for this file. Go on."
+)
+READ_LOOP_FILE_INTERVENTION: str = os.getenv(
+    "READ_LOOP_FILE_INTERVENTION",
+    "STOP! You are crawling file '{file}' — {count} reads in the last {window} tool calls. "
+    "You already have the full content. STOP READING and proceed with your task "
+    "(edit, build, run, or respond). Do NOT read '{file}' again. Go on."
 )
 
 
@@ -451,11 +459,17 @@ def _apply_config_file() -> None:
     TOOL_RESULT_CAP = int(cfg.get("tokens", {}).get("tool_result_cap", TOOL_RESULT_CAP))
 
     global READ_LOOP_THRESHOLD, READ_LOOP_INTERVENTION
+    global READ_LOOP_FILE_THRESHOLD, READ_LOOP_FILE_WINDOW, READ_LOOP_FILE_INTERVENTION
     tokens_cfg = cfg.get("tokens", {})
     READ_LOOP_THRESHOLD = int(tokens_cfg.get("read_loop_threshold", READ_LOOP_THRESHOLD))
+    READ_LOOP_FILE_THRESHOLD = int(tokens_cfg.get("read_loop_file_threshold", READ_LOOP_FILE_THRESHOLD))
+    READ_LOOP_FILE_WINDOW = int(tokens_cfg.get("read_loop_file_window", READ_LOOP_FILE_WINDOW))
     rl_intervention = tokens_cfg.get("read_loop_intervention", "")
     if rl_intervention:
         READ_LOOP_INTERVENTION = str(rl_intervention)
+    rl_file_intervention = tokens_cfg.get("read_loop_file_intervention", "")
+    if rl_file_intervention:
+        READ_LOOP_FILE_INTERVENTION = str(rl_file_intervention)
 
     _log("Config aus config.json neu geladen")
 
@@ -997,11 +1011,20 @@ def _extract_read_signature(args_raw: Any) -> Optional[str]:
 _READ_FILE_TOOL_NAMES = {"read_file", "readFile", "read_lines", "readLines"}
 
 
-def _detect_read_loop_inplace(messages: List[Dict[str, Any]], label: str = "Payload") -> bool:
+def _detect_read_loop_inplace(messages: List[Dict[str, Any]], label: str = "Payload",
+                              category: str = "") -> bool:
     """Erkennt Read-Loops: gleiche Datei + gleiche Zeilen >N mal hintereinander.
+    NUR fuer lokale Modelle (category='local'). Cloud-Modelle werden nicht beeinflusst.
     Injiziert eine Interventions-User-Message wenn ein Loop erkannt wird.
     Gibt True zurueck wenn eine Intervention injiziert wurde.
+
+    Zwei Detection-Modi:
+      1. Exact-Loop: identische Signaturen (file+lines) >READ_LOOP_THRESHOLD konsekutiv
+      2. File-Crawl: gleiche Datei (verschiedene Zeilen) >READ_LOOP_FILE_THRESHOLD mal
+         in den letzten READ_LOOP_FILE_WINDOW Reads
     """
+    if category != "local":
+        return False
     if READ_LOOP_THRESHOLD <= 0:
         return False
 
@@ -1033,7 +1056,7 @@ def _detect_read_loop_inplace(messages: List[Dict[str, Any]], label: str = "Payl
     if not read_signatures:
         return False
 
-    # Zaehle aufeinanderfolgende identische Signaturen
+    # ── Modus 1: Exact-Loop (gleiche Datei + gleiche Zeilen konsekutiv) ──
     max_consecutive = 1
     current_count = 1
     current_sig = read_signatures[0]
@@ -1046,18 +1069,34 @@ def _detect_read_loop_inplace(messages: List[Dict[str, Any]], label: str = "Payl
         if current_count > max_consecutive:
             max_consecutive = current_count
 
-    if max_consecutive <= READ_LOOP_THRESHOLD:
-        return False
+    if max_consecutive > READ_LOOP_THRESHOLD:
+        intervention_text = READ_LOOP_INTERVENTION.format(count=max_consecutive)
+        messages.append({"role": "user", "content": intervention_text})
+        _log(f"{label}: READ-LOOP (exact) erkannt ({max_consecutive}x gleiche read_file-Parameter), "
+             f"Intervention injiziert")
+        return True
 
-    # Intervention injizieren
-    intervention_text = READ_LOOP_INTERVENTION.format(count=max_consecutive)
-    messages.append({
-        "role": "user",
-        "content": intervention_text,
-    })
-    _log(f"{label}: READ-LOOP erkannt ({max_consecutive}x gleiche read_file-Parameter), "
-         f"Intervention injiziert")
-    return True
+    # ── Modus 2: File-Crawl (gleiche Datei, verschiedene Zeilen, gehaeuft) ──
+    if READ_LOOP_FILE_THRESHOLD > 0 and READ_LOOP_FILE_WINDOW > 0:
+        # Betrachte die letzten N read_file-Signaturen
+        window = read_signatures[-READ_LOOP_FILE_WINDOW:]
+        # Extrahiere nur den Dateipfad (Teil vor dem ersten |)
+        file_counts: Dict[str, int] = {}
+        for sig in window:
+            file_part = sig.split("|", 1)[0]
+            file_counts[file_part] = file_counts.get(file_part, 0) + 1
+
+        for file_path, count in file_counts.items():
+            if count > READ_LOOP_FILE_THRESHOLD:
+                intervention_text = READ_LOOP_FILE_INTERVENTION.format(
+                    file=file_path, count=count, window=READ_LOOP_FILE_WINDOW
+                )
+                messages.append({"role": "user", "content": intervention_text})
+                _log(f"{label}: READ-LOOP (file-crawl) erkannt ({count}x '{file_path}' "
+                     f"in letzten {len(window)} reads), Intervention injiziert")
+                return True
+
+    return False
 
 
 def _sanitize_image_urls_inplace(messages: List[Dict[str, Any]], label: str = "Payload") -> int:
@@ -1224,7 +1263,7 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
 
     _cut_tool_results_inplace(messages, "Passthrough", TOOL_RESULT_CAP)
 
-    _detect_read_loop_inplace(messages, "Passthrough")
+    _detect_read_loop_inplace(messages, "Passthrough", category=category)
 
     if not cat.get("is_vision", False):
         _sanitize_image_urls_inplace(messages, "Passthrough")
