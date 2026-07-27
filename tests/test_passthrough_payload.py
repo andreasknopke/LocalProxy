@@ -422,3 +422,163 @@ def test_cooldown_roundtrip():
     if proxy.COOLDOWN_FILE.exists():
         proxy.COOLDOWN_FILE.unlink()
     assert not proxy._is_in_cooldown("light", 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Read-Loop-Detection
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _make_read_msg(file_path: str, start: int, end: int) -> Dict[str, Any]:
+    """Erzeugt eine assistant-Message mit read_file tool_call."""
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_test",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": json.dumps({
+                    "filePath": file_path, "startLine": start, "endLine": end
+                }),
+            },
+        }],
+    }
+
+
+def test_extract_read_signature_basic():
+    args = json.dumps({"filePath": "/a/b.py", "startLine": 1, "endLine": 10})
+    sig = proxy._extract_read_signature(args)
+    assert sig == "/a/b.py|1|10"
+
+
+def test_extract_read_signature_dict():
+    sig = proxy._extract_read_signature({"filePath": "/x.py", "startLine": 5, "endLine": 20})
+    assert sig == "/x.py|5|20"
+
+
+def test_extract_read_signature_no_file():
+    assert proxy._extract_read_signature({"startLine": 1}) is None
+    assert proxy._extract_read_signature("not json") is None
+    assert proxy._extract_read_signature(None) is None
+
+
+def test_extract_read_signature_missing_lines():
+    sig = proxy._extract_read_signature({"filePath": "/f.py"})
+    assert sig == "/f.py||"
+
+
+def test_detect_read_loop_below_threshold():
+    """3 identische Reads bei Threshold=3 → keine Intervention (erst >3)."""
+    msgs = [
+        {"role": "user", "content": "read it"},
+        _make_read_msg("/a.py", 1, 10),
+        {"role": "tool", "content": "file content"},
+        _make_read_msg("/a.py", 1, 10),
+        {"role": "tool", "content": "file content"},
+        _make_read_msg("/a.py", 1, 10),
+        {"role": "tool", "content": "file content"},
+    ]
+    old_threshold = proxy.READ_LOOP_THRESHOLD
+    proxy.READ_LOOP_THRESHOLD = 3
+    try:
+        result = proxy._detect_read_loop_inplace(msgs)
+        assert result is False
+        assert len(msgs) == 7  # keine Intervention, 7 Messages unveraendert
+    finally:
+        proxy.READ_LOOP_THRESHOLD = old_threshold
+
+
+def test_detect_read_loop_triggers():
+    """4 identische Reads bei Threshold=3 → Intervention wird injiziert."""
+    msgs = [
+        {"role": "user", "content": "read it"},
+        _make_read_msg("/a.py", 1, 10),
+        {"role": "tool", "content": "c"},
+        _make_read_msg("/a.py", 1, 10),
+        {"role": "tool", "content": "c"},
+        _make_read_msg("/a.py", 1, 10),
+        {"role": "tool", "content": "c"},
+        _make_read_msg("/a.py", 1, 10),
+        {"role": "tool", "content": "c"},
+    ]
+    old_threshold = proxy.READ_LOOP_THRESHOLD
+    proxy.READ_LOOP_THRESHOLD = 3
+    try:
+        result = proxy._detect_read_loop_inplace(msgs)
+        assert result is True
+        assert len(msgs) == 10  # +1 Intervention
+        last = msgs[-1]
+        assert last["role"] == "user"
+        assert "STOP LOOPING" in last["content"]
+        assert "4" in last["content"]
+    finally:
+        proxy.READ_LOOP_THRESHOLD = old_threshold
+
+
+def test_detect_read_loop_different_files_no_trigger():
+    """Unterschiedliche Dateien → kein Loop."""
+    msgs = [
+        _make_read_msg("/a.py", 1, 10),
+        _make_read_msg("/b.py", 1, 10),
+        _make_read_msg("/c.py", 1, 10),
+        _make_read_msg("/d.py", 1, 10),
+        _make_read_msg("/e.py", 1, 10),
+    ]
+    old_threshold = proxy.READ_LOOP_THRESHOLD
+    proxy.READ_LOOP_THRESHOLD = 3
+    try:
+        assert proxy._detect_read_loop_inplace(msgs) is False
+    finally:
+        proxy.READ_LOOP_THRESHOLD = old_threshold
+
+
+def test_detect_read_loop_different_lines_no_trigger():
+    """Gleiche Datei aber andere Zeilen → kein Loop."""
+    msgs = [
+        _make_read_msg("/a.py", 1, 10),
+        _make_read_msg("/a.py", 11, 20),
+        _make_read_msg("/a.py", 21, 30),
+        _make_read_msg("/a.py", 31, 40),
+    ]
+    old_threshold = proxy.READ_LOOP_THRESHOLD
+    proxy.READ_LOOP_THRESHOLD = 3
+    try:
+        assert proxy._detect_read_loop_inplace(msgs) is False
+    finally:
+        proxy.READ_LOOP_THRESHOLD = old_threshold
+
+
+def test_detect_read_loop_disabled():
+    """Threshold=0 → Detection deaktiviert."""
+    msgs = [
+        _make_read_msg("/a.py", 1, 10),
+        _make_read_msg("/a.py", 1, 10),
+        _make_read_msg("/a.py", 1, 10),
+        _make_read_msg("/a.py", 1, 10),
+        _make_read_msg("/a.py", 1, 10),
+    ]
+    old_threshold = proxy.READ_LOOP_THRESHOLD
+    proxy.READ_LOOP_THRESHOLD = 0
+    try:
+        assert proxy._detect_read_loop_inplace(msgs) is False
+    finally:
+        proxy.READ_LOOP_THRESHOLD = old_threshold
+
+
+def test_detect_read_loop_interrupted_sequence():
+    """Loop wird durch anderen Read unterbrochen → Zaehler reset."""
+    msgs = [
+        _make_read_msg("/a.py", 1, 10),
+        _make_read_msg("/a.py", 1, 10),
+        _make_read_msg("/b.py", 1, 10),  # Unterbrechung
+        _make_read_msg("/a.py", 1, 10),
+        _make_read_msg("/a.py", 1, 10),
+    ]
+    old_threshold = proxy.READ_LOOP_THRESHOLD
+    proxy.READ_LOOP_THRESHOLD = 3
+    try:
+        # max consecutive = 2, nicht > 3
+        assert proxy._detect_read_loop_inplace(msgs) is False
+    finally:
+        proxy.READ_LOOP_THRESHOLD = old_threshold

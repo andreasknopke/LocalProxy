@@ -299,6 +299,19 @@ HINDSIGHT_DIR: Path = Path(os.getenv("HINDSIGHT_DIR", "./data/.hindsight_memory"
 # ── Tool-Result-Capping ────────────────────────────────────────────────────
 TOOL_RESULT_CAP: int = int(os.getenv("TOOL_RESULT_CAP", "0"))
 
+# ── Read-Loop-Detection ─────────────────────────────────────────────────────
+# Erkennt wenn ein Modell dieselbe Datei mit denselben Zeilen >N mal liest
+# und injiziert eine Interventions-Message.
+READ_LOOP_THRESHOLD: int = int(os.getenv("READ_LOOP_THRESHOLD", "3"))
+READ_LOOP_INTERVENTION: str = os.getenv(
+    "READ_LOOP_INTERVENTION",
+    "STOP LOOPING! You have read the same file with the same line range more than "
+    "{count} times consecutively. This is a read loop. Stop reading and proceed "
+    "with your task using the information you already have. If you need different "
+    "information, read a DIFFERENT file or DIFFERENT lines. Do NOT repeat the same "
+    "read_file call again."
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Config aus config.json laden (nachdem Globals initialisiert sind)
@@ -436,6 +449,13 @@ def _apply_config_file() -> None:
 
     global TOOL_RESULT_CAP
     TOOL_RESULT_CAP = int(cfg.get("tokens", {}).get("tool_result_cap", TOOL_RESULT_CAP))
+
+    global READ_LOOP_THRESHOLD, READ_LOOP_INTERVENTION
+    tokens_cfg = cfg.get("tokens", {})
+    READ_LOOP_THRESHOLD = int(tokens_cfg.get("read_loop_threshold", READ_LOOP_THRESHOLD))
+    rl_intervention = tokens_cfg.get("read_loop_intervention", "")
+    if rl_intervention:
+        READ_LOOP_INTERVENTION = str(rl_intervention)
 
     _log("Config aus config.json neu geladen")
 
@@ -942,6 +962,104 @@ def _cut_tool_results_inplace(messages: List[Dict[str, Any]], label: str = "Payl
     return capped_count
 
 
+# ── Read-Loop-Detection ─────────────────────────────────────────────────────
+
+def _extract_read_signature(args_raw: Any) -> Optional[str]:
+    """Extrahiert eine stabile Signatur (filePath|startLine|endLine) aus read_file Arguments.
+    Gibt None zurueck wenn keine gueltige read_file-Signatur erkennbar ist.
+    """
+    try:
+        if isinstance(args_raw, str):
+            args = json.loads(args_raw)
+        elif isinstance(args_raw, dict):
+            args = args_raw
+        else:
+            return None
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+
+    if not isinstance(args, dict):
+        return None
+
+    file_path = str(args.get("filePath") or args.get("file_path") or args.get("path") or "").strip()
+    start_line = args.get("startLine") or args.get("start_line") or args.get("start")
+    end_line = args.get("endLine") or args.get("end_line") or args.get("end")
+
+    if not file_path:
+        return None
+
+    start_str = str(start_line).strip() if start_line is not None else ""
+    end_str = str(end_line).strip() if end_line is not None else ""
+
+    return f"{file_path}|{start_str}|{end_str}"
+
+
+_READ_FILE_TOOL_NAMES = {"read_file", "readFile", "read_lines", "readLines"}
+
+
+def _detect_read_loop_inplace(messages: List[Dict[str, Any]], label: str = "Payload") -> bool:
+    """Erkennt Read-Loops: gleiche Datei + gleiche Zeilen >N mal hintereinander.
+    Injiziert eine Interventions-User-Message wenn ein Loop erkannt wird.
+    Gibt True zurueck wenn eine Intervention injiziert wurde.
+    """
+    if READ_LOOP_THRESHOLD <= 0:
+        return False
+
+    # Extrahiere read_file Tool-Call-Signaturen aus assistant messages (chronologisch)
+    read_signatures: List[str] = []
+
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") != "assistant":
+            continue
+        tool_calls = m.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            func = tc.get("function") or {}
+            if not isinstance(func, dict):
+                continue
+            name = str(func.get("name", "")).strip()
+            if name not in _READ_FILE_TOOL_NAMES:
+                continue
+            args_raw = func.get("arguments", "")
+            sig = _extract_read_signature(args_raw)
+            if sig:
+                read_signatures.append(sig)
+
+    if not read_signatures:
+        return False
+
+    # Zaehle aufeinanderfolgende identische Signaturen
+    max_consecutive = 1
+    current_count = 1
+    current_sig = read_signatures[0]
+    for sig in read_signatures[1:]:
+        if sig == current_sig:
+            current_count += 1
+        else:
+            current_count = 1
+            current_sig = sig
+        if current_count > max_consecutive:
+            max_consecutive = current_count
+
+    if max_consecutive <= READ_LOOP_THRESHOLD:
+        return False
+
+    # Intervention injizieren
+    intervention_text = READ_LOOP_INTERVENTION.format(count=max_consecutive)
+    messages.append({
+        "role": "user",
+        "content": intervention_text,
+    })
+    _log(f"{label}: READ-LOOP erkannt ({max_consecutive}x gleiche read_file-Parameter), "
+         f"Intervention injiziert")
+    return True
+
+
 def _sanitize_image_urls_inplace(messages: List[Dict[str, Any]], label: str = "Payload") -> int:
     removed = 0
     for msg in messages:
@@ -1105,6 +1223,8 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
         payload["messages"] = messages
 
     _cut_tool_results_inplace(messages, "Passthrough", TOOL_RESULT_CAP)
+
+    _detect_read_loop_inplace(messages, "Passthrough")
 
     if not cat.get("is_vision", False):
         _sanitize_image_urls_inplace(messages, "Passthrough")

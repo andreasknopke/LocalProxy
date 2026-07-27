@@ -237,6 +237,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "tokens": {
         "tool_result_cap": 0,
+        "read_loop_threshold": 3,
+        "read_loop_intervention": "",
     },
 }
 
@@ -255,6 +257,8 @@ _ENV_TO_CONFIG: Dict[str, Tuple[str, str]] = {
     "HINDSIGHT_RETAIN_DELAY_SECONDS": ("hindsight", "retain_delay_seconds"),
     "HINDSIGHT_DIR": ("hindsight", "dir"),
     "TOOL_RESULT_CAP": ("tokens", "tool_result_cap"),
+    "READ_LOOP_THRESHOLD": ("tokens", "read_loop_threshold"),
+    "READ_LOOP_INTERVENTION": ("tokens", "read_loop_intervention"),
 }
 
 
@@ -1024,6 +1028,16 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
         <input type="number" id="tool_result_cap" min="0" max="1000000">
         <div class="hint">Kappt grosse grep/read-Ergebnisse auf dieses Limit. 0 = deaktiviert.</div>
       </div>
+      <div class="form-group">
+        <label>Read-Loop-Schwelle (0=aus)</label>
+        <input type="number" id="read_loop_threshold" min="0" max="100">
+        <div class="hint">Erkennt wiederholtes Lesen derselben Datei/Zeilen. Bei &gt;N Wiederholungen wird eine Intervention injiziert. 0 = deaktiviert.</div>
+      </div>
+      <div class="form-group">
+        <label>Read-Loop-Interventionstext (optional)</label>
+        <textarea id="read_loop_intervention" rows="3" placeholder="Leer = Standardtext verwenden. {count} wird durch Anzahl ersetzt."></textarea>
+        <div class="hint">Eigener Interventionstext. Platzhalter {count} = Anzahl der Wiederholungen.</div>
+      </div>
     </div>
   </section>
 
@@ -1164,6 +1178,8 @@ async function loadConfig() {
     // Tokens
     const tk = cfg.tokens || {};
     document.getElementById('tool_result_cap').value = tk.tool_result_cap || 0;
+    document.getElementById('read_loop_threshold').value = tk.read_loop_threshold != null ? tk.read_loop_threshold : 3;
+    document.getElementById('read_loop_intervention').value = tk.read_loop_intervention || '';
 
   } catch(e) {
     showToast('Fehler beim Laden: ' + e.message, 'error');
@@ -1231,6 +1247,8 @@ async function saveConfig() {
 
   cfg.tokens = {
     tool_result_cap: parseInt(document.getElementById('tool_result_cap').value) || 0,
+    read_loop_threshold: parseInt(document.getElementById('read_loop_threshold').value) || 0,
+    read_loop_intervention: document.getElementById('read_loop_intervention').value || '',
   };
 
   try {

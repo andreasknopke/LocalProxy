@@ -86,6 +86,10 @@ Refactore die Architektur --strong
   Moonshot-Parameter-Patch (temp=1.0, top_p=0.95, penalties=0) nur bei
   moonshot-ai URL.
 - **Tool-Result-Capping**: Verhindert Token-Bombing durch grosse grep/read-Results.
+- **Read-Loop-Detection**: Erkennt wenn ein Modell dieselbe Datei mit denselben
+  Zeilen >N mal hintereinander liest (Default: >3) und injiziert eine
+  Interventions-Message ("STOP LOOPING!..."). Konfigurierbar via `READ_LOOP_THRESHOLD`
+  und `READ_LOOP_INTERVENTION` (Env oder WebUI).
 - **WebUI**: Login-gesichertes Dashboard, 4 Modell-Karten mit Test-Endpunkt,
   Live-Config-Reload via `_apply_config_file()`.
 - **Debug-Endpoints**: `/debug/files`, `/debug/file/{id}`, `/debug/ring`,
