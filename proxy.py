@@ -126,6 +126,7 @@ _MODEL_CATEGORIES: Dict[str, Any] = {
         "use_max_completion_tokens": os.getenv("LOCAL_USE_MAX_COMPLETION_TOKENS", "false").lower() in {"1", "true", "yes", "y", "on"},
         "is_vision": os.getenv("LOCAL_IS_VISION", "false").lower() in {"1", "true", "yes", "y", "on"},
         "timeout_seconds": float(os.getenv("LOCAL_TIMEOUT_SECONDS", "300")),
+        "read_timeout_seconds": float(os.getenv("LOCAL_READ_TIMEOUT_SECONDS", "120")),
         "label": "local primary",
     },
     "light": [
@@ -352,7 +353,8 @@ def _apply_config_file() -> None:
                     # Memory hat Array, config sagt Dict → als 1-elementiges Array behandeln
                     merged: Dict[str, Any] = {}
                     for field in ("label", "api_url", "api_key", "model_name", "max_tokens",
-                                   "use_max_completion_tokens", "is_vision", "timeout_seconds"):
+                                   "use_max_completion_tokens", "is_vision", "timeout_seconds",
+                                   "read_timeout_seconds"):
                         if field in sc:
                             val = sc[field]
                             if field in ("api_url", "api_key") and isinstance(val, str) and val.strip() == "":
@@ -365,7 +367,7 @@ def _apply_config_file() -> None:
                             elif field == "is_vision":
                                 val = bool(val) if not isinstance(val, str) else \
                                     str(val).lower() in {"1", "true", "yes", "y", "on"}
-                            elif field == "timeout_seconds":
+                            elif field in ("timeout_seconds", "read_timeout_seconds"):
                                 val = float(val)
                             merged[field] = val
                     merged.setdefault("label", key)
@@ -373,7 +375,8 @@ def _apply_config_file() -> None:
                 else:
                     cat = _MODEL_CATEGORIES.setdefault(key, {})
                     for field in ("label", "api_url", "api_key", "model_name", "max_tokens",
-                                   "use_max_completion_tokens", "is_vision", "timeout_seconds"):
+                                   "use_max_completion_tokens", "is_vision", "timeout_seconds",
+                                   "read_timeout_seconds"):
                         if field in sc:
                             val = sc[field]
                             if field in ("api_url", "api_key") and isinstance(val, str) and val.strip() == "":
@@ -386,7 +389,7 @@ def _apply_config_file() -> None:
                             elif field == "is_vision":
                                 val = bool(val) if not isinstance(val, str) else \
                                     str(val).lower() in {"1", "true", "yes", "y", "on"}
-                            elif field == "timeout_seconds":
+                            elif field in ("timeout_seconds", "read_timeout_seconds"):
                                 val = float(val)
                             cat[field] = val
 
@@ -398,7 +401,8 @@ def _apply_config_file() -> None:
                         continue
                     element: Dict[str, Any] = {}
                     for field in ("label", "api_url", "api_key", "model_name", "max_tokens",
-                                   "use_max_completion_tokens", "is_vision", "timeout_seconds"):
+                                   "use_max_completion_tokens", "is_vision", "timeout_seconds",
+                                   "read_timeout_seconds"):
                         if field in d:
                             val = d[field]
                             if field in ("api_url", "api_key") and isinstance(val, str) and val.strip() == "":
@@ -411,7 +415,7 @@ def _apply_config_file() -> None:
                             elif field == "is_vision":
                                 val = (bool(val) if not isinstance(val, str) else
                                        str(val).lower() in {"1", "true", "yes", "y", "on"})
-                            elif field == "timeout_seconds":
+                            elif field in ("timeout_seconds", "read_timeout_seconds"):
                                 val = float(val)
                             element[field] = val
                     cleaned_list.append(element)
@@ -1318,12 +1322,13 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
     api_url = cat["api_url"].rstrip("/")
     api_key = cat.get("api_key", "")
     timeout = float(cat.get("timeout_seconds", 300))
+    read_timeout = float(cat.get("read_timeout_seconds", timeout))
 
     msg_count = len(messages) if isinstance(messages, list) else 0
     total_chars = sum(len(str(m.get("content", ""))) for m in (messages if isinstance(messages, list) else []))
     _log(f"Single-Model call cat={category}[{def_idx}] model={model} "
          f"api_key={_truncate_key(api_key)} "
-         f"messages={msg_count} chars={total_chars} timeout={timeout:.0f}s")
+         f"messages={msg_count} chars={total_chars} timeout={timeout:.0f}s read_timeout={read_timeout:.0f}s")
 
     req_id = f"model_{category}_{def_idx}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
     _dump_debug_payload(req_id, f"model_{category}_{def_idx}", payload, extra={
@@ -1342,9 +1347,10 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
     })
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        _http_timeout = httpx.Timeout(timeout, read=read_timeout)
+        async with httpx.AsyncClient(timeout=_http_timeout) as client:
             response = await client.post(
-                api_url, json=payload, headers=_api_headers(api_key), timeout=timeout,
+                api_url, json=payload, headers=_api_headers(api_key),
             )
         duration = time.perf_counter() - started
         _finish_active_call(req_id, "done", {"duration_seconds": duration})
@@ -1400,9 +1406,9 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
                     if val is not None:
                         payload_retry["max_completion_tokens"] = val
                     try:
-                        async with httpx.AsyncClient(timeout=timeout) as client:
+                        async with httpx.AsyncClient(timeout=_http_timeout) as client:
                             response2 = await client.post(
-                                api_url, json=payload_retry, headers=_api_headers(api_key), timeout=timeout,
+                                api_url, json=payload_retry, headers=_api_headers(api_key),
                             )
                         if response2.status_code == 200:
                             result = response2.json()
@@ -1434,9 +1440,9 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
                 payload_retry = copy.deepcopy(payload)
                 payload_retry.pop("reasoning_effort", None)
                 try:
-                    async with httpx.AsyncClient(timeout=timeout) as client:
+                    async with httpx.AsyncClient(timeout=_http_timeout) as client:
                         response2 = await client.post(
-                            api_url, json=payload_retry, headers=_api_headers(api_key), timeout=timeout,
+                            api_url, json=payload_retry, headers=_api_headers(api_key),
                         )
                     if response2.status_code == 200:
                         result = response2.json()
