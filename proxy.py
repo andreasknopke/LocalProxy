@@ -323,6 +323,20 @@ READ_LOOP_FILE_INTERVENTION: str = os.getenv(
     "(edit, build, run, or respond). Do NOT read '{file}' again. Go on."
 )
 
+# ── Search-Loop-Detection (NUR lokales Modell) ─────────────────────────────
+# Erkennt wenn ein Modell dieselbe Suche >N mal wiederholt und jedes Mal
+# "No matches found" zurueckkommt — das Modell haengt in einer Such-Schleife.
+SEARCH_LOOP_THRESHOLD: int = int(os.getenv("SEARCH_LOOP_THRESHOLD", "3"))
+SEARCH_LOOP_INTERVENTION: str = os.getenv(
+    "SEARCH_LOOP_INTERVENTION",
+    "STOP! You are looping on a search that returns no results. You have already "
+    "searched for '{query}' {count} times with NO MATCHES. The pattern does not "
+    "exist in this workspace or is excluded by ignore/exclude settings. "
+    "STOP SEARCHING for this pattern. Change your approach: try a different "
+    "search term, read the file directly, use a different tool, or proceed with "
+    "the information you already have. Do NOT repeat this search. Go on."
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Config aus config.json laden (nachdem Globals initialisiert sind)
@@ -479,6 +493,12 @@ def _apply_config_file() -> None:
     rl_file_intervention = tokens_cfg.get("read_loop_file_intervention", "")
     if rl_file_intervention:
         READ_LOOP_FILE_INTERVENTION = str(rl_file_intervention)
+
+    global SEARCH_LOOP_THRESHOLD, SEARCH_LOOP_INTERVENTION
+    SEARCH_LOOP_THRESHOLD = int(tokens_cfg.get("search_loop_threshold", SEARCH_LOOP_THRESHOLD))
+    sl_intervention = tokens_cfg.get("search_loop_intervention", "")
+    if sl_intervention:
+        SEARCH_LOOP_INTERVENTION = str(sl_intervention)
 
     _log("Config aus config.json neu geladen")
 
@@ -1108,6 +1128,151 @@ def _detect_read_loop_inplace(messages: List[Dict[str, Any]], label: str = "Payl
     return False
 
 
+# ── Search-Loop-Detection ──────────────────────────────────────────────────
+
+_SEARCH_TOOL_NAMES = {"grep_search", "grepSearch", "file_search", "fileSearch"}
+
+_NO_MATCHES_INDICATORS = (
+    "No matches found",
+    "no matches found",
+    "0 results",
+    "No files found",
+)
+
+
+def _extract_search_signature(args_raw: Any) -> Optional[str]:
+    """Extrahiert eine stabile Signatur (tool_name|query|includePattern) aus Search-Arguments.
+    Gibt None zurueck wenn keine gueltige Search-Signatur erkennbar ist.
+    """
+    try:
+        if isinstance(args_raw, str):
+            args = json.loads(args_raw)
+        elif isinstance(args_raw, dict):
+            args = args_raw
+        else:
+            return None
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+
+    if not isinstance(args, dict):
+        return None
+
+    query = str(args.get("query") or args.get("pattern") or "").strip()
+    if not query:
+        return None
+
+    include = str(args.get("includePattern") or args.get("include_pattern") or "").strip()
+    return f"{query}|{include}"
+
+
+def _extract_tool_result_text(msg: Dict[str, Any]) -> str:
+    """Extrahiert den Text-Inhalt einer Tool-Result-Message."""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(str(part.get("text", "")))
+        return "\n".join(parts)
+    return ""
+
+
+def _detect_search_loop_inplace(messages: List[Dict[str, Any]], label: str = "Payload",
+                                category: str = "") -> bool:
+    """Erkennt Search-Loops: gleiche Suche >N mal mit 'No matches found' als Ergebnis.
+    NUR fuer lokale Modelle (category='local'). Cloud-Modelle werden nicht beeinflusst.
+    Injiziert eine Interventions-User-Message wenn ein Loop erkannt wird.
+    Gibt True zurueck wenn eine Intervention injiziert wurde.
+
+    Logik:
+      - Durchlaufe alle Messages und sammle (search_signature, tool_call_id) Paare
+        aus assistant-Tool-Calls.
+      - Pruefe die zugehoerigen tool-Role-Messages auf 'No matches found'.
+      - Zaehle konsekutive gleiche Signaturen mit No-Match-Ergebnis.
+    """
+    if category != "local":
+        return False
+    if SEARCH_LOOP_THRESHOLD <= 0:
+        return False
+
+    # Schritt 1: Sammle alle Search-Tool-Calls mit ihrer ID und Signatur
+    search_calls: List[Tuple[str, str]] = []  # (tool_call_id, signature)
+
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") != "assistant":
+            continue
+        tool_calls = m.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            func = tc.get("function") or {}
+            if not isinstance(func, dict):
+                continue
+            name = str(func.get("name", "")).strip()
+            if name not in _SEARCH_TOOL_NAMES:
+                continue
+            args_raw = func.get("arguments", "")
+            sig = _extract_search_signature(args_raw)
+            if sig:
+                tc_id = str(tc.get("id", ""))
+                search_calls.append((tc_id, sig))
+
+    if not search_calls:
+        return False
+
+    # Schritt 2: Baue ein Mapping tool_call_id -> Ergebnis-Text
+    tool_results: Dict[str, str] = {}
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") != "tool":
+            continue
+        tc_id = str(m.get("tool_call_id", ""))
+        if tc_id:
+            tool_results[tc_id] = _extract_tool_result_text(m)
+
+    # Schritt 3: Zaehle konsekutive gleiche Signaturen mit No-Match
+    max_consecutive = 0
+    current_count = 0
+    current_sig = ""
+    worst_query = ""
+
+    for tc_id, sig in search_calls:
+        result_text = tool_results.get(tc_id, "")
+        is_no_match = any(indicator in result_text for indicator in _NO_MATCHES_INDICATORS)
+
+        if is_no_match:
+            if sig == current_sig:
+                current_count += 1
+            else:
+                current_count = 1
+                current_sig = sig
+            if current_count > max_consecutive:
+                max_consecutive = current_count
+                worst_query = sig.split("|", 1)[0]
+        else:
+            # Ergebnis vorhanden -> Zaehler zuruecksetzen
+            current_count = 0
+            current_sig = ""
+
+    if max_consecutive > SEARCH_LOOP_THRESHOLD:
+        intervention_text = SEARCH_LOOP_INTERVENTION.format(
+            query=worst_query[:120], count=max_consecutive
+        )
+        messages.append({"role": "user", "content": intervention_text})
+        _log(f"{label}: SEARCH-LOOP erkannt ({max_consecutive}x gleiche Suche '{worst_query[:80]}' "
+             f"mit 'No matches found'), Intervention injiziert")
+        return True
+
+    return False
+
+
 def _sanitize_image_urls_inplace(messages: List[Dict[str, Any]], label: str = "Payload") -> int:
     removed = 0
     for msg in messages:
@@ -1314,6 +1479,7 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
     _cut_tool_results_inplace(messages, "Passthrough", TOOL_RESULT_CAP)
 
     _detect_read_loop_inplace(messages, "Passthrough", category=category)
+    _detect_search_loop_inplace(messages, "Passthrough", category=category)
 
     if not cat.get("is_vision", False):
         _sanitize_image_urls_inplace(messages, "Passthrough")

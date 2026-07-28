@@ -691,21 +691,215 @@ def test_detect_file_crawl_triggers():
         proxy.READ_LOOP_FILE_WINDOW = old_file_window
 
 
-def test_detect_file_crawl_below_threshold():
-    """7 Reads der gleichen Datei im Fenster → kein file-crawl (threshold=8)."""
+# ═══════════════════════════════════════════════════════════════════════════
+# Search-Loop-Detection Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _make_search_msg(query: str, include_pattern: str = "", call_id: str = "call_s1") -> Dict[str, Any]:
+    """Erzeugt eine assistant-Message mit grep_search tool_call."""
+    args = {"query": query, "isRegexp": False}
+    if include_pattern:
+        args["includePattern"] = include_pattern
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": "grep_search",
+                "arguments": json.dumps(args),
+            },
+        }],
+    }
+
+
+def _make_search_result(call_id: str, text: str) -> Dict[str, Any]:
+    """Erzeugt eine tool-Result-Message."""
+    return {"role": "tool", "tool_call_id": call_id, "content": text}
+
+
+_NO_MATCH_TEXT = (
+    "No matches found. Your search pattern might be excluded completely by either "
+    "the search.exclude settings or .*ignore files."
+)
+
+
+def test_extract_search_signature_basic():
+    args = json.dumps({"query": "foo_bar", "isRegexp": False, "includePattern": "src/**"})
+    sig = proxy._extract_search_signature(args)
+    assert sig == "foo_bar|src/**"
+
+
+def test_extract_search_signature_dict():
+    sig = proxy._extract_search_signature({"query": "hello", "isRegexp": True})
+    assert sig == "hello|"
+
+
+def test_extract_search_signature_no_query():
+    assert proxy._extract_search_signature({"isRegexp": False}) is None
+    assert proxy._extract_search_signature("not json") is None
+    assert proxy._extract_search_signature(None) is None
+
+
+def test_detect_search_loop_triggers():
+    """4 identische Suchen mit No-Match bei Threshold=3 → Intervention."""
     msgs = []
-    for i in range(7):
-        msgs.append(_make_read_msg("/big.tsx", i * 100 + 1, (i + 1) * 100))
-        msgs.append({"role": "tool", "content": "content"})
-    old_threshold = proxy.READ_LOOP_THRESHOLD
-    old_file_threshold = proxy.READ_LOOP_FILE_THRESHOLD
-    old_file_window = proxy.READ_LOOP_FILE_WINDOW
-    proxy.READ_LOOP_THRESHOLD = 3
-    proxy.READ_LOOP_FILE_THRESHOLD = 8
-    proxy.READ_LOOP_FILE_WINDOW = 12
+    for i in range(4):
+        cid = f"call_{i}"
+        msgs.append(_make_search_msg("nonexistent_thing", call_id=cid))
+        msgs.append(_make_search_result(cid, _NO_MATCH_TEXT))
+
+    old_threshold = proxy.SEARCH_LOOP_THRESHOLD
+    proxy.SEARCH_LOOP_THRESHOLD = 3
     try:
-        assert proxy._detect_read_loop_inplace(msgs, category="local") is False
+        result = proxy._detect_search_loop_inplace(msgs, category="local")
+        assert result is True
+        assert len(msgs) == 9  # 8 + 1 Intervention
+        last = msgs[-1]
+        assert last["role"] == "user"
+        assert "STOP" in last["content"]
+        assert "nonexistent_thing" in last["content"]
+        assert "4" in last["content"]
     finally:
-        proxy.READ_LOOP_THRESHOLD = old_threshold
-        proxy.READ_LOOP_FILE_THRESHOLD = old_file_threshold
-        proxy.READ_LOOP_FILE_WINDOW = old_file_window
+        proxy.SEARCH_LOOP_THRESHOLD = old_threshold
+
+
+def test_detect_search_loop_below_threshold():
+    """3 identische Suchen bei Threshold=3 → keine Intervention (erst >3)."""
+    msgs = []
+    for i in range(3):
+        cid = f"call_{i}"
+        msgs.append(_make_search_msg("foo", call_id=cid))
+        msgs.append(_make_search_result(cid, _NO_MATCH_TEXT))
+
+    old_threshold = proxy.SEARCH_LOOP_THRESHOLD
+    proxy.SEARCH_LOOP_THRESHOLD = 3
+    try:
+        result = proxy._detect_search_loop_inplace(msgs, category="local")
+        assert result is False
+        assert len(msgs) == 6  # unveraendert
+    finally:
+        proxy.SEARCH_LOOP_THRESHOLD = old_threshold
+
+
+def test_detect_search_loop_cloud_model_ignored():
+    """Cloud-Modelle → keine Search-Loop-Detection."""
+    msgs = []
+    for i in range(5):
+        cid = f"call_{i}"
+        msgs.append(_make_search_msg("foo", call_id=cid))
+        msgs.append(_make_search_result(cid, _NO_MATCH_TEXT))
+
+    old_threshold = proxy.SEARCH_LOOP_THRESHOLD
+    proxy.SEARCH_LOOP_THRESHOLD = 3
+    try:
+        assert proxy._detect_search_loop_inplace(msgs, category="light") is False
+        assert proxy._detect_search_loop_inplace(msgs, category="strong") is False
+        assert proxy._detect_search_loop_inplace(msgs, category="") is False
+    finally:
+        proxy.SEARCH_LOOP_THRESHOLD = old_threshold
+
+
+def test_detect_search_loop_with_results_no_trigger():
+    """Suchen die Ergebnisse liefern → kein Loop, auch wenn wiederholt."""
+    msgs = []
+    for i in range(5):
+        cid = f"call_{i}"
+        msgs.append(_make_search_msg("foo", call_id=cid))
+        msgs.append(_make_search_result(cid, "Found 3 matches in 2 files."))
+
+    old_threshold = proxy.SEARCH_LOOP_THRESHOLD
+    proxy.SEARCH_LOOP_THRESHOLD = 3
+    try:
+        assert proxy._detect_search_loop_inplace(msgs, category="local") is False
+    finally:
+        proxy.SEARCH_LOOP_THRESHOLD = old_threshold
+
+
+def test_detect_search_loop_interrupted_by_success():
+    """No-Match-Loop wird durch erfolgreiche Suche unterbrochen → Zaehler reset."""
+    msgs = []
+    # 2x no match
+    msgs.append(_make_search_msg("foo", call_id="c0"))
+    msgs.append(_make_search_result("c0", _NO_MATCH_TEXT))
+    msgs.append(_make_search_msg("foo", call_id="c1"))
+    msgs.append(_make_search_result("c1", _NO_MATCH_TEXT))
+    # 1x success (unterbricht)
+    msgs.append(_make_search_msg("foo", call_id="c2"))
+    msgs.append(_make_search_result("c2", "Found 1 match."))
+    # 2x no match
+    msgs.append(_make_search_msg("foo", call_id="c3"))
+    msgs.append(_make_search_result("c3", _NO_MATCH_TEXT))
+    msgs.append(_make_search_msg("foo", call_id="c4"))
+    msgs.append(_make_search_result("c4", _NO_MATCH_TEXT))
+
+    old_threshold = proxy.SEARCH_LOOP_THRESHOLD
+    proxy.SEARCH_LOOP_THRESHOLD = 3
+    try:
+        # max consecutive = 2, nicht > 3
+        assert proxy._detect_search_loop_inplace(msgs, category="local") is False
+    finally:
+        proxy.SEARCH_LOOP_THRESHOLD = old_threshold
+
+
+def test_detect_search_loop_different_queries_no_trigger():
+    """Unterschiedliche Suchanfragen → kein Loop."""
+    msgs = []
+    for i, q in enumerate(["alpha", "beta", "gamma", "delta"]):
+        cid = f"call_{i}"
+        msgs.append(_make_search_msg(q, call_id=cid))
+        msgs.append(_make_search_result(cid, _NO_MATCH_TEXT))
+
+    old_threshold = proxy.SEARCH_LOOP_THRESHOLD
+    proxy.SEARCH_LOOP_THRESHOLD = 3
+    try:
+        assert proxy._detect_search_loop_inplace(msgs, category="local") is False
+    finally:
+        proxy.SEARCH_LOOP_THRESHOLD = old_threshold
+
+
+def test_detect_search_loop_disabled():
+    """Threshold=0 → Detection deaktiviert."""
+    msgs = []
+    for i in range(5):
+        cid = f"call_{i}"
+        msgs.append(_make_search_msg("foo", call_id=cid))
+        msgs.append(_make_search_result(cid, _NO_MATCH_TEXT))
+
+    old_threshold = proxy.SEARCH_LOOP_THRESHOLD
+    proxy.SEARCH_LOOP_THRESHOLD = 0
+    try:
+        assert proxy._detect_search_loop_inplace(msgs, category="local") is False
+    finally:
+        proxy.SEARCH_LOOP_THRESHOLD = old_threshold
+
+
+def test_detect_search_loop_file_search_tool():
+    """file_search Tool-Name wird ebenfalls erkannt."""
+    msgs = []
+    for i in range(4):
+        cid = f"call_{i}"
+        msgs.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": cid,
+                "type": "function",
+                "function": {
+                    "name": "file_search",
+                    "arguments": json.dumps({"query": "**/missing.ts"}),
+                },
+            }],
+        })
+        msgs.append(_make_search_result(cid, "No files found matching pattern."))
+
+    old_threshold = proxy.SEARCH_LOOP_THRESHOLD
+    proxy.SEARCH_LOOP_THRESHOLD = 3
+    try:
+        result = proxy._detect_search_loop_inplace(msgs, category="local")
+        assert result is True
+        last = msgs[-1]
+        assert "STOP" in last["content"]
+    finally:
+        proxy.SEARCH_LOOP_THRESHOLD = old_threshold
