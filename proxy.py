@@ -1197,6 +1197,47 @@ def _patch_reasoning_effort_payload(payload: Dict[str, Any], cat: Dict[str, Any]
         _log(f"reasoning_effort='{old_val}' entfernt fuer Model '{model_name}' (tools + reasoning_effort inkompatibel)")
 
 
+# Regex fuer Modelle, die eine Reasoning-Reduktions-Injektion benoetigen
+_MODEL_REASONING_INJECTION_RE = re.compile(
+    r'Laguna', re.IGNORECASE
+)
+_REASONING_INJECTION_TEXT = "\n\nMandatory: Reduce reasoning to max 50 words!"
+
+
+def _patch_reasoning_injection_payload(payload: Dict[str, Any], cat: Dict[str, Any]) -> None:
+    """Injiziert eine Reasoning-Reduktions-Anweisung am ENDE der letzten User-Message,
+    wenn das Modell dies benoetigt (z.B. poolside/Laguna-S-2.1-NVFP4).
+    Die Injektion erfolgt NACH dem Flag-Stripping, sodass --local nicht korrumpiert wird.
+    Position: direkt vor dem (bereits entfernten) Flag = Ende der User-Message.
+    """
+    model_name = str(cat.get("model_name", payload.get("model", "")))
+    if not _MODEL_REASONING_INJECTION_RE.search(model_name):
+        return
+    messages = payload.get("messages", [])
+    if not isinstance(messages, list):
+        return
+    # Letzte User-Message finden und Injektion anhaengen
+    for msg in reversed(messages):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            msg["content"] = content + _REASONING_INJECTION_TEXT
+            _log(f"Reasoning-Injektion angehaengt fuer Model '{model_name}'")
+            return
+        elif isinstance(content, list):
+            # Multimodal: an den letzten Text-Block anhaengen
+            for block in reversed(content):
+                if isinstance(block, dict) and block.get("type") == "text":
+                    block["text"] = block.get("text", "") + _REASONING_INJECTION_TEXT
+                    _log(f"Reasoning-Injektion angehaengt (multimodal) fuer Model '{model_name}'")
+                    return
+            # Kein Text-Block vorhanden: neuen anhaengen
+            content.append({"type": "text", "text": _REASONING_INJECTION_TEXT.strip()})
+            _log(f"Reasoning-Injektion als neuer Text-Block fuer Model '{model_name}'")
+            return
+
+
 def _patch_moonshot_payload(payload: Dict[str, Any], api_url: str) -> None:
     """Erzwingt Moonshot-kompatible Parameter — NUR wenn api_url moonshot-ai enthaelt."""
     url_lower = api_url.lower()
@@ -1280,6 +1321,7 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
     _patch_moonshot_payload(payload, cat.get("api_url", ""))
     _patch_max_tokens_payload(payload, cat)
     _patch_reasoning_effort_payload(payload, cat)
+    _patch_reasoning_injection_payload(payload, cat)
 
     return _clean_payload(payload, keep_tools=True)
 

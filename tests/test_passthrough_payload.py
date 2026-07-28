@@ -217,6 +217,61 @@ def test_moonshot_patch_skips_non_moonshot():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 3b. Reasoning-Injektion (Laguna)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_reasoning_injection_laguna_string_content():
+    """Injektion wird an das Ende der letzten User-Message angehaengt."""
+    payload = {"messages": [
+        {"role": "system", "content": "you are helpful"},
+        {"role": "user", "content": "Erklaere mir Python"},
+    ]}
+    cat = {"model_name": "poolside/Laguna-S-2.1-NVFP4"}
+    proxy._patch_reasoning_injection_payload(payload, cat)
+    assert payload["messages"][1]["content"].endswith("Mandatory: Reduce reasoning to max 50 words!")
+    # System-Message bleibt unveraendert
+    assert payload["messages"][0]["content"] == "you are helpful"
+
+
+def test_reasoning_injection_laguna_multimodal():
+    """Injektion wird an den letzten Text-Block einer Multimodal-Message angehaengt."""
+    payload = {"messages": [
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:..."}},
+            {"type": "text", "text": "describe this"},
+        ]},
+    ]}
+    cat = {"model_name": "poolside/Laguna-S-2.1-NVFP4"}
+    proxy._patch_reasoning_injection_payload(payload, cat)
+    text_block = payload["messages"][0]["content"][1]
+    assert text_block["text"].endswith("Mandatory: Reduce reasoning to max 50 words!")
+
+
+def test_reasoning_injection_skips_non_laguna():
+    """Keine Injektion fuer Modelle die nicht Laguna sind."""
+    payload = {"messages": [{"role": "user", "content": "hello"}]}
+    cat = {"model_name": "Qwen/Qwen3-Next-80B"}
+    proxy._patch_reasoning_injection_payload(payload, cat)
+    assert payload["messages"][0]["content"] == "hello"
+
+
+def test_reasoning_injection_flag_not_corrupted():
+    """Flag-Extraktion funktioniert weiterhin, Injektion kommt erst danach."""
+    # Simuliere den vollen Ablauf: Flag extrahieren, strippen, dann Injektion
+    text = "Erklaere mir Python --local"
+    cleaned, cat_flag, slot = proxy._extract_model_flag(text)
+    assert cat_flag == "local"
+    assert "--local" not in cleaned
+    # Jetzt Payload bauen und Injektion anwenden
+    payload = {"messages": [{"role": "user", "content": cleaned}]}
+    cat = {"model_name": "poolside/Laguna-S-2.1-NVFP4"}
+    proxy._patch_reasoning_injection_payload(payload, cat)
+    final = payload["messages"][0]["content"]
+    assert "--local" not in final  # Flag wurde vorher entfernt
+    assert final.endswith("Mandatory: Reduce reasoning to max 50 words!")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 4. Tool-Call-Normalisierung
 # ═══════════════════════════════════════════════════════════════════════════
 
