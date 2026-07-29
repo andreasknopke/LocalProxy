@@ -699,7 +699,9 @@ def test_extract_search_signature_dict():
 
 
 def test_extract_search_signature_no_query():
-    assert proxy._extract_search_signature({"isRegexp": False}) is None
+    """Ohne query-Feld: faellt auf universelle Signatur zurueck (nicht None)."""
+    sig = proxy._extract_search_signature({"isRegexp": False})
+    assert sig is not None  # universelle Signatur: "isRegexp=False"
     assert proxy._extract_search_signature("not json") is None
     assert proxy._extract_search_signature(None) is None
 
