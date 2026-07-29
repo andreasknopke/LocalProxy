@@ -1045,3 +1045,228 @@ def test_detect_search_loop_file_search_tool():
         assert "STOP" in last["content"]
     finally:
         proxy.SEARCH_LOOP_THRESHOLD = old_threshold
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Generic-Tool-Loop-Detection Tests (z.B. manage_todo_list)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _make_generic_tool_msg(tool_name: str, args: Dict[str, Any],
+                            call_id: str = "call_g1") -> Dict[str, Any]:
+    """Erzeugt eine assistant-Message mit beliebigem tool_call."""
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "arguments": json.dumps(args),
+            },
+        }],
+    }
+
+
+_TODO_ARGS = {
+    "todoList": [
+        {"id": 1, "title": "Task 1", "status": "completed"},
+        {"id": 2, "title": "Task 2", "status": "in-progress"},
+    ],
+}
+
+
+def test_generic_tool_loop_triggers():
+    """4x identischer manage_todo_list-Call bei Threshold=3 → Truncation."""
+    msgs = []
+    for i in range(4):
+        cid = f"call_t{i}"
+        msgs.append(_make_generic_tool_msg("manage_todo_list", _TODO_ARGS, call_id=cid))
+        msgs.append({"role": "tool", "tool_call_id": cid, "content": "Aufgabenliste aktualisiert"})
+
+    old_threshold = proxy.GENERIC_TOOL_LOOP_THRESHOLD
+    proxy.GENERIC_TOOL_LOOP_THRESHOLD = 3
+    try:
+        result = proxy._detect_generic_tool_loop_inplace(msgs, category="local")
+        assert result is True
+        last = msgs[-1]
+        assert last["role"] == "user"
+        assert "STOP" in last["content"]
+        assert "manage_todo_list" in last["content"]
+    finally:
+        proxy.GENERIC_TOOL_LOOP_THRESHOLD = old_threshold
+
+
+def test_generic_tool_loop_below_threshold():
+    """3x identischer Call bei Threshold=3 → keine Intervention."""
+    msgs = []
+    for i in range(3):
+        cid = f"call_t{i}"
+        msgs.append(_make_generic_tool_msg("manage_todo_list", _TODO_ARGS, call_id=cid))
+        msgs.append({"role": "tool", "tool_call_id": cid, "content": "ok"})
+
+    old_threshold = proxy.GENERIC_TOOL_LOOP_THRESHOLD
+    proxy.GENERIC_TOOL_LOOP_THRESHOLD = 3
+    try:
+        result = proxy._detect_generic_tool_loop_inplace(msgs, category="local")
+        assert result is False
+    finally:
+        proxy.GENERIC_TOOL_LOOP_THRESHOLD = old_threshold
+
+
+def test_generic_tool_loop_different_args_no_trigger():
+    """Gleiche Tool-Name, aber verschiedene Argumente → kein Loop."""
+    msgs = []
+    for i in range(5):
+        cid = f"call_t{i}"
+        args = {"todoList": [{"id": i, "title": f"Task {i}", "status": "in-progress"}]}
+        msgs.append(_make_generic_tool_msg("manage_todo_list", args, call_id=cid))
+        msgs.append({"role": "tool", "tool_call_id": cid, "content": "ok"})
+
+    old_threshold = proxy.GENERIC_TOOL_LOOP_THRESHOLD
+    proxy.GENERIC_TOOL_LOOP_THRESHOLD = 3
+    try:
+        result = proxy._detect_generic_tool_loop_inplace(msgs, category="local")
+        assert result is False
+    finally:
+        proxy.GENERIC_TOOL_LOOP_THRESHOLD = old_threshold
+
+
+def test_generic_tool_loop_disabled():
+    """Threshold=0 → deaktiviert."""
+    msgs = []
+    for i in range(6):
+        cid = f"call_t{i}"
+        msgs.append(_make_generic_tool_msg("manage_todo_list", _TODO_ARGS, call_id=cid))
+        msgs.append({"role": "tool", "tool_call_id": cid, "content": "ok"})
+
+    old_threshold = proxy.GENERIC_TOOL_LOOP_THRESHOLD
+    proxy.GENERIC_TOOL_LOOP_THRESHOLD = 0
+    try:
+        result = proxy._detect_generic_tool_loop_inplace(msgs, category="local")
+        assert result is False
+    finally:
+        proxy.GENERIC_TOOL_LOOP_THRESHOLD = old_threshold
+
+
+def test_generic_tool_loop_cloud_model_ignored():
+    """Cloud-Kategorien → keine Detection."""
+    msgs = []
+    for i in range(5):
+        cid = f"call_t{i}"
+        msgs.append(_make_generic_tool_msg("manage_todo_list", _TODO_ARGS, call_id=cid))
+        msgs.append({"role": "tool", "tool_call_id": cid, "content": "ok"})
+
+    old_threshold = proxy.GENERIC_TOOL_LOOP_THRESHOLD
+    proxy.GENERIC_TOOL_LOOP_THRESHOLD = 3
+    try:
+        assert proxy._detect_generic_tool_loop_inplace(msgs, category="light") is False
+        assert proxy._detect_generic_tool_loop_inplace(msgs, category="strong") is False
+    finally:
+        proxy.GENERIC_TOOL_LOOP_THRESHOLD = old_threshold
+
+
+def test_generic_tool_loop_interrupted_by_different_tool():
+    """Unterbrochene Sequenz (anderes Tool dazwischen) → kein Loop."""
+    msgs = []
+    for i in range(2):
+        cid = f"call_t{i}"
+        msgs.append(_make_generic_tool_msg("manage_todo_list", _TODO_ARGS, call_id=cid))
+        msgs.append({"role": "tool", "tool_call_id": cid, "content": "ok"})
+    # Anderes Tool dazwischen
+    msgs.append(_make_generic_tool_msg("create_file", {"path": "/x.py", "content": "x"}, call_id="call_x"))
+    msgs.append({"role": "tool", "tool_call_id": "call_x", "content": "created"})
+    for i in range(2, 4):
+        cid = f"call_t{i}"
+        msgs.append(_make_generic_tool_msg("manage_todo_list", _TODO_ARGS, call_id=cid))
+        msgs.append({"role": "tool", "tool_call_id": cid, "content": "ok"})
+
+    old_threshold = proxy.GENERIC_TOOL_LOOP_THRESHOLD
+    proxy.GENERIC_TOOL_LOOP_THRESHOLD = 3
+    try:
+        result = proxy._detect_generic_tool_loop_inplace(msgs, category="local")
+        assert result is False  # nur 2 trailing, nicht >3
+    finally:
+        proxy.GENERIC_TOOL_LOOP_THRESHOLD = old_threshold
+
+
+def test_generic_tool_loop_skips_read_and_search():
+    """read_file und grep_search werden nicht als generic loops erkannt."""
+    msgs = []
+    for i in range(4):
+        msgs.append(_make_read_msg("/a.py", 1, 10, call_id=f"r{i}"))
+        msgs.append({"role": "tool", "tool_call_id": f"r{i}", "content": "code"})
+    for i in range(4):
+        cid = f"s{i}"
+        msgs.append(_make_search_msg("foo", call_id=cid))
+        msgs.append(_make_search_result(cid, _NO_MATCH_TEXT))
+
+    old_threshold = proxy.GENERIC_TOOL_LOOP_THRESHOLD
+    proxy.GENERIC_TOOL_LOOP_THRESHOLD = 3
+    try:
+        result = proxy._detect_generic_tool_loop_inplace(msgs, category="local")
+        assert result is False  # read/search haben eigene Detection
+    finally:
+        proxy.GENERIC_TOOL_LOOP_THRESHOLD = old_threshold
+
+
+def test_detect_response_loop_flags_generic_tool_repeat():
+    """Response-Level: weiterer identischer manage_todo_list-Call wird erkannt."""
+    msgs = []
+    for i in range(4):
+        cid = f"call_t{i}"
+        msgs.append(_make_generic_tool_msg("manage_todo_list", _TODO_ARGS, call_id=cid))
+        msgs.append({"role": "tool", "tool_call_id": cid, "content": "Aufgabenliste aktualisiert"})
+    body = {"messages": msgs}
+    new_tc = [{
+        "id": "call_new",
+        "type": "function",
+        "function": {
+            "name": "manage_todo_list",
+            "arguments": json.dumps(_TODO_ARGS),
+        },
+    }]
+
+    old_thr = proxy._RESPONSE_LOOP_THRESHOLD
+    old_gen = proxy.GENERIC_TOOL_LOOP_THRESHOLD
+    proxy._RESPONSE_LOOP_THRESHOLD = 3
+    proxy.GENERIC_TOOL_LOOP_THRESHOLD = 3
+    try:
+        reasons, blocked_names = proxy._detect_response_loop(
+            body, new_tc, category="local")
+        assert reasons
+        assert "manage_todo_list" in blocked_names
+    finally:
+        proxy._RESPONSE_LOOP_THRESHOLD = old_thr
+        proxy.GENERIC_TOOL_LOOP_THRESHOLD = old_gen
+
+
+def test_detect_response_loop_allows_different_generic_args():
+    """Response-Level: manage_todo_list mit ANDEREN Argumenten wird nicht geblockt."""
+    msgs = []
+    for i in range(4):
+        cid = f"call_t{i}"
+        msgs.append(_make_generic_tool_msg("manage_todo_list", _TODO_ARGS, call_id=cid))
+        msgs.append({"role": "tool", "tool_call_id": cid, "content": "ok"})
+    body = {"messages": msgs}
+    new_tc = [{
+        "id": "call_new",
+        "type": "function",
+        "function": {
+            "name": "manage_todo_list",
+            "arguments": json.dumps({"todoList": [{"id": 99, "title": "Neu", "status": "not-started"}]}),
+        },
+    }]
+
+    old_thr = proxy._RESPONSE_LOOP_THRESHOLD
+    old_gen = proxy.GENERIC_TOOL_LOOP_THRESHOLD
+    proxy._RESPONSE_LOOP_THRESHOLD = 3
+    proxy.GENERIC_TOOL_LOOP_THRESHOLD = 3
+    try:
+        reasons, blocked_names = proxy._detect_response_loop(
+            body, new_tc, category="local")
+        assert reasons == []
+        assert blocked_names == []
+    finally:
+        proxy._RESPONSE_LOOP_THRESHOLD = old_thr
+        proxy.GENERIC_TOOL_LOOP_THRESHOLD = old_gen

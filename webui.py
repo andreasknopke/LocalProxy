@@ -251,6 +251,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "search_repeat_threshold": 3,
         "search_repeat_intervention": "",
         "response_loop_threshold": 3,
+        "generic_tool_loop_threshold": 3,
+        "generic_tool_loop_intervention": "",
     },
 }
 
@@ -276,6 +278,8 @@ _ENV_TO_CONFIG: Dict[str, Tuple[str, str]] = {
     "SEARCH_REPEAT_THRESHOLD": ("tokens", "search_repeat_threshold"),
     "SEARCH_REPEAT_INTERVENTION": ("tokens", "search_repeat_intervention"),
     "RESPONSE_LOOP_THRESHOLD": ("tokens", "response_loop_threshold"),
+    "GENERIC_TOOL_LOOP_THRESHOLD": ("tokens", "generic_tool_loop_threshold"),
+    "GENERIC_TOOL_LOOP_INTERVENTION": ("tokens", "generic_tool_loop_intervention"),
 }
 
 
@@ -1098,6 +1102,16 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
         <input type="number" id="response_loop_threshold" min="0" max="100">
         <div class="hint">Blockiert Tool-Calls in der Modell-Antwort, die denselben Read/Search-Loop fortsetzen. Default 3.</div>
       </div>
+      <div class="form-group">
+        <label>Generic-Tool-Loop-Schwelle (0=aus)</label>
+        <input type="number" id="generic_tool_loop_threshold" min="0" max="100">
+        <div class="hint">Erkennt wiederholte identische Aufrufe beliebiger Tools (z.B. manage_todo_list, create_file) mit denselben Argumenten. Default 3. 0 = deaktiviert.</div>
+      </div>
+      <div class="form-group">
+        <label>Generic-Tool-Loop-Interventionstext (optional)</label>
+        <textarea id="generic_tool_loop_intervention" rows="3" placeholder="Leer = Standardtext. {tool}/{count}"></textarea>
+        <div class="hint">Eigener Interventionstext. Platzhalter {tool} = Tool-Name, {count} = Anzahl Wiederholungen.</div>
+      </div>
     </div>
   </section>
 
@@ -1251,6 +1265,8 @@ async function loadConfig() {
     document.getElementById('search_repeat_threshold').value = tk.search_repeat_threshold != null ? tk.search_repeat_threshold : 3;
     document.getElementById('search_repeat_intervention').value = tk.search_repeat_intervention || '';
     document.getElementById('response_loop_threshold').value = tk.response_loop_threshold != null ? tk.response_loop_threshold : 3;
+    document.getElementById('generic_tool_loop_threshold').value = tk.generic_tool_loop_threshold != null ? tk.generic_tool_loop_threshold : 3;
+    document.getElementById('generic_tool_loop_intervention').value = tk.generic_tool_loop_intervention || '';
 
   } catch(e) {
     showToast('Fehler beim Laden: ' + e.message, 'error');
@@ -1328,6 +1344,8 @@ async function saveConfig() {
     search_repeat_threshold: parseInt(document.getElementById('search_repeat_threshold').value) || 0,
     search_repeat_intervention: document.getElementById('search_repeat_intervention').value || '',
     response_loop_threshold: parseInt(document.getElementById('response_loop_threshold').value) || 0,
+    generic_tool_loop_threshold: parseInt(document.getElementById('generic_tool_loop_threshold').value) || 0,
+    generic_tool_loop_intervention: document.getElementById('generic_tool_loop_intervention').value || '',
   };
 
   try {

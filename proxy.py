@@ -328,6 +328,20 @@ READ_LOOP_FILE_INTERVENTION: str = os.getenv(
     "create_file to implement the change, or ask a specific question. Go on."
 )
 
+# ── Generic Tool-Loop-Detection (NUR lokales Modell) ──────────────────────
+# Erkennt wenn ein beliebiges Tool (z.B. manage_todo_list, create_file, etc.)
+# mit identischen Argumenten >N mal hintereinander aufgerufen wird.
+# Default 0 = deaktiviert (opt-in), damit legitime Wiederholungen nicht blockiert werden.
+GENERIC_TOOL_LOOP_THRESHOLD: int = int(os.getenv("GENERIC_TOOL_LOOP_THRESHOLD", "3"))
+GENERIC_TOOL_LOOP_INTERVENTION: str = os.getenv(
+    "GENERIC_TOOL_LOOP_INTERVENTION",
+    "STOP! You are looping. You have already called the tool '{tool}' with the "
+    "exact same arguments {count} times. The task/update is already done. "
+    "Do NOT call '{tool}' again with these arguments. "
+    "NOW: proceed to the next step of your task — implement the change with "
+    "replace_string_in_file/create_file, run a test, or respond to the user. Go on."
+)
+
 # ── Search-Loop-Detection (NUR lokales Modell) ─────────────────────────────
 # No-Match-Loops: gleiche Suche >N mal ohne Treffer.
 SEARCH_LOOP_THRESHOLD: int = int(os.getenv("SEARCH_LOOP_THRESHOLD", "3"))
@@ -532,6 +546,7 @@ def _apply_config_file() -> None:
     global SEARCH_LOOP_THRESHOLD, SEARCH_LOOP_INTERVENTION
     global SEARCH_REPEAT_THRESHOLD, SEARCH_REPEAT_INTERVENTION
     global _RESPONSE_LOOP_THRESHOLD
+    global GENERIC_TOOL_LOOP_THRESHOLD, GENERIC_TOOL_LOOP_INTERVENTION
     SEARCH_LOOP_THRESHOLD = int(tokens_cfg.get("search_loop_threshold", SEARCH_LOOP_THRESHOLD))
     SEARCH_REPEAT_THRESHOLD = int(tokens_cfg.get("search_repeat_threshold", SEARCH_REPEAT_THRESHOLD))
     sl_intervention = tokens_cfg.get("search_loop_intervention", "")
@@ -542,6 +557,11 @@ def _apply_config_file() -> None:
         SEARCH_REPEAT_INTERVENTION = str(sr_intervention)
     _RESPONSE_LOOP_THRESHOLD = int(tokens_cfg.get(
         "response_loop_threshold", _RESPONSE_LOOP_THRESHOLD))
+    GENERIC_TOOL_LOOP_THRESHOLD = int(tokens_cfg.get(
+        "generic_tool_loop_threshold", GENERIC_TOOL_LOOP_THRESHOLD))
+    gt_intervention = tokens_cfg.get("generic_tool_loop_intervention", "")
+    if gt_intervention:
+        GENERIC_TOOL_LOOP_INTERVENTION = str(gt_intervention)
 
     _log("Config aus config.json neu geladen")
 
@@ -1235,6 +1255,82 @@ def _collect_search_entries(
     return entries, diag
 
 
+def _collect_generic_tool_entries(
+    messages: List[Dict[str, Any]],
+) -> List[Tuple[int, str, str]]:
+    """Sammelt ALLE tool_calls: (msg_idx, tool_name, sig).
+
+    Sig = name + universelle Argument-Signatur (sortierte key=value Paare).
+    Read/Search-Tools werden ausgeschlossen (haben eigene Detection).
+    """
+    entries: List[Tuple[int, str, str]] = []
+    for msg_idx, m in enumerate(messages):
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        tool_calls = m.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            func = tc.get("function") or {}
+            if not isinstance(func, dict):
+                continue
+            name = str(func.get("name", "")).strip()
+            if not name:
+                continue
+            # Read/Search-Tools haben eigene Detection
+            if name in _READ_FILE_TOOL_NAMES or _is_search_tool_name(name):
+                continue
+            sig = _extract_tool_call_signature(func.get("arguments", ""))
+            if not sig:
+                continue
+            entries.append((msg_idx, name, sig))
+    return entries
+
+
+def _detect_generic_tool_loop_inplace(
+    messages: List[Dict[str, Any]], label: str = "Payload",
+    category: str = "",
+) -> bool:
+    """Erkennt wenn ein beliebiges Tool (z.B. manage_todo_list) mit identischen
+    Argumenten >GENERIC_TOOL_LOOP_THRESHOLD mal hintereinander aufgerufen wird.
+
+    Trunciert ab dem 2. Vorkommen bis zum Ende + Intervention.
+    """
+    if category != "local":
+        return False
+    if GENERIC_TOOL_LOOP_THRESHOLD <= 0:
+        return False
+
+    entries = _collect_generic_tool_entries(messages)
+    if not entries:
+        return False
+
+    # Trailing-Sequenz: gleiche (name, sig) am Ende
+    _last_idx, last_name, last_sig = entries[-1]
+    trailing_indices: List[int] = []
+    for msg_idx, name, sig in reversed(entries):
+        if name == last_name and sig == last_sig:
+            trailing_indices.append(msg_idx)
+        else:
+            break
+    trailing_indices.reverse()
+
+    if len(trailing_indices) > GENERIC_TOOL_LOOP_THRESHOLD:
+        cut = trailing_indices[1] if len(trailing_indices) > 1 else trailing_indices[0]
+        intervention_text = GENERIC_TOOL_LOOP_INTERVENTION.format(
+            tool=last_name, count=len(trailing_indices)
+        )
+        _truncate_messages_from(messages, cut, intervention_text)
+        _log(f"{label}: GENERIC-TOOL-LOOP erkannt ({len(trailing_indices)}x "
+             f"'{last_name}' mit identischen Argumenten), Konversation trunkiert "
+             f"bei idx={cut}")
+        return True
+
+    return False
+
+
 def _detect_read_loop_inplace(messages: List[Dict[str, Any]], label: str = "Payload",
                               category: str = "") -> bool:
     """Erkennt Read-Loops: gleiche Datei + gleiche Zeilen >N mal hintereinander.
@@ -1542,6 +1638,18 @@ def _detect_response_loop(body: Dict[str, Any], tool_calls: List[Dict[str, Any]]
                 break
             trailing_search_no_match_count += 1
 
+    # Generic tool entries (alle non-read/search Tools)
+    generic_entries = _collect_generic_tool_entries(messages)
+    trailing_gen_name = generic_entries[-1][1] if generic_entries else ""
+    trailing_gen_sig = generic_entries[-1][2] if generic_entries else ""
+    trailing_gen_count = 0
+    if trailing_gen_name:
+        for _idx, gname, gsig in reversed(generic_entries):
+            if gname == trailing_gen_name and gsig == trailing_gen_sig:
+                trailing_gen_count += 1
+            else:
+                break
+
     thr = _RESPONSE_LOOP_THRESHOLD
     reasons: List[str] = []
     blocked_names: Set[str] = set()
@@ -1576,6 +1684,13 @@ def _detect_response_loop(body: Dict[str, Any], tool_calls: List[Dict[str, Any]]
                     reason = f"search-no-match {trailing_search_no_match_count}x"
                 elif trailing_search_count >= thr:
                     reason = f"search-repeat {trailing_search_count}x"
+        else:
+            # Generische Tools (z.B. manage_todo_list): identische Argumente wiederholt
+            gsig = _extract_tool_call_signature(args_raw)
+            if (gsig and trailing_gen_name == name and gsig == trailing_gen_sig
+                    and GENERIC_TOOL_LOOP_THRESHOLD > 0
+                    and trailing_gen_count > GENERIC_TOOL_LOOP_THRESHOLD):
+                reason = f"generic-tool {trailing_gen_count}x '{name}'"
 
         if reason:
             reasons.append(f"{name}: {reason}")
@@ -2769,12 +2884,13 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     if category == "local" and isinstance(msgs, list):
         read_hit = _detect_read_loop_inplace(msgs, "Passthrough", category=category)
         search_hit = _detect_search_loop_inplace(msgs, "Passthrough", category=category)
-        loop_intervened = bool(read_hit or search_hit)
+        generic_hit = _detect_generic_tool_loop_inplace(msgs, "Passthrough", category=category)
+        loop_intervened = bool(read_hit or search_hit or generic_hit)
         if loop_intervened:
             last_iv = msgs[-1].get("content", "") if isinstance(msgs[-1], dict) else ""
             loop_reasons.append(str(last_iv)[:200])
             _log(f"Loop-Intervention: history truncated + appended "
-                 f"(read={read_hit}, search={search_hit})")
+                 f"(read={read_hit}, search={search_hit}, generic={generic_hit})")
 
     # Log aktiven Index für die Kategorie
     defs = _model_defs(category)
