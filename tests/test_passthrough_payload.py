@@ -217,58 +217,13 @@ def test_moonshot_patch_skips_non_moonshot():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 3b. Reasoning-Injektion (Laguna)
+# 3b. Reasoning-Injektion entfernt (wurde verworfen — funktioniert nicht)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def test_reasoning_injection_laguna_string_content():
-    """Injektion wird an das Ende der letzten User-Message angehaengt."""
-    payload = {"messages": [
-        {"role": "system", "content": "you are helpful"},
-        {"role": "user", "content": "Erklaere mir Python"},
-    ]}
-    cat = {"model_name": "poolside/Laguna-S-2.1-NVFP4"}
-    proxy._patch_reasoning_injection_payload(payload, cat)
-    assert payload["messages"][1]["content"].endswith("Mandatory: Reduce reasoning to max 50 words!")
-    # System-Message bleibt unveraendert
-    assert payload["messages"][0]["content"] == "you are helpful"
-
-
-def test_reasoning_injection_laguna_multimodal():
-    """Injektion wird an den letzten Text-Block einer Multimodal-Message angehaengt."""
-    payload = {"messages": [
-        {"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "data:..."}},
-            {"type": "text", "text": "describe this"},
-        ]},
-    ]}
-    cat = {"model_name": "poolside/Laguna-S-2.1-NVFP4"}
-    proxy._patch_reasoning_injection_payload(payload, cat)
-    text_block = payload["messages"][0]["content"][1]
-    assert text_block["text"].endswith("Mandatory: Reduce reasoning to max 50 words!")
-
-
-def test_reasoning_injection_skips_non_laguna():
-    """Keine Injektion fuer Modelle die nicht Laguna sind."""
-    payload = {"messages": [{"role": "user", "content": "hello"}]}
-    cat = {"model_name": "Qwen/Qwen3-Next-80B"}
-    proxy._patch_reasoning_injection_payload(payload, cat)
-    assert payload["messages"][0]["content"] == "hello"
-
-
-def test_reasoning_injection_flag_not_corrupted():
-    """Flag-Extraktion funktioniert weiterhin, Injektion kommt erst danach."""
-    # Simuliere den vollen Ablauf: Flag extrahieren, strippen, dann Injektion
-    text = "Erklaere mir Python --local"
-    cleaned, cat_flag, slot = proxy._extract_model_flag(text)
-    assert cat_flag == "local"
-    assert "--local" not in cleaned
-    # Jetzt Payload bauen und Injektion anwenden
-    payload = {"messages": [{"role": "user", "content": cleaned}]}
-    cat = {"model_name": "poolside/Laguna-S-2.1-NVFP4"}
-    proxy._patch_reasoning_injection_payload(payload, cat)
-    final = payload["messages"][0]["content"]
-    assert "--local" not in final  # Flag wurde vorher entfernt
-    assert final.endswith("Mandatory: Reduce reasoning to max 50 words!")
+def test_reasoning_injection_function_removed():
+    """Die Funktion _patch_reasoning_injection_payload wurde entfernt."""
+    assert not hasattr(proxy, "_patch_reasoning_injection_payload")
+    assert not hasattr(proxy, "_REASONING_INJECTION_TEXT")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -545,11 +500,13 @@ def test_detect_read_loop_below_threshold():
 
 
 def test_detect_read_loop_triggers():
-    """4 identische Reads bei Threshold=3 → Intervention wird injiziert."""
+    """4 identische Reads bei Threshold=3 → Truncation: Loop-Historie wird entfernt."""
     msgs = [
         {"role": "user", "content": "read it"},
+        # --- 1. read (below threshold, bleibt erhalten) ---
         _make_read_msg("/a.py", 1, 10),
         {"role": "tool", "content": "c"},
+        # --- ab hier: Loop (wiederholte Reads, werden trunkiert) ---
         _make_read_msg("/a.py", 1, 10),
         {"role": "tool", "content": "c"},
         _make_read_msg("/a.py", 1, 10),
@@ -562,11 +519,14 @@ def test_detect_read_loop_triggers():
     try:
         result = proxy._detect_read_loop_inplace(msgs, category="local")
         assert result is True
-        assert len(msgs) == 10  # +1 Intervention
+        # User-Msg + 1.Read + 1.ToolResult + Intervention = 4
+        assert len(msgs) == 4
         last = msgs[-1]
         assert last["role"] == "user"
         assert "STOP" in last["content"]
         assert "4" in last["content"]
+        # Der erste Read ist noch da (nicht Teil der Konsekutiv-Sequenz ab idx 2)
+        assert msgs[1] is not None
     finally:
         proxy.READ_LOOP_THRESHOLD = old_threshold
 
@@ -666,7 +626,7 @@ def test_detect_read_loop_interrupted_sequence():
 
 
 def test_detect_file_crawl_triggers():
-    """Gleiche Datei mit verschiedenen Zeilen >N mal im Fenster → file-crawl Intervention."""
+    """Gleiche Datei mit verschiedenen Zeilen >N mal im Fenster → file-crawl Truncation."""
     # 9 Reads der gleichen Datei mit verschiedenen Zeilen im Fenster von 12
     msgs = []
     for i in range(9):
@@ -685,6 +645,8 @@ def test_detect_file_crawl_triggers():
         assert last["role"] == "user"
         assert "crawling" in last["content"]
         assert "/big.tsx" in last["content"]
+        # Die ueberzaehligen Reads wurden trunkiert
+        assert len(msgs) < 18
     finally:
         proxy.READ_LOOP_THRESHOLD = old_threshold
         proxy.READ_LOOP_FILE_THRESHOLD = old_file_threshold
@@ -743,7 +705,7 @@ def test_extract_search_signature_no_query():
 
 
 def test_detect_search_loop_triggers():
-    """4 identische Suchen mit No-Match bei Threshold=3 → Intervention."""
+    """4 identische Suchen mit No-Match bei Threshold=3 → Truncation ab 2. Wiederholung."""
     msgs = []
     for i in range(4):
         cid = f"call_{i}"
@@ -755,7 +717,8 @@ def test_detect_search_loop_triggers():
     try:
         result = proxy._detect_search_loop_inplace(msgs, category="local")
         assert result is True
-        assert len(msgs) == 9  # 8 + 1 Intervention
+        # 1.Search + 1.NoMatchResult + Intervention = 3
+        assert len(msgs) == 3
         last = msgs[-1]
         assert last["role"] == "user"
         assert "STOP" in last["content"]

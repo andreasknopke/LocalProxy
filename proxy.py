@@ -1040,12 +1040,37 @@ def _extract_read_signature(args_raw: Any) -> Optional[str]:
 _READ_FILE_TOOL_NAMES = {"read_file", "readFile", "read_lines", "readLines"}
 
 
+def _truncate_messages_from(messages: List[Dict[str, Any]], msg_index: int,
+                            intervention_text: str) -> None:
+    """Trunciert die messages-Liste ab msg_index (inklusiv) und appended eine
+    Intervention-User-Message. Stellt sicher, dass keine dangling tool_calls / tool
+    results zurueckbleiben (d.h. assistant mit tool_calls ohne result ist ungueltig).
+    """
+    # Rueckwaerts vom Cut-Punkt pruefen: die letzte verbleibende Message darf KEINE
+    # assistant mit tool_calls ohne nachfolgendes tool-result sein.
+    # Da wir ab msg_index alles abschneiden, duerfen davor keine unpaarigen tool_calls stehen.
+    # Falls die letzte verbleibende Message assistant+tool_calls ist, muessen wir diese
+    # ebenfalls entfernen (sonst ist die Konversation ungueltig).
+    while msg_index > 0:
+        prev = messages[msg_index - 1]
+        if isinstance(prev, dict) and prev.get("role") == "assistant" and prev.get("tool_calls"):
+            msg_index -= 1
+        else:
+            break
+
+    del messages[msg_index:]
+    messages.append({"role": "user", "content": intervention_text})
+
+
 def _detect_read_loop_inplace(messages: List[Dict[str, Any]], label: str = "Payload",
                               category: str = "") -> bool:
     """Erkennt Read-Loops: gleiche Datei + gleiche Zeilen >N mal hintereinander.
     NUR fuer lokale Modelle (category='local'). Cloud-Modelle werden nicht beeinflusst.
-    Injiziert eine Interventions-User-Message wenn ein Loop erkannt wird.
-    Gibt True zurueck wenn eine Intervention injiziert wurde.
+
+    AKTIVE INTERVENTION durch Truncation: Die wiederholten Tool-Calls und deren
+    Ergebnisse werden aus dem Nachrichtenverlauf entfernt und durch eine einzige
+    Interventions-Message ersetzt. Das Modell hat keinen Zugriff mehr auf die
+    Loop-Historie und ist gezwungen, einen neuen Ansatz zu waehlen.
 
     Zwei Detection-Modi:
       1. Exact-Loop: identische Signaturen (file+lines) >READ_LOOP_THRESHOLD konsekutiv
@@ -1057,10 +1082,10 @@ def _detect_read_loop_inplace(messages: List[Dict[str, Any]], label: str = "Payl
     if READ_LOOP_THRESHOLD <= 0:
         return False
 
-    # Extrahiere read_file Tool-Call-Signaturen aus assistant messages (chronologisch)
-    read_signatures: List[str] = []
+    # Extrahiere read_file Tool-Call-Signaturen MIT Message-Index
+    read_entries: List[Tuple[int, str]] = []  # (message_index, signature)
 
-    for m in messages:
+    for msg_idx, m in enumerate(messages):
         if not isinstance(m, dict):
             continue
         if m.get("role") != "assistant":
@@ -1080,50 +1105,59 @@ def _detect_read_loop_inplace(messages: List[Dict[str, Any]], label: str = "Payl
             args_raw = func.get("arguments", "")
             sig = _extract_read_signature(args_raw)
             if sig:
-                read_signatures.append(sig)
+                read_entries.append((msg_idx, sig))
 
-    if not read_signatures:
+    if not read_entries:
         return False
 
     # ── Modus 1: Exact-Loop (gleiche Datei + gleiche Zeilen konsekutiv) ──
     max_consecutive = 1
     current_count = 1
-    current_sig = read_signatures[0]
-    for sig in read_signatures[1:]:
-        if sig == current_sig:
+    current_entry: Tuple[int, str] = read_entries[0]
+    loop_start_idx: Optional[int] = None  # message-index der 2. Konsekutiv-Wiederholung
+    loop_sig: Optional[str] = None
+
+    for entry in read_entries[1:]:
+        if entry[1] == current_entry[1]:
             current_count += 1
+            if current_count == 2 and loop_start_idx is None:
+                loop_start_idx = entry[0]
+                loop_sig = entry[1]
         else:
             current_count = 1
-            current_sig = sig
+        current_entry = entry
         if current_count > max_consecutive:
             max_consecutive = current_count
 
     if max_consecutive > READ_LOOP_THRESHOLD:
+        truncate_idx = loop_start_idx if loop_start_idx is not None else read_entries[-1][0]
         intervention_text = READ_LOOP_INTERVENTION.format(count=max_consecutive)
-        messages.append({"role": "user", "content": intervention_text})
+        _truncate_messages_from(messages, truncate_idx, intervention_text)
         _log(f"{label}: READ-LOOP (exact) erkannt ({max_consecutive}x gleiche read_file-Parameter), "
-             f"Intervention injiziert")
+             f"Konversation bei idx={truncate_idx} trunkiert + Intervention")
         return True
 
     # ── Modus 2: File-Crawl (gleiche Datei, verschiedene Zeilen, gehaeuft) ──
     if READ_LOOP_FILE_THRESHOLD > 0 and READ_LOOP_FILE_WINDOW > 0:
-        # Betrachte die letzten N read_file-Signaturen
-        window = read_signatures[-READ_LOOP_FILE_WINDOW:]
-        # Extrahiere nur den Dateipfad (Teil vor dem ersten |)
+        window = read_entries[-READ_LOOP_FILE_WINDOW:]
         file_counts: Dict[str, int] = {}
-        for sig in window:
+        for _idx, sig in window:
             file_part = sig.split("|", 1)[0]
             file_counts[file_part] = file_counts.get(file_part, 0) + 1
 
         for file_path, count in file_counts.items():
             if count > READ_LOOP_FILE_THRESHOLD:
-                intervention_text = READ_LOOP_FILE_INTERVENTION.format(
-                    file=file_path, count=count, window=READ_LOOP_FILE_WINDOW
-                )
-                messages.append({"role": "user", "content": intervention_text})
-                _log(f"{label}: READ-LOOP (file-crawl) erkannt ({count}x '{file_path}' "
-                     f"in letzten {len(window)} reads), Intervention injiziert")
-                return True
+                # Finde den Message-Index der (threshold+1).-ten Wiederholung
+                occurrences = [e_idx for e_idx, e_sig in window if e_sig.split("|", 1)[0] == file_path]
+                if len(occurrences) > READ_LOOP_FILE_THRESHOLD:
+                    truncate_idx = occurrences[READ_LOOP_FILE_THRESHOLD]
+                    intervention_text = READ_LOOP_FILE_INTERVENTION.format(
+                        file=file_path, count=count, window=READ_LOOP_FILE_WINDOW
+                    )
+                    _truncate_messages_from(messages, truncate_idx, intervention_text)
+                    _log(f"{label}: READ-LOOP (file-crawl) erkannt ({count}x '{file_path}' "
+                         f"in letzten {len(window)} reads), Konversation trunkiert bei idx={truncate_idx}")
+                    return True
 
     return False
 
@@ -1197,10 +1231,10 @@ def _detect_search_loop_inplace(messages: List[Dict[str, Any]], label: str = "Pa
     if SEARCH_LOOP_THRESHOLD <= 0:
         return False
 
-    # Schritt 1: Sammle alle Search-Tool-Calls mit ihrer ID und Signatur
-    search_calls: List[Tuple[str, str]] = []  # (tool_call_id, signature)
+    # Schritt 1: Sammle alle Search-Tool-Calls: (message_index, tool_call_id, signature)
+    search_entries: List[Tuple[int, str, str]] = []
 
-    for m in messages:
+    for msg_idx, m in enumerate(messages):
         if not isinstance(m, dict):
             continue
         if m.get("role") != "assistant":
@@ -1221,12 +1255,12 @@ def _detect_search_loop_inplace(messages: List[Dict[str, Any]], label: str = "Pa
             sig = _extract_search_signature(args_raw)
             if sig:
                 tc_id = str(tc.get("id", ""))
-                search_calls.append((tc_id, sig))
+                search_entries.append((msg_idx, tc_id, sig))
 
-    if not search_calls:
+    if not search_entries:
         return False
 
-    # Schritt 2: Baue ein Mapping tool_call_id -> Ergebnis-Text
+    # Schritt 2: Mapping tool_call_id → Ergebnis-Text
     tool_results: Dict[str, str] = {}
     for m in messages:
         if not isinstance(m, dict):
@@ -1237,37 +1271,43 @@ def _detect_search_loop_inplace(messages: List[Dict[str, Any]], label: str = "Pa
         if tc_id:
             tool_results[tc_id] = _extract_tool_result_text(m)
 
-    # Schritt 3: Zaehle konsekutive gleiche Signaturen mit No-Match
+    # Schritt 3: Finde den Punkt ab dem die wiederholten No-Match-Suchen beginnen
+    # und trunkiere ab dort.
     max_consecutive = 0
     current_count = 0
     current_sig = ""
     worst_query = ""
+    truncate_msg_idx: Optional[int] = None
 
-    for tc_id, sig in search_calls:
+    for msg_idx, tc_id, sig in search_entries:
         result_text = tool_results.get(tc_id, "")
         is_no_match = any(indicator in result_text for indicator in _NO_MATCHES_INDICATORS)
 
         if is_no_match:
             if sig == current_sig:
                 current_count += 1
+                # Ab der 2. Wiederholung: Truncation-Punkt festhalten
+                if current_count == 2 and truncate_msg_idx is None:
+                    truncate_msg_idx = msg_idx
             else:
                 current_count = 1
                 current_sig = sig
+                truncate_msg_idx = None
             if current_count > max_consecutive:
                 max_consecutive = current_count
                 worst_query = sig.split("|", 1)[0]
         else:
-            # Ergebnis vorhanden -> Zaehler zuruecksetzen
             current_count = 0
             current_sig = ""
+            truncate_msg_idx = None
 
-    if max_consecutive > SEARCH_LOOP_THRESHOLD:
+    if max_consecutive > SEARCH_LOOP_THRESHOLD and truncate_msg_idx is not None:
         intervention_text = SEARCH_LOOP_INTERVENTION.format(
             query=worst_query[:120], count=max_consecutive
         )
-        messages.append({"role": "user", "content": intervention_text})
-        _log(f"{label}: SEARCH-LOOP erkannt ({max_consecutive}x gleiche Suche '{worst_query[:80]}' "
-             f"mit 'No matches found'), Intervention injiziert")
+        _truncate_messages_from(messages, truncate_msg_idx, intervention_text)
+        _log(f"{label}: SEARCH-LOOP erkannt ({max_consecutive}x Suche '{worst_query[:80]}' "
+             f"mit 'No matches found'), Konversation trunkiert bei idx={truncate_msg_idx}")
         return True
 
     return False
@@ -1362,47 +1402,6 @@ def _patch_reasoning_effort_payload(payload: Dict[str, Any], cat: Dict[str, Any]
         _log(f"reasoning_effort='{old_val}' entfernt fuer Model '{model_name}' (tools + reasoning_effort inkompatibel)")
 
 
-# Regex fuer Modelle, die eine Reasoning-Reduktions-Injektion benoetigen
-_MODEL_REASONING_INJECTION_RE = re.compile(
-    r'Laguna', re.IGNORECASE
-)
-_REASONING_INJECTION_TEXT = "\n\nMandatory: Reduce reasoning to max 50 words!"
-
-
-def _patch_reasoning_injection_payload(payload: Dict[str, Any], cat: Dict[str, Any]) -> None:
-    """Injiziert eine Reasoning-Reduktions-Anweisung am ENDE der letzten User-Message,
-    wenn das Modell dies benoetigt (z.B. poolside/Laguna-S-2.1-NVFP4).
-    Die Injektion erfolgt NACH dem Flag-Stripping, sodass --local nicht korrumpiert wird.
-    Position: direkt vor dem (bereits entfernten) Flag = Ende der User-Message.
-    """
-    model_name = str(cat.get("model_name", payload.get("model", "")))
-    if not _MODEL_REASONING_INJECTION_RE.search(model_name):
-        return
-    messages = payload.get("messages", [])
-    if not isinstance(messages, list):
-        return
-    # Letzte User-Message finden und Injektion anhaengen
-    for msg in reversed(messages):
-        if not isinstance(msg, dict) or msg.get("role") != "user":
-            continue
-        content = msg.get("content")
-        if isinstance(content, str):
-            msg["content"] = content + _REASONING_INJECTION_TEXT
-            _log(f"Reasoning-Injektion angehaengt fuer Model '{model_name}'")
-            return
-        elif isinstance(content, list):
-            # Multimodal: an den letzten Text-Block anhaengen
-            for block in reversed(content):
-                if isinstance(block, dict) and block.get("type") == "text":
-                    block["text"] = block.get("text", "") + _REASONING_INJECTION_TEXT
-                    _log(f"Reasoning-Injektion angehaengt (multimodal) fuer Model '{model_name}'")
-                    return
-            # Kein Text-Block vorhanden: neuen anhaengen
-            content.append({"type": "text", "text": _REASONING_INJECTION_TEXT.strip()})
-            _log(f"Reasoning-Injektion als neuer Text-Block fuer Model '{model_name}'")
-            return
-
-
 def _patch_moonshot_payload(payload: Dict[str, Any], api_url: str) -> None:
     """Erzwingt Moonshot-kompatible Parameter — NUR wenn api_url moonshot-ai enthaelt."""
     url_lower = api_url.lower()
@@ -1487,7 +1486,6 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
     _patch_moonshot_payload(payload, cat.get("api_url", ""))
     _patch_max_tokens_payload(payload, cat)
     _patch_reasoning_effort_payload(payload, cat)
-    _patch_reasoning_injection_payload(payload, cat)
 
     return _clean_payload(payload, keep_tools=True)
 
