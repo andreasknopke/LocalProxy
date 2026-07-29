@@ -1564,26 +1564,36 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
 
     response = None
     last_exc: Optional[Exception] = None
-    for attempt in range(1 + max_retries):
-        try:
-            async with httpx.AsyncClient(timeout=_http_timeout) as client:
-                response = await client.post(
-                    api_url, json=payload, headers=_api_headers(api_key),
-                )
-            last_exc = None
-            break  # Erfolg — kein Retry noetig
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError, OSError) as exc:
-            last_exc = exc
-            duration_so_far = time.perf_counter() - started
-            exc_type = type(exc).__name__
-            if attempt < max_retries:
-                _log(f"Model TIMEOUT/CONN cat={category}[{def_idx}] attempt={attempt+1}/{1+max_retries} "
-                     f"duration={duration_so_far:.1f}s type={exc_type}: {_safe_str(exc)}")
-                _log(f"   → Auto-Retry in {retry_delay:.0f}s...")
-                await asyncio.sleep(retry_delay)
-            else:
-                _log(f"Model TIMEOUT/CONN cat={category}[{def_idx}] attempt={attempt+1}/{1+max_retries} "
-                     f"duration={duration_so_far:.1f}s type={exc_type}: {_safe_str(exc)} — KEINE Retries mehr")
+    try:
+        for attempt in range(1 + max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=_http_timeout) as client:
+                    response = await client.post(
+                        api_url, json=payload, headers=_api_headers(api_key),
+                    )
+                last_exc = None
+                break  # Erfolg — kein Retry noetig
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError, OSError) as exc:
+                last_exc = exc
+                duration_so_far = time.perf_counter() - started
+                exc_type = type(exc).__name__
+                if attempt < max_retries:
+                    _log(f"Model TIMEOUT/CONN cat={category}[{def_idx}] attempt={attempt+1}/{1+max_retries} "
+                         f"duration={duration_so_far:.1f}s type={exc_type}: {_safe_str(exc)}")
+                    _log(f"   → Auto-Retry in {retry_delay:.0f}s...")
+                    await asyncio.sleep(retry_delay)
+                else:
+                    _log(f"Model TIMEOUT/CONN cat={category}[{def_idx}] attempt={attempt+1}/{1+max_retries} "
+                         f"duration={duration_so_far:.1f}s type={exc_type}: {_safe_str(exc)} — KEINE Retries mehr")
+    except asyncio.CancelledError:
+        # Client-Disconnect (VS Code bricht Request ab). CancelledError ist eine
+        # BaseException — wuerde vom except Exception weiter unten NICHT gefangen.
+        # Daher explizit abfangen, aufraeumen, dann weiterpropagieren.
+        duration = time.perf_counter() - started
+        _finish_active_call(req_id, "cancelled", {"duration_seconds": duration})
+        _log(f"Model CANCELLED cat={category}[{def_idx}] duration={duration:.1f}s "
+             f"(Client-Disconnect / Task-Abbruch)")
+        raise
 
     if last_exc is not None:
         # Alle Retries erschoepft — Timeout/ConnectionError
@@ -2042,6 +2052,13 @@ def _register_debug_request(req_id: str, info: Dict[str, Any]) -> None:
         _DEBUG_RING = _DEBUG_RING[-_DEBUG_RING_MAX:]
 
 
+# Maximale Lebensdauer eines aktiven Calls (Sekunden). Darueber wird der
+# Call als 'stale' (verwaist) markiert und automatisch bereinigt.
+# Default: 15 Minuten — praeventiert, dass abgebrochene Tasks (Client-Disconnect)
+# den Heartbeat ewig laufen lassen.
+_ACTIVE_CALL_HARD_TIMEOUT: int = int(os.getenv("ACTIVE_CALL_HARD_TIMEOUT", "900"))
+
+
 def _register_active_call(call_id: str, info: Dict[str, Any]) -> None:
     info = dict(info)
     info["started_at"] = time.time()
@@ -2051,12 +2068,23 @@ def _register_active_call(call_id: str, info: Dict[str, Any]) -> None:
 
 
 async def _active_call_heartbeat(call_id: str) -> None:
+    """Heartbeat fuer aktive Calls. Logt alle 30s die verstrichene Zeit.
+    Self-Cleaning: Calls die laenger als _ACTIVE_CALL_HARD_TIMEOUT leben
+    (z.B. weil der Client abgebrochen ist und CancelledError nicht richtig
+    aufgeraeumt hat) werden automatisch als stale entfernt.
+    """
     while call_id in _ACTIVE_CALLS:
         await asyncio.sleep(30)
         info = _ACTIVE_CALLS.get(call_id)
         if not info:
             return
         elapsed = time.time() - info.get("started_at", time.time())
+        if elapsed > _ACTIVE_CALL_HARD_TIMEOUT:
+            _log(f"[{call_id}] STALE CALL: {elapsed:.0f}s alt — automatisch bereinigt "
+                 f"(category={info.get('agent_key','?')}, model={info.get('model','?')}). "
+                 f"Client-Disconnect oder fehlende Bereinigung vermutet.")
+            _ACTIVE_CALLS.pop(call_id, None)
+            return
         _log(f"[{call_id}] aktiver Call seit {elapsed:.0f}s "
              f"(category={info.get('agent_key','?')}, model={info.get('model','?')})")
 
@@ -2068,6 +2096,28 @@ def _finish_active_call(call_id: str, status: str = "done",
         return
     elapsed = time.time() - info.get("started_at", time.time())
     _log(f"[{call_id}] Call beendet nach {elapsed:.0f}s ({status})")
+
+
+def _purge_stale_active_calls() -> int:
+    """Entfernt alle aktiven Calls, die das Hard-Timeout ueberschritten haben.
+    Wird beim Startup (Persistenz ueber Restart) und periodisch aufgerufen.
+    Gibt die Anzahl der entfernten Calls zurueck.
+    """
+    now = time.time()
+    stale_ids: List[str] = []
+    for cid, info in _ACTIVE_CALLS.items():
+        elapsed = now - info.get("started_at", now)
+        if elapsed > _ACTIVE_CALL_HARD_TIMEOUT:
+            stale_ids.append(cid)
+    for cid in stale_ids:
+        info = _ACTIVE_CALLS.pop(cid, None)
+        if info:
+            elapsed = now - info.get("started_at", now)
+            _log(f"[{cid}] STALE CALL purge: {elapsed:.0f}s alt "
+                 f"(category={info.get('agent_key','?')}, model={info.get('model','?')})")
+    if stale_ids:
+        _log(f"Startup-Sweep: {len(stale_ids)} stale active call(s) bereinigt")
+    return len(stale_ids)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2195,6 +2245,10 @@ async def _startup_event() -> None:
     _log(f"   Auth:    {'enabled' if PROXY_AUTH_ENABLED else 'disabled'}")
     _log(f"   Debug:   {'enabled' if DEBUG_ENABLED else 'disabled'}")
     _log(f"   Tool-Cap: {TOOL_RESULT_CAP if TOOL_RESULT_CAP > 0 else 'off'}")
+
+    # Stale active calls bereinigen (Vorfahre aus vorherigem Prozess-Lauf,
+    # falls _ACTIVE_CALLS persistiert wurde oder der Prozess neu startete)
+    _purge_stale_active_calls()
 
     # Health-Checks nicht-blockierend im Hintergrund starten
     asyncio.ensure_future(_run_startup_health_checks())
