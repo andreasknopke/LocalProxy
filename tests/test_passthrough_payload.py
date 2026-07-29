@@ -438,13 +438,14 @@ def test_cooldown_roundtrip():
 # Read-Loop-Detection
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _make_read_msg(file_path: str, start: int, end: int) -> Dict[str, Any]:
+def _make_read_msg(file_path: str, start: int, end: int,
+                   call_id: str = "call_test") -> Dict[str, Any]:
     """Erzeugt eine assistant-Message mit read_file tool_call."""
     return {
         "role": "assistant",
         "content": None,
         "tool_calls": [{
-            "id": "call_test",
+            "id": call_id,
             "type": "function",
             "function": {
                 "name": "read_file",
@@ -635,9 +636,11 @@ def test_detect_file_crawl_triggers():
     old_threshold = proxy.READ_LOOP_THRESHOLD
     old_file_threshold = proxy.READ_LOOP_FILE_THRESHOLD
     old_file_window = proxy.READ_LOOP_FILE_WINDOW
+    old_keep = proxy.READ_LOOP_FILE_KEEP
     proxy.READ_LOOP_THRESHOLD = 3
     proxy.READ_LOOP_FILE_THRESHOLD = 8
     proxy.READ_LOOP_FILE_WINDOW = 12
+    proxy.READ_LOOP_FILE_KEEP = 1
     try:
         result = proxy._detect_read_loop_inplace(msgs, category="local")
         assert result is True
@@ -645,12 +648,148 @@ def test_detect_file_crawl_triggers():
         assert last["role"] == "user"
         assert "crawling" in last["content"]
         assert "/big.tsx" in last["content"]
-        # Die ueberzaehligen Reads wurden trunkiert
+        # Die ueberzaehligen Reads wurden trunkiert (keep=1 → 1 read + tool + intervention)
         assert len(msgs) < 18
+        # Tail muss weg sein: Intervention ist letzte Message
+        assert msgs[-1]["role"] == "user"
     finally:
         proxy.READ_LOOP_THRESHOLD = old_threshold
         proxy.READ_LOOP_FILE_THRESHOLD = old_file_threshold
         proxy.READ_LOOP_FILE_WINDOW = old_file_window
+        proxy.READ_LOOP_FILE_KEEP = old_keep
+
+
+def test_file_crawl_truncation_removes_tail():
+    """File-crawl Truncation entfernt den gesamten Tail inkl. spaeterer Search-Loops."""
+    msgs = [{"role": "user", "content": "analyze schedule"}]
+    for i in range(9):
+        msgs.append(_make_read_msg("/ScheduleBoard.tsx", i * 200 + 1, (i + 1) * 200))
+        msgs.append({"role": "tool", "tool_call_id": f"r{i}", "content": "chunk"})
+    # Nach dem Crawl: Search-Spam (waere sonst im Tail geblieben)
+    for i in range(5):
+        msgs.append(_make_search_msg("currentWeekShifts", call_id=f"s{i}"))
+        msgs.append(_make_search_result(f"s{i}", "Found 64 matches."))
+
+    old_threshold = proxy.READ_LOOP_THRESHOLD
+    old_file_threshold = proxy.READ_LOOP_FILE_THRESHOLD
+    old_file_window = proxy.READ_LOOP_FILE_WINDOW
+    old_keep = proxy.READ_LOOP_FILE_KEEP
+    proxy.READ_LOOP_THRESHOLD = 3
+    proxy.READ_LOOP_FILE_THRESHOLD = 8
+    proxy.READ_LOOP_FILE_WINDOW = 12
+    proxy.READ_LOOP_FILE_KEEP = 1
+    try:
+        before = len(msgs)
+        assert proxy._detect_read_loop_inplace(msgs, category="local") is True
+        assert len(msgs) < before
+        # Kein Search-Tail mehr
+        assert not any(
+            m.get("role") == "assistant" and "currentWeekShifts" in json.dumps(m)
+            for m in msgs
+        )
+        assert msgs[-1]["role"] == "user"
+        assert "crawling" in msgs[-1]["content"]
+    finally:
+        proxy.READ_LOOP_THRESHOLD = old_threshold
+        proxy.READ_LOOP_FILE_THRESHOLD = old_file_threshold
+        proxy.READ_LOOP_FILE_WINDOW = old_file_window
+        proxy.READ_LOOP_FILE_KEEP = old_keep
+
+
+def test_filter_response_blocks_repeated_search():
+    """Response-Filter blockiert Search die trailing bereits >=threshold oft kam."""
+    msgs = []
+    for i in range(4):
+        cid = f"call_{i}"
+        msgs.append(_make_search_msg("currentWeekShifts", call_id=cid))
+        msgs.append(_make_search_result(cid, "Found 64 matches."))
+    body = {"messages": msgs}
+    new_tc = [{
+        "id": "call_new",
+        "type": "function",
+        "function": {
+            "name": "grep_search",
+            "arguments": json.dumps({
+                "query": "currentWeekShifts",
+                "isRegexp": False,
+            }),
+        },
+    }]
+    old_thr = proxy._RESPONSE_LOOP_THRESHOLD
+    proxy._RESPONSE_LOOP_THRESHOLD = 3
+    try:
+        kept, removed = proxy._filter_looping_response_tool_calls(
+            body, new_tc, category="local")
+        assert len(removed) == 1
+        assert kept == []
+    finally:
+        proxy._RESPONSE_LOOP_THRESHOLD = old_thr
+
+
+def test_filter_response_allows_different_search():
+    """Andere Search-Query wird nicht geblockt."""
+    msgs = []
+    for i in range(4):
+        cid = f"call_{i}"
+        msgs.append(_make_search_msg("currentWeekShifts", call_id=cid))
+        msgs.append(_make_search_result(cid, "Found 64 matches."))
+    body = {"messages": msgs}
+    new_tc = [{
+        "id": "call_new",
+        "type": "function",
+        "function": {
+            "name": "grep_search",
+            "arguments": json.dumps({
+                "query": "totallyDifferentSymbol",
+                "isRegexp": False,
+            }),
+        },
+    }]
+    old_thr = proxy._RESPONSE_LOOP_THRESHOLD
+    proxy._RESPONSE_LOOP_THRESHOLD = 3
+    try:
+        kept, removed = proxy._filter_looping_response_tool_calls(
+            body, new_tc, category="local")
+        assert len(kept) == 1
+        assert removed == []
+    finally:
+        proxy._RESPONSE_LOOP_THRESHOLD = old_thr
+
+
+def test_filter_response_blocks_file_crawl_continue():
+    """Response-Filter blockiert weiteren read_file derselben gecrawlten Datei."""
+    msgs = []
+    for i in range(9):
+        msgs.append(_make_read_msg("/big.tsx", i * 100 + 1, (i + 1) * 100, call_id=f"r{i}"))
+        msgs.append({"role": "tool", "tool_call_id": f"r{i}", "content": "c"})
+    body = {"messages": msgs}
+    new_tc = [{
+        "id": "call_new",
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "arguments": json.dumps({
+                "filePath": "/big.tsx",
+                "startLine": 900,
+                "endLine": 1000,
+            }),
+        },
+    }]
+    old_thr = proxy._RESPONSE_LOOP_THRESHOLD
+    old_ft = proxy.READ_LOOP_FILE_THRESHOLD
+    old_fw = proxy.READ_LOOP_FILE_WINDOW
+    proxy._RESPONSE_LOOP_THRESHOLD = 3
+    proxy.READ_LOOP_FILE_THRESHOLD = 8
+    proxy.READ_LOOP_FILE_WINDOW = 12
+    try:
+        kept, removed = proxy._filter_looping_response_tool_calls(
+            body, new_tc, category="local")
+        assert len(removed) == 1
+        assert kept == []
+    finally:
+        proxy._RESPONSE_LOOP_THRESHOLD = old_thr
+        proxy.READ_LOOP_FILE_THRESHOLD = old_ft
+        proxy.READ_LOOP_FILE_WINDOW = old_fw
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -766,8 +905,8 @@ def test_detect_search_loop_cloud_model_ignored():
         proxy.SEARCH_LOOP_THRESHOLD = old_threshold
 
 
-def test_detect_search_loop_with_results_no_trigger():
-    """Suchen die Ergebnisse liefern → kein Loop, auch wenn wiederholt."""
+def test_detect_search_loop_with_results_no_trigger_when_repeat_disabled():
+    """Suchen mit Treffern → kein No-Match-Loop; Repeat-Detection aus."""
     msgs = []
     for i in range(5):
         cid = f"call_{i}"
@@ -775,15 +914,44 @@ def test_detect_search_loop_with_results_no_trigger():
         msgs.append(_make_search_result(cid, "Found 3 matches in 2 files."))
 
     old_threshold = proxy.SEARCH_LOOP_THRESHOLD
+    old_repeat = proxy.SEARCH_REPEAT_THRESHOLD
     proxy.SEARCH_LOOP_THRESHOLD = 3
+    proxy.SEARCH_REPEAT_THRESHOLD = 0
     try:
         assert proxy._detect_search_loop_inplace(msgs, category="local") is False
     finally:
         proxy.SEARCH_LOOP_THRESHOLD = old_threshold
+        proxy.SEARCH_REPEAT_THRESHOLD = old_repeat
+
+
+def test_detect_search_repeat_loop_with_results_triggers():
+    """Gleiche Suche >N mal MIT Treffern → Repeat-Loop Truncation."""
+    msgs = []
+    for i in range(4):
+        cid = f"call_{i}"
+        msgs.append(_make_search_msg("currentWeekShifts", call_id=cid))
+        msgs.append(_make_search_result(cid, "Found 64 matches in 12 files."))
+
+    old_threshold = proxy.SEARCH_LOOP_THRESHOLD
+    old_repeat = proxy.SEARCH_REPEAT_THRESHOLD
+    proxy.SEARCH_LOOP_THRESHOLD = 3
+    proxy.SEARCH_REPEAT_THRESHOLD = 3
+    try:
+        result = proxy._detect_search_loop_inplace(msgs, category="local")
+        assert result is True
+        last = msgs[-1]
+        assert last["role"] == "user"
+        assert "STOP" in last["content"]
+        assert "currentWeekShifts" in last["content"]
+    finally:
+        proxy.SEARCH_LOOP_THRESHOLD = old_threshold
+        proxy.SEARCH_REPEAT_THRESHOLD = old_repeat
 
 
 def test_detect_search_loop_interrupted_by_success():
-    """No-Match-Loop wird durch erfolgreiche Suche unterbrochen → Zaehler reset."""
+    """No-Match-Loop wird durch erfolgreiche Suche unterbrochen → Zaehler reset.
+    Repeat-Detection hier aus, damit nur No-Match-Logik getestet wird.
+    """
     msgs = []
     # 2x no match
     msgs.append(_make_search_msg("foo", call_id="c0"))
@@ -800,12 +968,15 @@ def test_detect_search_loop_interrupted_by_success():
     msgs.append(_make_search_result("c4", _NO_MATCH_TEXT))
 
     old_threshold = proxy.SEARCH_LOOP_THRESHOLD
+    old_repeat = proxy.SEARCH_REPEAT_THRESHOLD
     proxy.SEARCH_LOOP_THRESHOLD = 3
+    proxy.SEARCH_REPEAT_THRESHOLD = 0
     try:
-        # max consecutive = 2, nicht > 3
+        # max consecutive no-match = 2, nicht > 3
         assert proxy._detect_search_loop_inplace(msgs, category="local") is False
     finally:
         proxy.SEARCH_LOOP_THRESHOLD = old_threshold
+        proxy.SEARCH_REPEAT_THRESHOLD = old_repeat
 
 
 def test_detect_search_loop_different_queries_no_trigger():
@@ -817,15 +988,18 @@ def test_detect_search_loop_different_queries_no_trigger():
         msgs.append(_make_search_result(cid, _NO_MATCH_TEXT))
 
     old_threshold = proxy.SEARCH_LOOP_THRESHOLD
+    old_repeat = proxy.SEARCH_REPEAT_THRESHOLD
     proxy.SEARCH_LOOP_THRESHOLD = 3
+    proxy.SEARCH_REPEAT_THRESHOLD = 3
     try:
         assert proxy._detect_search_loop_inplace(msgs, category="local") is False
     finally:
         proxy.SEARCH_LOOP_THRESHOLD = old_threshold
+        proxy.SEARCH_REPEAT_THRESHOLD = old_repeat
 
 
 def test_detect_search_loop_disabled():
-    """Threshold=0 → Detection deaktiviert."""
+    """Beide Thresholds=0 → Detection deaktiviert."""
     msgs = []
     for i in range(5):
         cid = f"call_{i}"
@@ -833,11 +1007,14 @@ def test_detect_search_loop_disabled():
         msgs.append(_make_search_result(cid, _NO_MATCH_TEXT))
 
     old_threshold = proxy.SEARCH_LOOP_THRESHOLD
+    old_repeat = proxy.SEARCH_REPEAT_THRESHOLD
     proxy.SEARCH_LOOP_THRESHOLD = 0
+    proxy.SEARCH_REPEAT_THRESHOLD = 0
     try:
         assert proxy._detect_search_loop_inplace(msgs, category="local") is False
     finally:
         proxy.SEARCH_LOOP_THRESHOLD = old_threshold
+        proxy.SEARCH_REPEAT_THRESHOLD = old_repeat
 
 
 def test_detect_search_loop_file_search_tool():

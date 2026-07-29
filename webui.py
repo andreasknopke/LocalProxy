@@ -244,9 +244,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "read_loop_intervention": "",
         "read_loop_file_threshold": 8,
         "read_loop_file_window": 12,
+        "read_loop_file_keep": 1,
         "read_loop_file_intervention": "",
         "search_loop_threshold": 3,
         "search_loop_intervention": "",
+        "search_repeat_threshold": 3,
+        "search_repeat_intervention": "",
+        "response_loop_threshold": 3,
     },
 }
 
@@ -269,6 +273,9 @@ _ENV_TO_CONFIG: Dict[str, Tuple[str, str]] = {
     "READ_LOOP_INTERVENTION": ("tokens", "read_loop_intervention"),
     "SEARCH_LOOP_THRESHOLD": ("tokens", "search_loop_threshold"),
     "SEARCH_LOOP_INTERVENTION": ("tokens", "search_loop_intervention"),
+    "SEARCH_REPEAT_THRESHOLD": ("tokens", "search_repeat_threshold"),
+    "SEARCH_REPEAT_INTERVENTION": ("tokens", "search_repeat_intervention"),
+    "RESPONSE_LOOP_THRESHOLD": ("tokens", "response_loop_threshold"),
 }
 
 
@@ -1068,7 +1075,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
         <div class="hint">Eigener Interventionstext. Platzhalter {count} = Anzahl der Wiederholungen.</div>
       </div>
       <div class="form-group">
-        <label>Search-Loop-Schwelle (0=aus)</label>
+        <label>Search-Loop-Schwelle No-Match (0=aus)</label>
         <input type="number" id="search_loop_threshold" min="0" max="100">
         <div class="hint">Erkennt wiederholte erfolglose Suchen (No matches found). Bei &gt;N Wiederholungen wird eine Intervention injiziert. 0 = deaktiviert.</div>
       </div>
@@ -1076,6 +1083,20 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
         <label>Search-Loop-Interventionstext (optional)</label>
         <textarea id="search_loop_intervention" rows="3" placeholder="Leer = Standardtext verwenden. {query} und {count} werden ersetzt."></textarea>
         <div class="hint">Eigener Interventionstext. Platzhalter {query} = Suchbegriff, {count} = Anzahl der Wiederholungen.</div>
+      </div>
+      <div class="form-group">
+        <label>Search-Repeat-Schwelle auch mit Treffern (0=aus)</label>
+        <input type="number" id="search_repeat_threshold" min="0" max="100">
+        <div class="hint">Erkennt wiederholte identische Suchen AUCH wenn Treffer kommen (z.B. currentWeekShifts 10x). 0 = deaktiviert.</div>
+      </div>
+      <div class="form-group">
+        <label>Search-Repeat-Interventionstext (optional)</label>
+        <textarea id="search_repeat_intervention" rows="3" placeholder="Leer = Standardtext. {query}/{count}"></textarea>
+      </div>
+      <div class="form-group">
+        <label>Response-Loop-Enforcement (0=aus)</label>
+        <input type="number" id="response_loop_threshold" min="0" max="100">
+        <div class="hint">Blockiert Tool-Calls in der Modell-Antwort, die denselben Read/Search-Loop fortsetzen. Default 3.</div>
       </div>
     </div>
   </section>
@@ -1227,6 +1248,9 @@ async function loadConfig() {
     document.getElementById('read_loop_intervention').value = tk.read_loop_intervention || '';
     document.getElementById('search_loop_threshold').value = tk.search_loop_threshold != null ? tk.search_loop_threshold : 3;
     document.getElementById('search_loop_intervention').value = tk.search_loop_intervention || '';
+    document.getElementById('search_repeat_threshold').value = tk.search_repeat_threshold != null ? tk.search_repeat_threshold : 3;
+    document.getElementById('search_repeat_intervention').value = tk.search_repeat_intervention || '';
+    document.getElementById('response_loop_threshold').value = tk.response_loop_threshold != null ? tk.response_loop_threshold : 3;
 
   } catch(e) {
     showToast('Fehler beim Laden: ' + e.message, 'error');
@@ -1301,6 +1325,9 @@ async function saveConfig() {
     read_loop_intervention: document.getElementById('read_loop_intervention').value || '',
     search_loop_threshold: parseInt(document.getElementById('search_loop_threshold').value) || 0,
     search_loop_intervention: document.getElementById('search_loop_intervention').value || '',
+    search_repeat_threshold: parseInt(document.getElementById('search_repeat_threshold').value) || 0,
+    search_repeat_intervention: document.getElementById('search_repeat_intervention').value || '',
+    response_loop_threshold: parseInt(document.getElementById('response_loop_threshold').value) || 0,
   };
 
   try {

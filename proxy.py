@@ -309,6 +309,8 @@ READ_LOOP_THRESHOLD: int = int(os.getenv("READ_LOOP_THRESHOLD", "3"))
 # File-Crawl-Detection: gleiche Datei >N mal in den letzten M Reads (auch verschiedene Zeilen)
 READ_LOOP_FILE_THRESHOLD: int = int(os.getenv("READ_LOOP_FILE_THRESHOLD", "8"))
 READ_LOOP_FILE_WINDOW: int = int(os.getenv("READ_LOOP_FILE_WINDOW", "12"))
+# Bei File-Crawl: wie viele Reads der Datei behalten (Rest + Folgeloop wird trunkiert)
+READ_LOOP_FILE_KEEP: int = int(os.getenv("READ_LOOP_FILE_KEEP", "1"))
 READ_LOOP_INTERVENTION: str = os.getenv(
     "READ_LOOP_INTERVENTION",
     "STOP! You are looping. You have already read this file/range {count} times. "
@@ -319,14 +321,16 @@ READ_LOOP_INTERVENTION: str = os.getenv(
 READ_LOOP_FILE_INTERVENTION: str = os.getenv(
     "READ_LOOP_FILE_INTERVENTION",
     "STOP! You are crawling file '{file}' — {count} reads in the last {window} tool calls. "
-    "You already have the full content. STOP READING and proceed with your task "
-    "(edit, build, run, or respond). Do NOT read '{file}' again. Go on."
+    "You already have enough content from this file. Do NOT read '{file}' again. "
+    "Do NOT re-search symbols you already found. Summarize what you know and take "
+    "the next concrete action (edit/create files, run commands, or answer). Go on."
 )
 
 # ── Search-Loop-Detection (NUR lokales Modell) ─────────────────────────────
-# Erkennt wenn ein Modell dieselbe Suche >N mal wiederholt und jedes Mal
-# "No matches found" zurueckkommt — das Modell haengt in einer Such-Schleife.
+# No-Match-Loops: gleiche Suche >N mal ohne Treffer.
 SEARCH_LOOP_THRESHOLD: int = int(os.getenv("SEARCH_LOOP_THRESHOLD", "3"))
+# Repeat-Loops: gleiche Suche >N mal — AUCH mit Treffern (Spam/Exploration-Loop).
+SEARCH_REPEAT_THRESHOLD: int = int(os.getenv("SEARCH_REPEAT_THRESHOLD", "3"))
 SEARCH_LOOP_INTERVENTION: str = os.getenv(
     "SEARCH_LOOP_INTERVENTION",
     "STOP! You are looping on a search that returns no results. You have already "
@@ -335,6 +339,25 @@ SEARCH_LOOP_INTERVENTION: str = os.getenv(
     "STOP SEARCHING for this pattern. Change your approach: try a different "
     "search term, read the file directly, use a different tool, or proceed with "
     "the information you already have. Do NOT repeat this search. Go on."
+)
+SEARCH_REPEAT_INTERVENTION: str = os.getenv(
+    "SEARCH_REPEAT_INTERVENTION",
+    "STOP! You already searched for '{query}' {count} times and got results. "
+    "Repeating the same search will not help. Use the results you already have, "
+    "read a specific file once, or implement the change. Do NOT search for "
+    "'{query}' again. Go on."
+)
+
+# Response-Level Enforcement: blockiert Tool-Calls die trotz Historie-Intervention
+# erneut denselben Loop fortsetzen. Default aktiv (3) fuer local.
+# 0 = deaktiviert.
+_RESPONSE_LOOP_THRESHOLD: int = int(os.getenv("RESPONSE_LOOP_THRESHOLD", "3"))
+_RESPONSE_LOOP_STOP_TEXT: str = os.getenv(
+    "RESPONSE_LOOP_STOP_TEXT",
+    "I've stopped the repeated tool loop. Based on the information already "
+    "gathered, I should proceed with a concrete next step instead of "
+    "re-reading or re-searching the same targets. Please continue with an "
+    "edit, a different approach, or a final answer."
 )
 
 
@@ -482,11 +505,13 @@ def _apply_config_file() -> None:
     TOOL_RESULT_CAP = int(cfg.get("tokens", {}).get("tool_result_cap", TOOL_RESULT_CAP))
 
     global READ_LOOP_THRESHOLD, READ_LOOP_INTERVENTION
-    global READ_LOOP_FILE_THRESHOLD, READ_LOOP_FILE_WINDOW, READ_LOOP_FILE_INTERVENTION
+    global READ_LOOP_FILE_THRESHOLD, READ_LOOP_FILE_WINDOW, READ_LOOP_FILE_KEEP
+    global READ_LOOP_FILE_INTERVENTION
     tokens_cfg = cfg.get("tokens", {})
     READ_LOOP_THRESHOLD = int(tokens_cfg.get("read_loop_threshold", READ_LOOP_THRESHOLD))
     READ_LOOP_FILE_THRESHOLD = int(tokens_cfg.get("read_loop_file_threshold", READ_LOOP_FILE_THRESHOLD))
     READ_LOOP_FILE_WINDOW = int(tokens_cfg.get("read_loop_file_window", READ_LOOP_FILE_WINDOW))
+    READ_LOOP_FILE_KEEP = int(tokens_cfg.get("read_loop_file_keep", READ_LOOP_FILE_KEEP))
     rl_intervention = tokens_cfg.get("read_loop_intervention", "")
     if rl_intervention:
         READ_LOOP_INTERVENTION = str(rl_intervention)
@@ -495,10 +520,18 @@ def _apply_config_file() -> None:
         READ_LOOP_FILE_INTERVENTION = str(rl_file_intervention)
 
     global SEARCH_LOOP_THRESHOLD, SEARCH_LOOP_INTERVENTION
+    global SEARCH_REPEAT_THRESHOLD, SEARCH_REPEAT_INTERVENTION
+    global _RESPONSE_LOOP_THRESHOLD
     SEARCH_LOOP_THRESHOLD = int(tokens_cfg.get("search_loop_threshold", SEARCH_LOOP_THRESHOLD))
+    SEARCH_REPEAT_THRESHOLD = int(tokens_cfg.get("search_repeat_threshold", SEARCH_REPEAT_THRESHOLD))
     sl_intervention = tokens_cfg.get("search_loop_intervention", "")
     if sl_intervention:
         SEARCH_LOOP_INTERVENTION = str(sl_intervention)
+    sr_intervention = tokens_cfg.get("search_repeat_intervention", "")
+    if sr_intervention:
+        SEARCH_REPEAT_INTERVENTION = str(sr_intervention)
+    _RESPONSE_LOOP_THRESHOLD = int(tokens_cfg.get(
+        "response_loop_threshold", _RESPONSE_LOOP_THRESHOLD))
 
     _log("Config aus config.json neu geladen")
 
@@ -1039,12 +1072,31 @@ def _extract_read_signature(args_raw: Any) -> Optional[str]:
 
 _READ_FILE_TOOL_NAMES = {"read_file", "readFile", "read_lines", "readLines"}
 
+# Bekannte Search-Tool-Namen (fuer Signatur-Extraktion / Response-Filter).
+# Die Detection selbst ist zusaetzlich tool-namen-unabhaengig via No-Match-Results.
+_SEARCH_TOOL_NAMES = {"grep_search", "grepSearch", "file_search", "fileSearch",
+                      "codebase_search", "search", "grep", "find_files"}
+
+_NO_MATCHES_INDICATORS = (
+    "No matches found",
+    "no matches found",
+    "0 results",
+    "No files found",
+    "no results found",
+    "No results",
+)
+
 
 def _truncate_messages_from(messages: List[Dict[str, Any]], msg_index: int,
                             intervention_text: str) -> None:
     """Trunciert die messages-Liste ab msg_index (inklusiv) und appended eine
     Intervention-User-Message. Stellt sicher, dass keine dangling tool_calls / tool
     results zurueckbleiben (d.h. assistant mit tool_calls ohne result ist ungueltig).
+
+    WICHTIG: Schneidet bis zum ENDE ab (nicht nur ein Segment). Das ist noetig,
+    weil VS Code die volle Historie mitschickt — wenn nur die Mitte entfernt
+    wuerde, bliebe der Loop-Tail erhalten und die Detection feuert endlos
+    mit demselben Cut-Punkt, waehrend das Modell weiter loopt.
     """
     # Rueckwaerts vom Cut-Punkt pruefen: die letzte verbleibende Message darf KEINE
     # assistant mit tool_calls ohne nachfolgendes tool-result sein.
@@ -1062,33 +1114,21 @@ def _truncate_messages_from(messages: List[Dict[str, Any]], msg_index: int,
     messages.append({"role": "user", "content": intervention_text})
 
 
-def _detect_read_loop_inplace(messages: List[Dict[str, Any]], label: str = "Payload",
-                              category: str = "") -> bool:
-    """Erkennt Read-Loops: gleiche Datei + gleiche Zeilen >N mal hintereinander.
-    NUR fuer lokale Modelle (category='local'). Cloud-Modelle werden nicht beeinflusst.
-
-    AKTIVE INTERVENTION durch Truncation: Die wiederholten Tool-Calls und deren
-    Ergebnisse werden aus dem Nachrichtenverlauf entfernt und durch eine einzige
-    Interventions-Message ersetzt. Das Modell hat keinen Zugriff mehr auf die
-    Loop-Historie und ist gezwungen, einen neuen Ansatz zu waehlen.
-
-    Zwei Detection-Modi:
-      1. Exact-Loop: identische Signaturen (file+lines) >READ_LOOP_THRESHOLD konsekutiv
-      2. File-Crawl: gleiche Datei (verschiedene Zeilen) >READ_LOOP_FILE_THRESHOLD mal
-         in den letzten READ_LOOP_FILE_WINDOW Reads
-    """
-    if category != "local":
+def _is_search_tool_name(name: str) -> bool:
+    n = (name or "").strip()
+    if not n:
         return False
-    if READ_LOOP_THRESHOLD <= 0:
-        return False
+    if n in _SEARCH_TOOL_NAMES:
+        return True
+    low = n.lower()
+    return "search" in low or "grep" in low
 
-    # Extrahiere read_file Tool-Call-Signaturen MIT Message-Index
-    read_entries: List[Tuple[int, str]] = []  # (message_index, signature)
 
+def _collect_read_entries(messages: List[Dict[str, Any]]) -> List[Tuple[int, str, str]]:
+    """(msg_idx, full_sig, file_path) fuer alle read_file tool_calls."""
+    entries: List[Tuple[int, str, str]] = []
     for msg_idx, m in enumerate(messages):
-        if not isinstance(m, dict):
-            continue
-        if m.get("role") != "assistant":
+        if not isinstance(m, dict) or m.get("role") != "assistant":
             continue
         tool_calls = m.get("tool_calls")
         if not isinstance(tool_calls, list):
@@ -1102,83 +1142,172 @@ def _detect_read_loop_inplace(messages: List[Dict[str, Any]], label: str = "Payl
             name = str(func.get("name", "")).strip()
             if name not in _READ_FILE_TOOL_NAMES:
                 continue
-            args_raw = func.get("arguments", "")
-            sig = _extract_read_signature(args_raw)
-            if sig:
-                read_entries.append((msg_idx, sig))
+            sig = _extract_read_signature(func.get("arguments", ""))
+            if not sig:
+                continue
+            file_path = sig.split("|", 1)[0]
+            entries.append((msg_idx, sig, file_path))
+    return entries
 
+
+def _collect_search_entries(
+    messages: List[Dict[str, Any]],
+) -> Tuple[List[Tuple[int, str, str, bool]], Dict[str, Any]]:
+    """Sammelt Search-Tool-Calls: (msg_idx, tc_id, sig, is_no_match).
+
+    Returns (entries, diag_info).
+    """
+    tool_results: Dict[str, str] = {}
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "")
+        if role == "tool":
+            tc_id = str(m.get("tool_call_id", ""))
+            if tc_id:
+                tool_results[tc_id] = _extract_tool_result_text(m)
+        elif role == "function":
+            tc_id = str(m.get("tool_call_id", "") or m.get("name", ""))
+            if tc_id:
+                tool_results[tc_id] = _extract_tool_result_text(m)
+
+    entries: List[Tuple[int, str, str, bool]] = []
+    diag_names: Set[str] = set()
+    diag_total = 0
+    diag_no_match = 0
+    diag_id_miss = 0
+
+    for msg_idx, m in enumerate(messages):
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        tool_calls = m.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            func = tc.get("function") or {}
+            if not isinstance(func, dict):
+                continue
+            name = str(func.get("name", "")).strip()
+            diag_total += 1
+            diag_names.add(name)
+            # Search-Detection: tool-namen-unabhaengig via Result ODER Search-Name
+            tc_id = str(tc.get("id", ""))
+            result_text = tool_results.get(tc_id, "")
+            if not result_text:
+                # Positionales Fallback: naechste tool-message
+                next_idx = msg_idx + 1
+                if next_idx < len(messages):
+                    next_m = messages[next_idx]
+                    if isinstance(next_m, dict) and next_m.get("role") in ("tool", "function"):
+                        result_text = _extract_tool_result_text(next_m)
+                if not result_text:
+                    diag_id_miss += 1
+            is_no_match = _is_no_match_result(result_text)
+            if is_no_match:
+                diag_no_match += 1
+            # Nur Search-Tools ODER No-Match-Results als Search-Entries
+            if not (_is_search_tool_name(name) or is_no_match):
+                continue
+            sig = _extract_search_signature(func.get("arguments", ""))
+            if sig:
+                entries.append((msg_idx, tc_id, sig, is_no_match))
+
+    diag = {
+        "total_tcs": diag_total,
+        "names": sorted(diag_names),
+        "tool_results_mapped": len(tool_results),
+        "no_match_results": diag_no_match,
+        "id_misses": diag_id_miss,
+        "search_entries": len(entries),
+    }
+    return entries, diag
+
+
+def _detect_read_loop_inplace(messages: List[Dict[str, Any]], label: str = "Payload",
+                              category: str = "") -> bool:
+    """Erkennt Read-Loops: gleiche Datei + gleiche Zeilen >N mal hintereinander.
+    NUR fuer lokale Modelle (category='local'). Cloud-Modelle werden nicht beeinflusst.
+
+    AKTIVE INTERVENTION durch Truncation: Ab dem Loop-Start wird ALLES bis zum
+    Ende entfernt und durch eine Intervention ersetzt. Das verhindert, dass
+    VS Code den Loop-Tail mitschickt und die Detection endlos denselben alten
+    Cut-Punkt trifft, waehrend das Modell weiter loopt.
+
+    Zwei Detection-Modi:
+      1. Exact-Loop: identische Signaturen (file+lines) >READ_LOOP_THRESHOLD konsekutiv
+      2. File-Crawl: gleiche Datei (verschiedene Zeilen) >READ_LOOP_FILE_THRESHOLD mal
+         in den letzten READ_LOOP_FILE_WINDOW Reads
+    """
+    if category != "local":
+        return False
+    if READ_LOOP_THRESHOLD <= 0:
+        return False
+
+    read_entries = _collect_read_entries(messages)
     if not read_entries:
         return False
 
     # ── Modus 1: Exact-Loop (gleiche Datei + gleiche Zeilen konsekutiv) ──
-    max_consecutive = 1
-    current_count = 1
-    current_entry: Tuple[int, str] = read_entries[0]
-    loop_start_idx: Optional[int] = None  # message-index der 2. Konsekutiv-Wiederholung
-    loop_sig: Optional[str] = None
-
-    for entry in read_entries[1:]:
-        if entry[1] == current_entry[1]:
-            current_count += 1
-            if current_count == 2 and loop_start_idx is None:
-                loop_start_idx = entry[0]
-                loop_sig = entry[1]
+    # Nur die TRAILING-Sequenz am Ende zaehlt (sonst greift alte Historie ewig).
+    trailing_sig = read_entries[-1][1]
+    trailing_indices: List[int] = []
+    for msg_idx, sig, _fp in reversed(read_entries):
+        if sig == trailing_sig:
+            trailing_indices.append(msg_idx)
         else:
-            current_count = 1
-        current_entry = entry
-        if current_count > max_consecutive:
-            max_consecutive = current_count
+            break
+    trailing_indices.reverse()
+    trailing_count = len(trailing_indices)
 
-    if max_consecutive > READ_LOOP_THRESHOLD:
-        truncate_idx = loop_start_idx if loop_start_idx is not None else read_entries[-1][0]
-        intervention_text = READ_LOOP_INTERVENTION.format(count=max_consecutive)
+    if trailing_count > READ_LOOP_THRESHOLD:
+        # Behalte den ersten Read der trailing-Sequenz, schneide ab dem 2.
+        truncate_idx = (
+            trailing_indices[1] if len(trailing_indices) > 1 else trailing_indices[0]
+        )
+        intervention_text = READ_LOOP_INTERVENTION.format(count=trailing_count)
         _truncate_messages_from(messages, truncate_idx, intervention_text)
-        _log(f"{label}: READ-LOOP (exact) erkannt ({max_consecutive}x gleiche read_file-Parameter), "
-             f"Konversation bei idx={truncate_idx} trunkiert + Intervention")
+        _log(f"{label}: READ-LOOP (exact) erkannt ({trailing_count}x trailing "
+             f"gleiche read_file-Parameter), Konversation bei idx={truncate_idx} "
+             f"trunkiert + Intervention")
         return True
 
     # ── Modus 2: File-Crawl (gleiche Datei, verschiedene Zeilen, gehaeuft) ──
     if READ_LOOP_FILE_THRESHOLD > 0 and READ_LOOP_FILE_WINDOW > 0:
         window = read_entries[-READ_LOOP_FILE_WINDOW:]
         file_counts: Dict[str, int] = {}
-        for _idx, sig in window:
-            file_part = sig.split("|", 1)[0]
+        for _idx, _sig, file_part in window:
             file_counts[file_part] = file_counts.get(file_part, 0) + 1
 
+        # Preferiere die Datei mit den meisten Reads im Fenster
+        worst_file = ""
+        worst_count = 0
         for file_path, count in file_counts.items():
-            if count > READ_LOOP_FILE_THRESHOLD:
-                # Finde den Message-Index der (threshold+1).-ten Wiederholung
-                occurrences = [e_idx for e_idx, e_sig in window if e_sig.split("|", 1)[0] == file_path]
-                if len(occurrences) > READ_LOOP_FILE_THRESHOLD:
-                    truncate_idx = occurrences[READ_LOOP_FILE_THRESHOLD]
-                    intervention_text = READ_LOOP_FILE_INTERVENTION.format(
-                        file=file_path, count=count, window=READ_LOOP_FILE_WINDOW
-                    )
-                    _truncate_messages_from(messages, truncate_idx, intervention_text)
-                    _log(f"{label}: READ-LOOP (file-crawl) erkannt ({count}x '{file_path}' "
-                         f"in letzten {len(window)} reads), Konversation trunkiert bei idx={truncate_idx}")
-                    return True
+            if count > worst_count:
+                worst_file = file_path
+                worst_count = count
+
+        if worst_file and worst_count > READ_LOOP_FILE_THRESHOLD:
+            keep_n = max(0, READ_LOOP_FILE_KEEP)
+            occurrences = [e_idx for e_idx, _sig, fp in window if fp == worst_file]
+            if len(occurrences) > READ_LOOP_FILE_THRESHOLD:
+                # Behalte die ersten keep_n Reads der Datei, schneide ab dem naechsten
+                cut_pos = min(keep_n, len(occurrences) - 1)
+                truncate_idx = occurrences[cut_pos]
+                intervention_text = READ_LOOP_FILE_INTERVENTION.format(
+                    file=worst_file, count=worst_count, window=READ_LOOP_FILE_WINDOW
+                )
+                _truncate_messages_from(messages, truncate_idx, intervention_text)
+                _log(f"{label}: READ-LOOP (file-crawl) erkannt ({worst_count}x '{worst_file}' "
+                     f"in letzten {len(window)} reads), Konversation trunkiert bei "
+                     f"idx={truncate_idx} (keep={keep_n})")
+                return True
 
     return False
 
 
 # ── Search-Loop-Detection ──────────────────────────────────────────────────
-
-# Bekannte Search-Tool-Namen (fuer Signatur-Extraktion).
-# Die Detection selbst ist tool-namen-unabhaengig: JEDER Tool-Call dessen
-# Ergebnis "No matches found" enthaelt wird als Search-Versuch gewertet.
-_SEARCH_TOOL_NAMES = {"grep_search", "grepSearch", "file_search", "fileSearch",
-                      "codebase_search", "search", "grep", "find_files"}
-
-_NO_MATCHES_INDICATORS = (
-    "No matches found",
-    "no matches found",
-    "0 results",
-    "No files found",
-    "no results found",
-    "No results",
-)
-
 
 def _extract_tool_call_signature(args_raw: Any) -> Optional[str]:
     """Extrahiert eine stabile Signatur aus Tool-Call-Arguments.
@@ -1256,153 +1385,74 @@ def _is_no_match_result(text: str) -> bool:
 
 def _detect_search_loop_inplace(messages: List[Dict[str, Any]], label: str = "Payload",
                                 category: str = "") -> bool:
-    """Erkennt Search-Loops: gleicher Tool-Call >N mal mit 'No matches found' als Ergebnis.
-    NUR fuer lokale Modelle (category='local'). Cloud-Modelle werden nicht beeinflusst.
+    """Erkennt Search-Loops fuer lokale Modelle.
 
-    TOOL-NAMEN-UNABHAENGIG: Jeder Tool-Call dessen Ergebnis "No matches found"
-    enthaelt wird als Search-Versuch gewertet. Die Signatur wird aus den
-    Arguments extrahiert — gleiche Arguments = gleicher Versuch.
+    Zwei Modi:
+      1. No-Match-Loop: gleiche Signatur >SEARCH_LOOP_THRESHOLD mit No-Match
+      2. Repeat-Loop: gleiche Signatur >SEARCH_REPEAT_THRESHOLD (auch MIT Treffern)
 
-    Bei Erkennung: Truncation der Konversation ab dem Loop-Beginn.
+    Nur TRAILING-Sequenzen am Ende der Historie zaehlen. Bei Erkennung:
+    Truncation ab dem 2. Vorkommen bis zum Ende + Intervention.
     """
     if category != "local":
         return False
-    if SEARCH_LOOP_THRESHOLD <= 0:
+    if SEARCH_LOOP_THRESHOLD <= 0 and SEARCH_REPEAT_THRESHOLD <= 0:
         return False
 
-    # Schritt 1: Mapping tool_call_id → Ergebnis-Text
-    # Unterstuetzt role="tool" (OpenAI) UND role="function" (legacy)
-    tool_results: Dict[str, str] = {}
-    for m in messages:
-        if not isinstance(m, dict):
-            continue
-        role = m.get("role", "")
-        if role == "tool":
-            tc_id = str(m.get("tool_call_id", ""))
-            if tc_id:
-                tool_results[tc_id] = _extract_tool_result_text(m)
-        elif role == "function":
-            # Legacy OpenAI function-calling format
-            tc_id = str(m.get("tool_call_id", "") or m.get("name", ""))
-            if tc_id:
-                tool_results[tc_id] = _extract_tool_result_text(m)
+    all_entries, diag = _collect_search_entries(messages)
 
-    # Schritt 2: Sammle ALLE Tool-Calls mit ihrer Signatur UND ob das Ergebnis
-    # "No matches found" war. So koennen erfolgreiche Suchen den Zaehler resetten.
-    all_entries: List[Tuple[int, str, str, bool]] = []  # (msg_idx, tc_id, sig, is_no_match)
-    _diag_tool_names: Set[str] = set()
-    _diag_total_tcs = 0
-    _diag_no_match_count = 0
-
-    for msg_idx, m in enumerate(messages):
-        if not isinstance(m, dict):
-            continue
-        if m.get("role") != "assistant":
-            continue
-        tool_calls = m.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            continue
-        for tc in tool_calls:
-            if not isinstance(tc, dict):
-                continue
-            func = tc.get("function") or {}
-            if not isinstance(func, dict):
-                continue
-            _diag_total_tcs += 1
-            name = str(func.get("name", "")).strip()
-            _diag_tool_names.add(name)
-            tc_id = str(tc.get("id", ""))
-            result_text = tool_results.get(tc_id, "")
-            is_no_match = _is_no_match_result(result_text)
-            if is_no_match:
-                _diag_no_match_count += 1
-            args_raw = func.get("arguments", "")
-            sig = _extract_search_signature(args_raw)
-            if sig:
-                all_entries.append((msg_idx, tc_id, sig, is_no_match))
-
-    # Diagnose-Logging
-    if _diag_total_tcs > 0 and not any(e[3] for e in all_entries):
-        _log(f"{label}: SEARCH-LOOP-DIAG: {_diag_total_tcs} tool_calls gefunden, "
-             f"names={sorted(_diag_tool_names)}, "
-             f"tool_results_mapped={len(tool_results)}, "
-             f"no_match_results={_diag_no_match_count}")
-
-    # Fallback: Wenn tool_call_id-Matching fehlschlaegt (IDs stimmen nicht
-    # ueberein), versuche positionales Matching: assistant mit tool_calls
-    # direkt gefolgt von tool-Message.
-    if not all_entries and _diag_total_tcs > 0:
-        for msg_idx, m in enumerate(messages):
-            if not isinstance(m, dict) or m.get("role") != "assistant":
-                continue
-            tool_calls = m.get("tool_calls")
-            if not isinstance(tool_calls, list) or not tool_calls:
-                continue
-            next_idx = msg_idx + 1
-            if next_idx >= len(messages):
-                continue
-            next_m = messages[next_idx]
-            if not isinstance(next_m, dict) or next_m.get("role") not in ("tool", "function"):
-                continue
-            result_text = _extract_tool_result_text(next_m)
-            is_no_match = _is_no_match_result(result_text)
-            for tc in tool_calls:
-                if not isinstance(tc, dict):
-                    continue
-                func = tc.get("function") or {}
-                if not isinstance(func, dict):
-                    continue
-                args_raw = func.get("arguments", "")
-                sig = _extract_search_signature(args_raw)
-                if sig:
-                    all_entries.append((msg_idx, str(tc.get("id", "")), sig, is_no_match))
+    if diag["total_tcs"] > 0 and diag["search_entries"] == 0:
+        _log(f"{label}: SEARCH-LOOP-DIAG: {diag['total_tcs']} tool_calls gefunden, "
+             f"names={diag['names']}, tool_results_mapped={diag['tool_results_mapped']}, "
+             f"no_match_results={diag['no_match_results']}, id_misses={diag['id_misses']}")
 
     if not all_entries:
         return False
 
-    # Schritt 3: Zaehle konsekutive gleiche Signaturen
-    max_consecutive = 0
-    current_count = 0
-    current_sig = ""
-    worst_query = ""
-    truncate_msg_idx: Optional[int] = None
+    # ── Modus 1: Trailing No-Match-Loop ──
+    if SEARCH_LOOP_THRESHOLD > 0:
+        nm_indices: List[int] = []
+        nm_sig = ""
+        for msg_idx, _tc_id, sig, is_no_match in reversed(all_entries):
+            if not is_no_match:
+                break
+            if not nm_sig:
+                nm_sig = sig
+            if sig != nm_sig:
+                break
+            nm_indices.append(msg_idx)
+        nm_indices.reverse()
+        if nm_sig and len(nm_indices) > SEARCH_LOOP_THRESHOLD:
+            cut = nm_indices[1] if len(nm_indices) > 1 else nm_indices[0]
+            query = nm_sig.split("|", 1)[0]
+            intervention_text = SEARCH_LOOP_INTERVENTION.format(
+                query=query[:120], count=len(nm_indices)
+            )
+            _truncate_messages_from(messages, cut, intervention_text)
+            _log(f"{label}: SEARCH-LOOP (no-match) erkannt ({len(nm_indices)}x "
+                 f"'{query[:80]}'), Konversation trunkiert bei idx={cut}")
+            return True
 
-    # Schritt 3: Zaehle konsekutive gleiche Signaturen mit No-Match-Ergebnis.
-    # Erfolgreiche Suchen (is_no_match=False) resetten den Zaehler.
-    max_consecutive = 0
-    current_count = 0
-    current_sig = ""
-    worst_query = ""
-    truncate_msg_idx: Optional[int] = None
-
-    for msg_idx, tc_id, sig, is_no_match in all_entries:
-        if is_no_match:
-            if sig == current_sig:
-                current_count += 1
-                if current_count == 2 and truncate_msg_idx is None:
-                    truncate_msg_idx = msg_idx
-            else:
-                current_count = 1
-                current_sig = sig
-                truncate_msg_idx = None
-            if current_count > max_consecutive:
-                max_consecutive = current_count
-                worst_query = sig.split("|", 1)[0]
-        else:
-            # Erfolgreiche Suche → Zaehler resetten
-            current_count = 0
-            current_sig = ""
-            truncate_msg_idx = None
-
-    if max_consecutive > SEARCH_LOOP_THRESHOLD and truncate_msg_idx is not None:
-        intervention_text = SEARCH_LOOP_INTERVENTION.format(
-            query=worst_query[:120], count=max_consecutive
-        )
-        _truncate_messages_from(messages, truncate_msg_idx, intervention_text)
-        _log(f"{label}: SEARCH-LOOP erkannt ({max_consecutive}x gleicher Tool-Call "
-             f"'{worst_query[:80]}' mit 'No matches found'), "
-             f"Konversation trunkiert bei idx={truncate_msg_idx}")
-        return True
+    # ── Modus 2: Trailing Repeat-Loop (auch mit Treffern) ──
+    if SEARCH_REPEAT_THRESHOLD > 0:
+        rep_indices: List[int] = []
+        rep_sig = all_entries[-1][2]
+        for msg_idx, _tc_id, sig, _nm in reversed(all_entries):
+            if sig != rep_sig:
+                break
+            rep_indices.append(msg_idx)
+        rep_indices.reverse()
+        if len(rep_indices) > SEARCH_REPEAT_THRESHOLD:
+            cut = rep_indices[1] if len(rep_indices) > 1 else rep_indices[0]
+            query = rep_sig.split("|", 1)[0]
+            intervention_text = SEARCH_REPEAT_INTERVENTION.format(
+                query=query[:120], count=len(rep_indices)
+            )
+            _truncate_messages_from(messages, cut, intervention_text)
+            _log(f"{label}: SEARCH-LOOP (repeat) erkannt ({len(rep_indices)}x "
+                 f"'{query[:80]}' auch mit Treffern), Konversation trunkiert bei "
+                 f"idx={cut}")
+            return True
 
     return False
 
@@ -1430,49 +1480,10 @@ def _sanitize_image_urls_inplace(messages: List[Dict[str, Any]], label: str = "P
     return removed
 
 
-# ── Response-Level Loop-Blocking ───────────────────────────────────────────
-# Letzter Ausweg NUR fuer echte No-Match-Search-Loops: Wenn das Modell trotz
-# Historie denselben erfolglosen Search-Call erneut ausgibt, wird genau dieser
-# Tool-Call aus der Response entfernt. Produktive Reads/Searches werden NICHT
-# geblockt — auch nicht bei wiederholtem Lesen derselben Datei.
-#
-# Default 0 = deaktiviert. History-basierte Truncation (read/search loop) bleibt
-# die primaere Intervention. Response-Blocking ist optional und konservativ.
-_RESPONSE_LOOP_THRESHOLD: int = int(os.getenv("RESPONSE_LOOP_THRESHOLD", "0"))
-
-_RESPONSE_LOOP_STOP_TEXT: str = os.getenv(
-    "RESPONSE_LOOP_STOP_TEXT",
-    "I've completed my analysis. The repeated unsuccessful search pattern "
-    "indicates the requested information is not available in this workspace "
-    "or is excluded by search settings. Please try a different approach or "
-    "provide more specific guidance."
-)
-
-
-def _named_tool_signature(name: str, args_raw: Any) -> Optional[str]:
-    """Signatur inkl. Tool-Name, damit read/search nicht kollidieren."""
-    args_sig = _extract_tool_call_signature(args_raw)
-    if not args_sig:
-        return None
-    return f"{name}|{args_sig}"
-
-
-def _build_tool_result_map(messages: List[Dict[str, Any]]) -> Dict[str, str]:
-    """Mapping tool_call_id → Ergebnistext (role=tool/function)."""
-    tool_results: Dict[str, str] = {}
-    for m in messages:
-        if not isinstance(m, dict):
-            continue
-        role = m.get("role", "")
-        if role == "tool":
-            tc_id = str(m.get("tool_call_id", ""))
-            if tc_id:
-                tool_results[tc_id] = _extract_tool_result_text(m)
-        elif role == "function":
-            tc_id = str(m.get("tool_call_id", "") or m.get("name", ""))
-            if tc_id:
-                tool_results[tc_id] = _extract_tool_result_text(m)
-    return tool_results
+# ── Response-Level Loop-Enforcement ────────────────────────────────────────
+# Letzter Ausweg: Wenn das Modell trotz History-Intervention denselben
+# Read/Search-Loop fortsetzt, werden die offending tool_calls aus der Response
+# entfernt. Defaults/Thresholds stehen oben bei den Loop-Globals.
 
 
 def _filter_looping_response_tool_calls(
@@ -1480,17 +1491,13 @@ def _filter_looping_response_tool_calls(
     tool_calls: List[Dict[str, Any]],
     category: str = "",
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Filtert nur echte No-Match-Search-Loops aus der Modell-Response.
+    """Filtert Tool-Calls aus der Modell-Response die einen aktiven Loop fortsetzen.
 
-    Ein Tool-Call wird entfernt wenn:
-      1. category == local und threshold > 0
-      2. Tool ist ein Search-Tool (oder Ergebnis-Historie zeigt No-Match)
-      3. Dieselbe name+args-Signatur kommt am ENDE der Historie
-         konsekutiv >= threshold mal vor UND die zugehoerigen Results
-         waren No-Match
+    Blockiert:
+      - read_file derselben Datei wenn trailing file-crawl / exact-read-loop
+      - search mit gleicher Signatur wenn trailing search-repeat / no-match-loop
 
     Gibt (kept_tool_calls, removed_tool_calls) zurueck.
-    Produktive Wiederholungen (Reads, erfolgreiche Searches) bleiben erhalten.
     """
     if category != "local" or _RESPONSE_LOOP_THRESHOLD <= 0 or not tool_calls:
         return list(tool_calls), []
@@ -1499,54 +1506,53 @@ def _filter_looping_response_tool_calls(
     if not isinstance(messages, list):
         return list(tool_calls), []
 
-    tool_results = _build_tool_result_map(messages)
+    read_entries = _collect_read_entries(messages)
+    search_entries, _diag = _collect_search_entries(messages)
 
-    # Baue chronologische Liste der historischen Search-No-Match-Signaturen
-    # (nur konsekutive No-Match-Searches am Ende zaehlen)
-    hist_no_match_sigs: List[str] = []
-    for m in messages:
-        if not isinstance(m, dict) or m.get("role") != "assistant":
-            continue
-        hist_tcs = m.get("tool_calls")
-        if not isinstance(hist_tcs, list):
-            continue
-        for htc in hist_tcs:
-            if not isinstance(htc, dict):
-                continue
-            hfunc = htc.get("function") or {}
-            if not isinstance(hfunc, dict):
-                continue
-            hname = str(hfunc.get("name", "")).strip()
-            hsig = _named_tool_signature(hname, hfunc.get("arguments", ""))
-            if not hsig:
-                continue
-            tc_id = str(htc.get("id", ""))
-            result_text = tool_results.get(tc_id, "")
-            # Positionales Fallback wenn ID-Match fehlt
-            if not result_text:
-                # naechste tool-message nach diesem assistant suchen — zu teuer
-                # hier; nur ID-basiertes Matching fuer Response-Filter
-                hist_no_match_sigs.append("")  # Unterbrechung
-                continue
-            if _is_no_match_result(result_text):
-                hist_no_match_sigs.append(hsig)
-            else:
-                hist_no_match_sigs.append("")  # erfolgreiches Result = Unterbrechung
-
-    # Konsekutive No-Match-Counts am Ende der Historie pro Signatur
-    def _trailing_no_match_count(sig: str) -> int:
-        count = 0
-        for hsig in reversed(hist_no_match_sigs):
-            if hsig == "":
-                break
-            if hsig == sig:
-                count += 1
+    # Trailing exact-read counts: sig -> count
+    trailing_read_sig = read_entries[-1][1] if read_entries else ""
+    trailing_read_count = 0
+    trailing_read_file = ""
+    if trailing_read_sig:
+        trailing_read_file = trailing_read_sig.split("|", 1)[0]
+        for _idx, sig, _fp in reversed(read_entries):
+            if sig == trailing_read_sig:
+                trailing_read_count += 1
             else:
                 break
-        return count
 
+    # File-crawl counts im Fenster
+    file_crawl_counts: Dict[str, int] = {}
+    if read_entries and READ_LOOP_FILE_WINDOW > 0:
+        window = read_entries[-READ_LOOP_FILE_WINDOW:]
+        for _idx, _sig, fp in window:
+            file_crawl_counts[fp] = file_crawl_counts.get(fp, 0) + 1
+
+    # Trailing search counts
+    trailing_search_sig = search_entries[-1][2] if search_entries else ""
+    trailing_search_count = 0
+    trailing_search_no_match_count = 0
+    if trailing_search_sig:
+        for _idx, _tcid, sig, is_nm in reversed(search_entries):
+            if sig != trailing_search_sig:
+                break
+            trailing_search_count += 1
+            if is_nm:
+                trailing_search_no_match_count += 1
+            else:
+                # gemischte Results: no-match-streak bricht, repeat bleibt
+                pass
+        # reine no-match trailing streak separat
+        trailing_search_no_match_count = 0
+        for _idx, _tcid, sig, is_nm in reversed(search_entries):
+            if not is_nm or sig != trailing_search_sig:
+                break
+            trailing_search_no_match_count += 1
+
+    thr = _RESPONSE_LOOP_THRESHOLD
     kept: List[Dict[str, Any]] = []
     removed: List[Dict[str, Any]] = []
+
     for tc in tool_calls:
         if not isinstance(tc, dict):
             kept.append(tc)
@@ -1556,18 +1562,45 @@ def _filter_looping_response_tool_calls(
             kept.append(tc)
             continue
         name = str(func.get("name", "")).strip()
-        sig = _named_tool_signature(name, func.get("arguments", ""))
-        if not sig:
-            kept.append(tc)
-            continue
+        args_raw = func.get("arguments", "")
 
-        # Nur Search-Tools (oder Tools mit No-Match-Historie) blocken
-        is_search = name in _SEARCH_TOOL_NAMES or "search" in name.lower() or "grep" in name.lower()
-        trailing = _trailing_no_match_count(sig)
-        if is_search and trailing >= _RESPONSE_LOOP_THRESHOLD:
-            _log(f"RESPONSE-LOOP: Search-Signatur '{sig[:100]}' bereits {trailing}x "
-                 f"konsekutiv No-Match am Ende — Tool-Call entfernt "
-                 f"(threshold={_RESPONSE_LOOP_THRESHOLD})")
+        block = False
+        reason = ""
+
+        if name in _READ_FILE_TOOL_NAMES:
+            rsig = _extract_read_signature(args_raw)
+            if rsig:
+                rfile = rsig.split("|", 1)[0]
+                # Exact trailing read loop fortsetzen
+                if (trailing_read_count >= thr and rsig == trailing_read_sig):
+                    block = True
+                    reason = f"exact-read {trailing_read_count}x"
+                # File-crawl fortsetzen
+                elif (READ_LOOP_FILE_THRESHOLD > 0
+                      and file_crawl_counts.get(rfile, 0) > READ_LOOP_FILE_THRESHOLD):
+                    block = True
+                    reason = (f"file-crawl {file_crawl_counts[rfile]}x "
+                              f"'{rfile}'")
+                # Auch wenn trailing file matches and count high enough vs thr
+                elif (trailing_read_file and rfile == trailing_read_file
+                      and file_crawl_counts.get(rfile, 0) >= thr
+                      and trailing_read_count >= thr):
+                    block = True
+                    reason = f"trailing-file {trailing_read_count}x '{rfile}'"
+
+        elif _is_search_tool_name(name):
+            ssig = _extract_search_signature(args_raw)
+            if ssig and ssig == trailing_search_sig:
+                if trailing_search_no_match_count >= thr:
+                    block = True
+                    reason = f"search-no-match {trailing_search_no_match_count}x"
+                elif trailing_search_count >= thr:
+                    block = True
+                    reason = f"search-repeat {trailing_search_count}x"
+
+        if block:
+            _log(f"RESPONSE-LOOP: Tool '{name}' geblockt ({reason}, "
+                 f"threshold={thr})")
             removed.append(tc)
         else:
             kept.append(tc)
@@ -1577,9 +1610,7 @@ def _filter_looping_response_tool_calls(
 
 def _check_response_loop(body: Dict[str, Any], tool_calls: List[Dict[str, Any]],
                          category: str = "") -> bool:
-    """True wenn ALLE tool_calls als No-Match-Search-Loop gefiltert wuerden.
-    Kompatibilitaets-Wrapper: partial filtering passiert in den Call-Sites.
-    """
+    """True wenn ALLE tool_calls als Loop gefiltert wuerden."""
     kept, removed = _filter_looping_response_tool_calls(body, tool_calls, category)
     return bool(removed) and not kept
 
