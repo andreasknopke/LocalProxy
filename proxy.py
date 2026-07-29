@@ -1431,80 +1431,157 @@ def _sanitize_image_urls_inplace(messages: List[Dict[str, Any]], label: str = "P
 
 
 # ── Response-Level Loop-Blocking ───────────────────────────────────────────
-# Letzter Ausweg: Wenn das Modell trotz Truncation einen identischen Tool-Call
-# zurueckgibt, wird die Response durch eine Stopp-Message ersetzt.
-# Verhindert, dass VS Code den Tool-Call ausfuehrt und den Loop fortsetzt.
-
-# Maximale Anzahl identischer Tool-Call-Signaturen die in der Historie
-# toleriert werden, bevor die Response geblockt wird.
-_RESPONSE_LOOP_THRESHOLD: int = int(os.getenv("RESPONSE_LOOP_THRESHOLD", "2"))
+# Letzter Ausweg NUR fuer echte No-Match-Search-Loops: Wenn das Modell trotz
+# Historie denselben erfolglosen Search-Call erneut ausgibt, wird genau dieser
+# Tool-Call aus der Response entfernt. Produktive Reads/Searches werden NICHT
+# geblockt — auch nicht bei wiederholtem Lesen derselben Datei.
+#
+# Default 0 = deaktiviert. History-basierte Truncation (read/search loop) bleibt
+# die primaere Intervention. Response-Blocking ist optional und konservativ.
+_RESPONSE_LOOP_THRESHOLD: int = int(os.getenv("RESPONSE_LOOP_THRESHOLD", "0"))
 
 _RESPONSE_LOOP_STOP_TEXT: str = os.getenv(
     "RESPONSE_LOOP_STOP_TEXT",
-    "I've completed my analysis. The repeated search/read pattern indicates "
-    "the requested information is not available in this workspace or is "
-    "excluded by search settings. Please try a different approach or "
+    "I've completed my analysis. The repeated unsuccessful search pattern "
+    "indicates the requested information is not available in this workspace "
+    "or is excluded by search settings. Please try a different approach or "
     "provide more specific guidance."
 )
 
 
-def _check_response_loop(body: Dict[str, Any], tool_calls: List[Dict[str, Any]],
-                         category: str = "") -> bool:
-    """Prueft ob die aktuell zurueckgegebenen tool_calls einen Loop darstellen.
-    Vergleicht die tool_call-Signaturen mit der Nachrichten-Historie.
-    Gibt True zurueck wenn die Response geblockt werden sollte.
+def _named_tool_signature(name: str, args_raw: Any) -> Optional[str]:
+    """Signatur inkl. Tool-Name, damit read/search nicht kollidieren."""
+    args_sig = _extract_tool_call_signature(args_raw)
+    if not args_sig:
+        return None
+    return f"{name}|{args_sig}"
+
+
+def _build_tool_result_map(messages: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Mapping tool_call_id → Ergebnistext (role=tool/function)."""
+    tool_results: Dict[str, str] = {}
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "")
+        if role == "tool":
+            tc_id = str(m.get("tool_call_id", ""))
+            if tc_id:
+                tool_results[tc_id] = _extract_tool_result_text(m)
+        elif role == "function":
+            tc_id = str(m.get("tool_call_id", "") or m.get("name", ""))
+            if tc_id:
+                tool_results[tc_id] = _extract_tool_result_text(m)
+    return tool_results
+
+
+def _filter_looping_response_tool_calls(
+    body: Dict[str, Any],
+    tool_calls: List[Dict[str, Any]],
+    category: str = "",
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Filtert nur echte No-Match-Search-Loops aus der Modell-Response.
+
+    Ein Tool-Call wird entfernt wenn:
+      1. category == local und threshold > 0
+      2. Tool ist ein Search-Tool (oder Ergebnis-Historie zeigt No-Match)
+      3. Dieselbe name+args-Signatur kommt am ENDE der Historie
+         konsekutiv >= threshold mal vor UND die zugehoerigen Results
+         waren No-Match
+
+    Gibt (kept_tool_calls, removed_tool_calls) zurueck.
+    Produktive Wiederholungen (Reads, erfolgreiche Searches) bleiben erhalten.
     """
-    if category != "local":
-        return False
-    if _RESPONSE_LOOP_THRESHOLD <= 0:
-        return False
-    if not tool_calls:
-        return False
+    if category != "local" or _RESPONSE_LOOP_THRESHOLD <= 0 or not tool_calls:
+        return list(tool_calls), []
 
     messages = body.get("messages", [])
     if not isinstance(messages, list):
-        return False
+        return list(tool_calls), []
 
-    # Signatur der aktuellen tool_calls extrahieren
-    current_sigs: List[str] = []
+    tool_results = _build_tool_result_map(messages)
+
+    # Baue chronologische Liste der historischen Search-No-Match-Signaturen
+    # (nur konsekutive No-Match-Searches am Ende zaehlen)
+    hist_no_match_sigs: List[str] = []
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        hist_tcs = m.get("tool_calls")
+        if not isinstance(hist_tcs, list):
+            continue
+        for htc in hist_tcs:
+            if not isinstance(htc, dict):
+                continue
+            hfunc = htc.get("function") or {}
+            if not isinstance(hfunc, dict):
+                continue
+            hname = str(hfunc.get("name", "")).strip()
+            hsig = _named_tool_signature(hname, hfunc.get("arguments", ""))
+            if not hsig:
+                continue
+            tc_id = str(htc.get("id", ""))
+            result_text = tool_results.get(tc_id, "")
+            # Positionales Fallback wenn ID-Match fehlt
+            if not result_text:
+                # naechste tool-message nach diesem assistant suchen — zu teuer
+                # hier; nur ID-basiertes Matching fuer Response-Filter
+                hist_no_match_sigs.append("")  # Unterbrechung
+                continue
+            if _is_no_match_result(result_text):
+                hist_no_match_sigs.append(hsig)
+            else:
+                hist_no_match_sigs.append("")  # erfolgreiches Result = Unterbrechung
+
+    # Konsekutive No-Match-Counts am Ende der Historie pro Signatur
+    def _trailing_no_match_count(sig: str) -> int:
+        count = 0
+        for hsig in reversed(hist_no_match_sigs):
+            if hsig == "":
+                break
+            if hsig == sig:
+                count += 1
+            else:
+                break
+        return count
+
+    kept: List[Dict[str, Any]] = []
+    removed: List[Dict[str, Any]] = []
     for tc in tool_calls:
         if not isinstance(tc, dict):
+            kept.append(tc)
             continue
         func = tc.get("function") or {}
         if not isinstance(func, dict):
+            kept.append(tc)
             continue
-        args_raw = func.get("arguments", "")
-        sig = _extract_tool_call_signature(args_raw)
-        if sig:
-            current_sigs.append(sig)
+        name = str(func.get("name", "")).strip()
+        sig = _named_tool_signature(name, func.get("arguments", ""))
+        if not sig:
+            kept.append(tc)
+            continue
 
-    if not current_sigs:
-        return False
+        # Nur Search-Tools (oder Tools mit No-Match-Historie) blocken
+        is_search = name in _SEARCH_TOOL_NAMES or "search" in name.lower() or "grep" in name.lower()
+        trailing = _trailing_no_match_count(sig)
+        if is_search and trailing >= _RESPONSE_LOOP_THRESHOLD:
+            _log(f"RESPONSE-LOOP: Search-Signatur '{sig[:100]}' bereits {trailing}x "
+                 f"konsekutiv No-Match am Ende — Tool-Call entfernt "
+                 f"(threshold={_RESPONSE_LOOP_THRESHOLD})")
+            removed.append(tc)
+        else:
+            kept.append(tc)
 
-    # Zaehle wie oft diese Signaturen bereits in der Historie vorkommen
-    for sig in current_sigs:
-        count = 0
-        for m in messages:
-            if not isinstance(m, dict) or m.get("role") != "assistant":
-                continue
-            hist_tcs = m.get("tool_calls")
-            if not isinstance(hist_tcs, list):
-                continue
-            for htc in hist_tcs:
-                if not isinstance(htc, dict):
-                    continue
-                hfunc = htc.get("function") or {}
-                if not isinstance(hfunc, dict):
-                    continue
-                hsig = _extract_tool_call_signature(hfunc.get("arguments", ""))
-                if hsig == sig:
-                    count += 1
-        if count >= _RESPONSE_LOOP_THRESHOLD:
-            _log(f"RESPONSE-LOOP: tool_call-Signatur bereits {count}x in Historie, "
-                 f"Response wird geblockt (threshold={_RESPONSE_LOOP_THRESHOLD})")
-            return True
+    return kept, removed
 
-    return False
+
+def _check_response_loop(body: Dict[str, Any], tool_calls: List[Dict[str, Any]],
+                         category: str = "") -> bool:
+    """True wenn ALLE tool_calls als No-Match-Search-Loop gefiltert wuerden.
+    Kompatibilitaets-Wrapper: partial filtering passiert in den Call-Sites.
+    """
+    kept, removed = _filter_looping_response_tool_calls(body, tool_calls, category)
+    return bool(removed) and not kept
 
 
 # ── Regex fuer Model-Namen, die max_completion_tokens statt max_tokens benoetigen ────
@@ -2578,14 +2655,21 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     if outcome.get("all_failed"):
         content = f"[Proxy: ALLE Fallbacks fehlgeschlagen]\n{content}"
 
-    # Response-Level Loop-Blocking (non-streaming)
+    # Response-Level Loop-Filtering (non-streaming)
     tool_calls = result.get("tool_calls")
-    if tool_calls and _check_response_loop(body, tool_calls, category=category):
-        _log("RESPONSE-LOOP-BLOCK (non-stream): tool_calls durch Stopp-Message ersetzt")
-        result = dict(result)
-        result["tool_calls"] = None
-        result["content"] = _RESPONSE_LOOP_STOP_TEXT
-        content = _RESPONSE_LOOP_STOP_TEXT
+    if tool_calls and _RESPONSE_LOOP_THRESHOLD > 0 and category == "local":
+        kept_tcs, removed_tcs = _filter_looping_response_tool_calls(
+            body, tool_calls, category=category)
+        if removed_tcs:
+            result = dict(result)
+            if kept_tcs:
+                result["tool_calls"] = kept_tcs
+                tool_calls = kept_tcs
+            else:
+                result["tool_calls"] = None
+                result["content"] = _RESPONSE_LOOP_STOP_TEXT
+                content = _RESPONSE_LOOP_STOP_TEXT
+                tool_calls = None
 
     response_payload = _build_response_payload(body, content, [result])
     asyncio.ensure_future(_hindsight.retain_async(body, content))
@@ -2628,13 +2712,17 @@ async def _stream_events(body: Dict[str, Any], category: str,
     if tool_calls:
         tool_calls = _normalize_tool_calls(tool_calls) or tool_calls
 
-        # Response-Level Loop-Blocking: Wenn das Modell einen identischen
-        # Tool-Call zurueckgibt der bereits >N mal in der Historie steht,
-        # wird die Response durch eine Stopp-Message ersetzt.
-        if _check_response_loop(body, tool_calls, category=category):
-            _log("RESPONSE-LOOP-BLOCK: tool_calls durch Stopp-Message ersetzt")
-            tool_calls = None
-            content = _RESPONSE_LOOP_STOP_TEXT
+        # Response-Level Loop-Filtering: Nur echte No-Match-Search-Loops
+        # werden aus der Response entfernt. Produktive Calls bleiben erhalten.
+        if _RESPONSE_LOOP_THRESHOLD > 0 and category == "local":
+            kept_tcs, removed_tcs = _filter_looping_response_tool_calls(
+                body, tool_calls, category=category)
+            if removed_tcs:
+                if kept_tcs:
+                    tool_calls = kept_tcs
+                else:
+                    tool_calls = None
+                    content = _RESPONSE_LOOP_STOP_TEXT
 
     if tool_calls:
         stream_id = f"chatcmpl-spark-{uuid.uuid4().hex}"
