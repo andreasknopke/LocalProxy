@@ -696,8 +696,8 @@ def test_file_crawl_truncation_removes_tail():
         proxy.READ_LOOP_FILE_KEEP = old_keep
 
 
-def test_filter_response_blocks_repeated_search():
-    """Response-Filter blockiert Search die trailing bereits >=threshold oft kam."""
+def test_detect_response_loop_flags_repeated_search():
+    """Detect-only: wiederholte Search wird als Loop erkannt (nicht blockiert)."""
     msgs = []
     for i in range(4):
         cid = f"call_{i}"
@@ -718,16 +718,16 @@ def test_filter_response_blocks_repeated_search():
     old_thr = proxy._RESPONSE_LOOP_THRESHOLD
     proxy._RESPONSE_LOOP_THRESHOLD = 3
     try:
-        kept, removed = proxy._filter_looping_response_tool_calls(
+        reasons, blocked_names = proxy._detect_response_loop(
             body, new_tc, category="local")
-        assert len(removed) == 1
-        assert kept == []
+        assert reasons
+        assert "grep_search" in blocked_names
     finally:
         proxy._RESPONSE_LOOP_THRESHOLD = old_thr
 
 
-def test_filter_response_allows_different_search():
-    """Andere Search-Query wird nicht geblockt."""
+def test_detect_response_loop_allows_different_search():
+    """Andere Search-Query wird nicht als Loop erkannt."""
     msgs = []
     for i in range(4):
         cid = f"call_{i}"
@@ -748,16 +748,16 @@ def test_filter_response_allows_different_search():
     old_thr = proxy._RESPONSE_LOOP_THRESHOLD
     proxy._RESPONSE_LOOP_THRESHOLD = 3
     try:
-        kept, removed = proxy._filter_looping_response_tool_calls(
+        reasons, blocked_names = proxy._detect_response_loop(
             body, new_tc, category="local")
-        assert len(kept) == 1
-        assert removed == []
+        assert reasons == []
+        assert blocked_names == []
     finally:
         proxy._RESPONSE_LOOP_THRESHOLD = old_thr
 
 
-def test_filter_response_blocks_file_crawl_continue():
-    """Response-Filter blockiert weiteren read_file derselben gecrawlten Datei."""
+def test_detect_response_loop_flags_file_crawl_continue():
+    """Detect-only: weiterer read_file derselben gecrawlten Datei wird erkannt."""
     msgs = []
     for i in range(9):
         msgs.append(_make_read_msg("/big.tsx", i * 100 + 1, (i + 1) * 100, call_id=f"r{i}"))
@@ -782,10 +782,10 @@ def test_filter_response_blocks_file_crawl_continue():
     proxy.READ_LOOP_FILE_THRESHOLD = 8
     proxy.READ_LOOP_FILE_WINDOW = 12
     try:
-        kept, removed = proxy._filter_looping_response_tool_calls(
+        reasons, blocked_names = proxy._detect_response_loop(
             body, new_tc, category="local")
-        assert len(removed) == 1
-        assert kept == []
+        assert reasons
+        assert "read_file" in blocked_names
     finally:
         proxy._RESPONSE_LOOP_THRESHOLD = old_thr
         proxy.READ_LOOP_FILE_THRESHOLD = old_ft

@@ -322,8 +322,10 @@ READ_LOOP_FILE_INTERVENTION: str = os.getenv(
     "READ_LOOP_FILE_INTERVENTION",
     "STOP! You are crawling file '{file}' — {count} reads in the last {window} tool calls. "
     "You already have enough content from this file. Do NOT read '{file}' again. "
-    "Do NOT re-search symbols you already found. Summarize what you know and take "
-    "the next concrete action (edit/create files, run commands, or answer). Go on."
+    "Do NOT re-search symbols you already found. "
+    "NOW: Summarize in one sentence what you know, then take the next concrete "
+    "action for the user's original request — use replace_string_in_file or "
+    "create_file to implement the change, or ask a specific question. Go on."
 )
 
 # ── Search-Loop-Detection (NUR lokales Modell) ─────────────────────────────
@@ -343,21 +345,29 @@ SEARCH_LOOP_INTERVENTION: str = os.getenv(
 SEARCH_REPEAT_INTERVENTION: str = os.getenv(
     "SEARCH_REPEAT_INTERVENTION",
     "STOP! You already searched for '{query}' {count} times and got results. "
-    "Repeating the same search will not help. Use the results you already have, "
-    "read a specific file once, or implement the change. Do NOT search for "
-    "'{query}' again. Go on."
+    "Repeating the same search will not help. Use the results you already have. "
+    "Do NOT search for '{query}' again. "
+    "NOW: take the next concrete action — edit the file with replace_string_in_file, "
+    "create the missing code with create_file, or answer the user. Go on."
 )
 
 # Response-Level Enforcement: blockiert Tool-Calls die trotz Historie-Intervention
 # erneut denselben Loop fortsetzen. Default aktiv (3) fuer local.
 # 0 = deaktiviert.
 _RESPONSE_LOOP_THRESHOLD: int = int(os.getenv("RESPONSE_LOOP_THRESHOLD", "3"))
-_RESPONSE_LOOP_STOP_TEXT: str = os.getenv(
-    "RESPONSE_LOOP_STOP_TEXT",
-    "I've stopped the repeated tool loop. Based on the information already "
-    "gathered, I should proceed with a concrete next step instead of "
-    "re-reading or re-searching the same targets. Please continue with an "
-    "edit, a different approach, or a final answer."
+# Hinweis: Bei geblocktem Response-Loop liefert der Proxy KEINE passive
+# Abschluss-Meldung mehr. Stattdessen wird eine handlungsorientierte
+# Interventions-Nachricht direkt in die Request-Messages eingefuegt und das
+# Modell erneut aufgerufen. Dadurch sieht VS Code niemals einen toten
+# "I've stopped ..." Text, sondern das Modell arbeitet am urspruenglichen Task.
+RESPONSE_LOOP_REDIRECT_TEXT: str = os.getenv(
+    "RESPONSE_LOOP_REDIRECT_TEXT",
+    "SYSTEM-INTERVENTION: Dein letzter Tool-Call wurde vom Proxy geblockt, weil "
+    "er einen Loop fortgesetzt haette ({reasons}). Du hast diese Informationen "
+    "bereits. Fuehre jetzt den naechsten sinnvollen Schritt fuer die eigentliche "
+    "Aufgabe aus: implementiere die Aenderung (replace_string_in_file/create_file), "
+    "oder formuliere eine konkrete Antwort. Wiederhole nicht die geblockten "
+    "Read/Search-Calls. Go on."
 )
 
 
@@ -1484,6 +1494,95 @@ def _sanitize_image_urls_inplace(messages: List[Dict[str, Any]], label: str = "P
 # Letzter Ausweg: Wenn das Modell trotz History-Intervention denselben
 # Read/Search-Loop fortsetzt, werden die offending tool_calls aus der Response
 # entfernt. Defaults/Thresholds stehen oben bei den Loop-Globals.
+
+
+def _detect_response_loop(body: Dict[str, Any], tool_calls: List[Dict[str, Any]],
+                          category: str = "") -> Tuple[List[str], List[str]]:
+    """Detect-only Loop-Check fuer die Modell-Response.
+
+    Gibt (loop_reasons, blocked_tool_names) zurueck. Blockiert nichts.
+    """
+    if category != "local" or _RESPONSE_LOOP_THRESHOLD <= 0 or not tool_calls:
+        return [], []
+
+    messages = body.get("messages", [])
+    if not isinstance(messages, list):
+        return [], []
+
+    read_entries = _collect_read_entries(messages)
+    search_entries, _diag = _collect_search_entries(messages)
+
+    trailing_read_sig = read_entries[-1][1] if read_entries else ""
+    trailing_read_count = 0
+    trailing_read_file = ""
+    if trailing_read_sig:
+        trailing_read_file = trailing_read_sig.split("|", 1)[0]
+        for _idx, sig, _fp in reversed(read_entries):
+            if sig == trailing_read_sig:
+                trailing_read_count += 1
+            else:
+                break
+
+    file_crawl_counts: Dict[str, int] = {}
+    if read_entries and READ_LOOP_FILE_WINDOW > 0:
+        window = read_entries[-READ_LOOP_FILE_WINDOW:]
+        for _idx, _sig, fp in window:
+            file_crawl_counts[fp] = file_crawl_counts.get(fp, 0) + 1
+
+    trailing_search_sig = search_entries[-1][2] if search_entries else ""
+    trailing_search_count = 0
+    trailing_search_no_match_count = 0
+    if trailing_search_sig:
+        for _idx, _tcid, sig, is_nm in reversed(search_entries):
+            if sig != trailing_search_sig:
+                break
+            trailing_search_count += 1
+        for _idx, _tcid, sig, is_nm in reversed(search_entries):
+            if not is_nm or sig != trailing_search_sig:
+                break
+            trailing_search_no_match_count += 1
+
+    thr = _RESPONSE_LOOP_THRESHOLD
+    reasons: List[str] = []
+    blocked_names: Set[str] = set()
+
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        func = tc.get("function") or {}
+        if not isinstance(func, dict):
+            continue
+        name = str(func.get("name", "")).strip()
+        args_raw = func.get("arguments", "")
+        reason = ""
+
+        if name in _READ_FILE_TOOL_NAMES:
+            rsig = _extract_read_signature(args_raw)
+            if rsig:
+                rfile = rsig.split("|", 1)[0]
+                if trailing_read_count >= thr and rsig == trailing_read_sig:
+                    reason = f"exact-read {trailing_read_count}x"
+                elif (READ_LOOP_FILE_THRESHOLD > 0
+                      and file_crawl_counts.get(rfile, 0) > READ_LOOP_FILE_THRESHOLD):
+                    reason = f"file-crawl {file_crawl_counts[rfile]}x '{rfile}'"
+                elif (trailing_read_file and rfile == trailing_read_file
+                      and file_crawl_counts.get(rfile, 0) >= thr
+                      and trailing_read_count >= thr):
+                    reason = f"trailing-file {trailing_read_count}x '{rfile}'"
+        elif _is_search_tool_name(name):
+            ssig = _extract_search_signature(args_raw)
+            if ssig and ssig == trailing_search_sig:
+                if trailing_search_no_match_count >= thr:
+                    reason = f"search-no-match {trailing_search_no_match_count}x"
+                elif trailing_search_count >= thr:
+                    reason = f"search-repeat {trailing_search_count}x"
+
+        if reason:
+            reasons.append(f"{name}: {reason}")
+            if name:
+                blocked_names.add(name)
+
+    return reasons, sorted(blocked_names)
 
 
 def _filter_looping_response_tool_calls(
@@ -2662,6 +2761,21 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
 
     _strip_model_flags_from_messages(msgs)
 
+    # ── Loop-Detection + Intervention auf REQUEST-Ebene ──
+    # Laeuft frueh, damit auch Tool-Continuations und "go on"-Requests greifen.
+    # Mutiert body["messages"] in-place (gleiche Liste wie msgs).
+    loop_intervened = False
+    loop_reasons: List[str] = []
+    if category == "local" and isinstance(msgs, list):
+        read_hit = _detect_read_loop_inplace(msgs, "Passthrough", category=category)
+        search_hit = _detect_search_loop_inplace(msgs, "Passthrough", category=category)
+        loop_intervened = bool(read_hit or search_hit)
+        if loop_intervened:
+            last_iv = msgs[-1].get("content", "") if isinstance(msgs[-1], dict) else ""
+            loop_reasons.append(str(last_iv)[:200])
+            _log(f"Loop-Intervention: history truncated + appended "
+                 f"(read={read_hit}, search={search_hit})")
+
     # Log aktiven Index für die Kategorie
     defs = _model_defs(category)
     active_model = defs[active_idx]["model_name"] if defs and active_idx < len(defs) else "?"
@@ -2686,21 +2800,42 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     if outcome.get("all_failed"):
         content = f"[Proxy: ALLE Fallbacks fehlgeschlagen]\n{content}"
 
-    # Response-Level Loop-Filtering (non-streaming)
+    # Response-Level Loop-Retry (non-streaming):
+    # Wenn das Modell trotz Intervention einen Loop-Tool-Call ausgibt,
+    # statt passivem Stopp-Text: Intervention in Messages injizieren und
+    # einmal erneut aufrufen. Ergebnis ist dann produktiv.
     tool_calls = result.get("tool_calls")
     if tool_calls and _RESPONSE_LOOP_THRESHOLD > 0 and category == "local":
-        kept_tcs, removed_tcs = _filter_looping_response_tool_calls(
-            body, tool_calls, category=category)
-        if removed_tcs:
-            result = dict(result)
-            if kept_tcs:
-                result["tool_calls"] = kept_tcs
-                tool_calls = kept_tcs
-            else:
-                result["tool_calls"] = None
-                result["content"] = _RESPONSE_LOOP_STOP_TEXT
-                content = _RESPONSE_LOOP_STOP_TEXT
-                tool_calls = None
+        resp_reasons, blocked_names = _detect_response_loop(body, tool_calls, category=category)
+        if resp_reasons:
+            _log(f"RESPONSE-LOOP erkannt (non-stream): {resp_reasons}")
+            reason_txt = "; ".join(resp_reasons)
+            retry_msg = RESPONSE_LOOP_REDIRECT_TEXT.format(
+                reasons=reason_txt,
+                tools=", ".join(blocked_names) if blocked_names else "read/search",
+            )
+            if isinstance(msgs, list):
+                msgs.append({"role": "user", "content": retry_msg})
+                retry_outcome = await _call_model_with_fallbacks(
+                    body, category, force_start_idx=force_start_idx)
+                retry_result = retry_outcome.get("result", {})
+                retry_tcs = retry_result.get("tool_calls")
+                retry_reasons, _ = _detect_response_loop(body, retry_tcs, category=category) if retry_tcs else ([], [])
+                if retry_tcs and not retry_reasons:
+                    _log("RESPONSE-LOOP-Retry: Modell lieferte produktive tool_calls")
+                    result = retry_result
+                    content = result.get("content", "") or ""
+                    tool_calls = retry_tcs
+                elif retry_result.get("content") and not retry_tcs:
+                    _log("RESPONSE-LOOP-Retry: Modell lieferte produktiven Content")
+                    result = retry_result
+                    content = result.get("content", "") or ""
+                    tool_calls = None
+                else:
+                    _log("RESPONSE-LOOP-Retry: weiterhin Loop oder leer — gebe Retry-Resultat zurueck")
+                    result = retry_result
+                    content = result.get("content", "") or content
+                    tool_calls = retry_tcs
 
     response_payload = _build_response_payload(body, content, [result])
     asyncio.ensure_future(_hindsight.retain_async(body, content))
@@ -2740,20 +2875,47 @@ async def _stream_events(body: Dict[str, Any], category: str,
     if outcome.get("all_failed"):
         content = f"[Proxy: ALLE Fallbacks fehlgeschlagen]\n{content}"
 
+    # Response-Level Loop-Retry (streaming):
+    # Wenn das Modell einen Loop-Tool-Call ausgibt: Intervention in Messages
+    # injizieren und einmal erneut aufrufen statt Stopp-Text zu senden.
     if tool_calls:
         tool_calls = _normalize_tool_calls(tool_calls) or tool_calls
 
-        # Response-Level Loop-Filtering: Nur echte No-Match-Search-Loops
-        # werden aus der Response entfernt. Produktive Calls bleiben erhalten.
         if _RESPONSE_LOOP_THRESHOLD > 0 and category == "local":
-            kept_tcs, removed_tcs = _filter_looping_response_tool_calls(
-                body, tool_calls, category=category)
-            if removed_tcs:
-                if kept_tcs:
-                    tool_calls = kept_tcs
-                else:
-                    tool_calls = None
-                    content = _RESPONSE_LOOP_STOP_TEXT
+            resp_reasons, blocked_names = _detect_response_loop(body, tool_calls, category=category)
+            if resp_reasons:
+                _log(f"RESPONSE-LOOP erkannt (stream): {resp_reasons}")
+                reason_txt = "; ".join(resp_reasons)
+                retry_msg = RESPONSE_LOOP_REDIRECT_TEXT.format(
+                    reasons=reason_txt,
+                    tools=", ".join(blocked_names) if blocked_names else "read/search",
+                )
+                msgs = body.get("messages", [])
+                if isinstance(msgs, list):
+                    msgs.append({"role": "user", "content": retry_msg})
+                    retry_outcome = await _call_model_with_fallbacks(
+                        body, category, force_start_idx=force_start_idx)
+                    retry_result = retry_outcome.get("result", {})
+                    retry_tcs = retry_result.get("tool_calls")
+                    retry_reasons, _ = _detect_response_loop(body, retry_tcs, category=category) if retry_tcs else ([], [])
+                    if retry_tcs and not retry_reasons:
+                        _log("RESPONSE-LOOP-Retry (stream): produktive tool_calls")
+                        result = retry_result
+                        content = result.get("content", "") or ""
+                        tool_calls = _normalize_tool_calls(retry_tcs) or retry_tcs
+                        used_model = retry_outcome.get("used_model", used_model)
+                    elif retry_result.get("content") and not retry_tcs:
+                        _log("RESPONSE-LOOP-Retry (stream): produktiver Content")
+                        result = retry_result
+                        content = result.get("content", "") or ""
+                        tool_calls = None
+                        used_model = retry_outcome.get("used_model", used_model)
+                    else:
+                        _log("RESPONSE-LOOP-Retry (stream): weiterhin Loop/leer — gebe Retry-Resultat zurueck")
+                        result = retry_result
+                        content = result.get("content", "") or content
+                        tool_calls = _normalize_tool_calls(retry_tcs) if retry_tcs else None
+                        used_model = retry_outcome.get("used_model", used_model)
 
     if tool_calls:
         stream_id = f"chatcmpl-spark-{uuid.uuid4().hex}"
