@@ -253,6 +253,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "response_loop_threshold": 3,
         "generic_tool_loop_threshold": 3,
         "generic_tool_loop_intervention": "",
+        "local_sampling": {
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0.0,
+            "dry_multiplier": 0.8,
+            "dry_base": 1.75,
+            "dry_allowed_length": 3,
+            "dry_penalty_last_n": -1,
+            "dry_sequence_breaker": "\n,:,\",*,;,{,}",
+            "enable_thinking": True,
+            "preserve_thinking": True,
+            "anti_loop_system_prompt": "",
+        },
     },
 }
 
@@ -1112,6 +1126,64 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
         <textarea id="generic_tool_loop_intervention" rows="3" placeholder="Leer = Standardtext. {tool}/{count}"></textarea>
         <div class="hint">Eigener Interventionstext. Platzhalter {tool} = Tool-Name, {count} = Anzahl Wiederholungen.</div>
       </div>
+
+      <h4 style="margin-top:24px;border-top:1px solid var(--border);padding-top:12px">🧠 Local-Model Sampling (Laguna-S-2.1)</h4>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
+        <div class="form-group">
+          <label>Temperature</label>
+          <input type="number" id="local_temperature" step="0.05" min="0" max="2">
+        </div>
+        <div class="form-group">
+          <label>Top-P</label>
+          <input type="number" id="local_top_p" step="0.01" min="0" max="1">
+        </div>
+        <div class="form-group">
+          <label>Top-K</label>
+          <input type="number" id="local_top_k" min="0" max="200">
+        </div>
+        <div class="form-group">
+          <label>Min-P</label>
+          <input type="number" id="local_min_p" step="0.01" min="0" max="1">
+        </div>
+        <div class="form-group">
+          <label>DRY Multiplier</label>
+          <input type="number" id="local_dry_multiplier" step="0.1" min="0" max="5">
+          <div class="hint">0 = DRY deaktiviert</div>
+        </div>
+        <div class="form-group">
+          <label>DRY Base</label>
+          <input type="number" id="local_dry_base" step="0.05" min="1" max="3">
+        </div>
+        <div class="form-group">
+          <label>DRY Allowed Length</label>
+          <input type="number" id="local_dry_allowed_length" min="0" max="20">
+        </div>
+        <div class="form-group">
+          <label>DRY Penalty Last N</label>
+          <input type="number" id="local_dry_penalty_last_n" min="-1" max="1000">
+          <div class="hint">-1 = gesamter Kontext</div>
+        </div>
+        <div class="form-group">
+          <label>DRY Sequence Breaker</label>
+          <input type="text" id="local_dry_sequence_breaker">
+          <div class="hint">Kommagetrennte Zeichen</div>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <div class="form-group">
+          <label><input type="checkbox" id="local_enable_thinking" checked> Enable Thinking</label>
+          <div class="hint">Reasoning in &lt;think&gt;-Tags aktivieren</div>
+        </div>
+        <div class="form-group">
+          <label><input type="checkbox" id="local_preserve_thinking" checked> Preserve Thinking</label>
+          <div class="hint">Vorherige &lt;think&gt;-Blöcke in Historie behalten</div>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Anti-Loop-System-Prompt (optional)</label>
+        <textarea id="local_anti_loop_system_prompt" rows="4" placeholder="Leer = Standard-Anti-Loop-Prompt"></textarea>
+        <div class="hint">Zusätzlicher System-Prompt der dem lokalen Modell Anti-Loop-Regeln vorgibt.</div>
+      </div>
     </div>
   </section>
 
@@ -1267,6 +1339,19 @@ async function loadConfig() {
     document.getElementById('response_loop_threshold').value = tk.response_loop_threshold != null ? tk.response_loop_threshold : 3;
     document.getElementById('generic_tool_loop_threshold').value = tk.generic_tool_loop_threshold != null ? tk.generic_tool_loop_threshold : 3;
     document.getElementById('generic_tool_loop_intervention').value = tk.generic_tool_loop_intervention || '';
+    const ls = tk.local_sampling || {};
+    document.getElementById('local_temperature').value = ls.temperature != null ? ls.temperature : 0.7;
+    document.getElementById('local_top_p').value = ls.top_p != null ? ls.top_p : 0.95;
+    document.getElementById('local_top_k').value = ls.top_k != null ? ls.top_k : 20;
+    document.getElementById('local_min_p').value = ls.min_p != null ? ls.min_p : 0.0;
+    document.getElementById('local_dry_multiplier').value = ls.dry_multiplier != null ? ls.dry_multiplier : 0.8;
+    document.getElementById('local_dry_base').value = ls.dry_base != null ? ls.dry_base : 1.75;
+    document.getElementById('local_dry_allowed_length').value = ls.dry_allowed_length != null ? ls.dry_allowed_length : 3;
+    document.getElementById('local_dry_penalty_last_n').value = ls.dry_penalty_last_n != null ? ls.dry_penalty_last_n : -1;
+    document.getElementById('local_dry_sequence_breaker').value = ls.dry_sequence_breaker || '\\n,:,",*,;,{,}';
+    document.getElementById('local_enable_thinking').checked = ls.enable_thinking !== false;
+    document.getElementById('local_preserve_thinking').checked = ls.preserve_thinking !== false;
+    document.getElementById('local_anti_loop_system_prompt').value = ls.anti_loop_system_prompt || '';
 
   } catch(e) {
     showToast('Fehler beim Laden: ' + e.message, 'error');
@@ -1346,6 +1431,20 @@ async function saveConfig() {
     response_loop_threshold: parseInt(document.getElementById('response_loop_threshold').value) || 0,
     generic_tool_loop_threshold: parseInt(document.getElementById('generic_tool_loop_threshold').value) || 0,
     generic_tool_loop_intervention: document.getElementById('generic_tool_loop_intervention').value || '',
+    local_sampling: {
+      temperature: parseFloat(document.getElementById('local_temperature').value) || 0.7,
+      top_p: parseFloat(document.getElementById('local_top_p').value) || 0.95,
+      top_k: parseInt(document.getElementById('local_top_k').value) || 20,
+      min_p: parseFloat(document.getElementById('local_min_p').value) || 0.0,
+      dry_multiplier: parseFloat(document.getElementById('local_dry_multiplier').value) || 0,
+      dry_base: parseFloat(document.getElementById('local_dry_base').value) || 1.75,
+      dry_allowed_length: parseInt(document.getElementById('local_dry_allowed_length').value) || 3,
+      dry_penalty_last_n: parseInt(document.getElementById('local_dry_penalty_last_n').value),
+      dry_sequence_breaker: document.getElementById('local_dry_sequence_breaker').value || '',
+      enable_thinking: document.getElementById('local_enable_thinking').checked,
+      preserve_thinking: document.getElementById('local_preserve_thinking').checked,
+      anti_loop_system_prompt: document.getElementById('local_anti_loop_system_prompt').value || '',
+    },
   };
 
   try {

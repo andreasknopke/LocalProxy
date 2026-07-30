@@ -1270,3 +1270,62 @@ def test_detect_response_loop_allows_different_generic_args():
     finally:
         proxy._RESPONSE_LOOP_THRESHOLD = old_thr
         proxy.GENERIC_TOOL_LOOP_THRESHOLD = old_gen
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Local-Model Sampling & Anti-Loop Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_patch_local_sampling_sets_params():
+    """_patch_local_sampling_payload setzt alle empfohlenen Parameter."""
+    payload = {"model": "test", "messages": []}
+    proxy._patch_local_sampling_payload(payload)
+    assert payload["temperature"] == proxy.LOCAL_TEMPERATURE
+    assert payload["top_p"] == proxy.LOCAL_TOP_P
+    assert payload["top_k"] == proxy.LOCAL_TOP_K
+    assert payload["min_p"] == proxy.LOCAL_MIN_P
+    assert payload["dry_multiplier"] == proxy.LOCAL_DRY_MULTIPLIER
+    assert payload["dry_base"] == proxy.LOCAL_DRY_BASE
+    assert payload["dry_allowed_length"] == proxy.LOCAL_DRY_ALLOWED_LENGTH
+    assert payload["dry_penalty_last_n"] == proxy.LOCAL_DRY_PENALTY_LAST_N
+    assert "dry_sequence_breaker" in payload
+    assert payload["chat_template_kwargs"]["enable_thinking"] == proxy.LOCAL_ENABLE_THINKING
+    assert payload["chat_template_kwargs"]["preserve_thinking"] == proxy.LOCAL_PRESERVE_THINKING
+
+
+def test_inject_local_anti_loop_system_no_existing_system():
+    """Anti-Loop-Prompt wird an Position 0 eingefuegt wenn kein system vorhanden."""
+    msgs = [{"role": "user", "content": "hello"}]
+    proxy._inject_local_anti_loop_system(msgs)
+    assert msgs[0]["role"] == "system"
+    assert "NEVER call the same tool" in msgs[0]["content"]
+    assert msgs[1]["role"] == "user"
+
+
+def test_inject_local_anti_loop_system_after_existing_system():
+    """Anti-Loop-Prompt wird NACH existierender system-Message eingefuegt."""
+    msgs = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "hello"},
+    ]
+    proxy._inject_local_anti_loop_system(msgs)
+    assert msgs[0]["role"] == "system"
+    assert msgs[0]["content"] == "You are helpful."
+    assert msgs[1]["role"] == "system"
+    assert "NEVER call the same tool" in msgs[1]["content"]
+    assert msgs[2]["role"] == "user"
+
+
+def test_clean_payload_keeps_top_k_for_local():
+    """_clean_payload mit keep_top_k=True behaelt top_k."""
+    payload = {"top_k": 20, "temperature": 0.7, "stop_sequences": ["x"]}
+    proxy._clean_payload(payload, keep_tools=True, keep_top_k=True)
+    assert payload["top_k"] == 20
+    assert "stop_sequences" not in payload
+
+
+def test_clean_payload_strips_top_k_for_cloud():
+    """_clean_payload mit keep_top_k=False entfernt top_k."""
+    payload = {"top_k": 20, "temperature": 0.7}
+    proxy._clean_payload(payload, keep_tools=True, keep_top_k=False)
+    assert "top_k" not in payload

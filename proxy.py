@@ -302,6 +302,38 @@ HINDSIGHT_DIR: Path = Path(os.getenv("HINDSIGHT_DIR", "./data/.hindsight_memory"
 # ── Tool-Result-Capping ────────────────────────────────────────────────────
 TOOL_RESULT_CAP: int = int(os.getenv("TOOL_RESULT_CAP", "0"))
 
+# ── Laguna-S-2.1 / Local-Model Sampling & Anti-Loop ───────────────────────
+# Empfohlene Parameter aus poolside/Laguna-S-2.1 Diskussion #23:
+#   temp=0.7, top_p=0.95, top_k=20, min_p=0.0
+#   DRY: multiplier=0.8, base=1.75, allowed_length=3, penalty_last_n=-1
+#   sequence_breaker: \n,:,",*,;,{,}
+#   samplers: top_k;top_p;min_p;temperature;dry
+LOCAL_TEMPERATURE: float = float(os.getenv("LOCAL_TEMPERATURE", "0.7"))
+LOCAL_TOP_P: float = float(os.getenv("LOCAL_TOP_P", "0.95"))
+LOCAL_TOP_K: int = int(os.getenv("LOCAL_TOP_K", "20"))
+LOCAL_MIN_P: float = float(os.getenv("LOCAL_MIN_P", "0.0"))
+LOCAL_DRY_MULTIPLIER: float = float(os.getenv("LOCAL_DRY_MULTIPLIER", "0.8"))
+LOCAL_DRY_BASE: float = float(os.getenv("LOCAL_DRY_BASE", "1.75"))
+LOCAL_DRY_ALLOWED_LENGTH: int = int(os.getenv("LOCAL_DRY_ALLOWED_LENGTH", "3"))
+LOCAL_DRY_PENALTY_LAST_N: int = int(os.getenv("LOCAL_DRY_PENALTY_LAST_N", "-1"))
+LOCAL_DRY_SEQUENCE_BREAKER: str = os.getenv("LOCAL_DRY_SEQUENCE_BREAKER", '\n,:,",*,;,{,}')
+LOCAL_ENABLE_THINKING: bool = os.getenv("LOCAL_ENABLE_THINKING", "true").lower() in {"1", "true", "yes", "y", "on"}
+LOCAL_PRESERVE_THINKING: bool = os.getenv("LOCAL_PRESERVE_THINKING", "true").lower() in {"1", "true", "yes", "y", "on"}
+# Anti-Loop-System-Prompt: wird als zusaetzliche System-Message injiziert
+LOCAL_ANTI_LOOP_SYSTEM_PROMPT: str = os.getenv(
+    "LOCAL_ANTI_LOOP_SYSTEM_PROMPT",
+    "CRITICAL RULES:\n"
+    "1. NEVER call the same tool with the same arguments more than once.\n"
+    "2. After reading a file or getting search results, IMMEDIATELY use the "
+    "information to take the next action (edit, create, run, or respond).\n"
+    "3. Do NOT re-read files you already read. Do NOT re-search patterns you "
+    "already searched.\n"
+    "4. If a tool call fails or returns no results, try a DIFFERENT approach — "
+    "do not retry the same call.\n"
+    "5. When updating a todo/task list, do it ONCE then move on to actual work.\n"
+    "6. Always produce reasoning in <think> tags before taking action."
+)
+
 # ── Read-Loop-Detection (NUR lokales Modell) ───────────────────────────────
 # Erkennt wenn ein Modell dieselbe Datei mit denselben Zeilen >N mal liest
 # und injiziert eine Interventions-Message.
@@ -562,6 +594,28 @@ def _apply_config_file() -> None:
     gt_intervention = tokens_cfg.get("generic_tool_loop_intervention", "")
     if gt_intervention:
         GENERIC_TOOL_LOOP_INTERVENTION = str(gt_intervention)
+
+    global LOCAL_TEMPERATURE, LOCAL_TOP_P, LOCAL_TOP_K, LOCAL_MIN_P
+    global LOCAL_DRY_MULTIPLIER, LOCAL_DRY_BASE, LOCAL_DRY_ALLOWED_LENGTH
+    global LOCAL_DRY_PENALTY_LAST_N, LOCAL_DRY_SEQUENCE_BREAKER
+    global LOCAL_ENABLE_THINKING, LOCAL_PRESERVE_THINKING
+    global LOCAL_ANTI_LOOP_SYSTEM_PROMPT
+    local_cfg = tokens_cfg.get("local_sampling", {})
+    if isinstance(local_cfg, dict) and local_cfg:
+        LOCAL_TEMPERATURE = float(local_cfg.get("temperature", LOCAL_TEMPERATURE))
+        LOCAL_TOP_P = float(local_cfg.get("top_p", LOCAL_TOP_P))
+        LOCAL_TOP_K = int(local_cfg.get("top_k", LOCAL_TOP_K))
+        LOCAL_MIN_P = float(local_cfg.get("min_p", LOCAL_MIN_P))
+        LOCAL_DRY_MULTIPLIER = float(local_cfg.get("dry_multiplier", LOCAL_DRY_MULTIPLIER))
+        LOCAL_DRY_BASE = float(local_cfg.get("dry_base", LOCAL_DRY_BASE))
+        LOCAL_DRY_ALLOWED_LENGTH = int(local_cfg.get("dry_allowed_length", LOCAL_DRY_ALLOWED_LENGTH))
+        LOCAL_DRY_PENALTY_LAST_N = int(local_cfg.get("dry_penalty_last_n", LOCAL_DRY_PENALTY_LAST_N))
+        LOCAL_DRY_SEQUENCE_BREAKER = str(local_cfg.get("dry_sequence_breaker", LOCAL_DRY_SEQUENCE_BREAKER))
+        LOCAL_ENABLE_THINKING = bool(local_cfg.get("enable_thinking", LOCAL_ENABLE_THINKING))
+        LOCAL_PRESERVE_THINKING = bool(local_cfg.get("preserve_thinking", LOCAL_PRESERVE_THINKING))
+        al_prompt = local_cfg.get("anti_loop_system_prompt", "")
+        if al_prompt:
+            LOCAL_ANTI_LOOP_SYSTEM_PROMPT = str(al_prompt)
 
     _log("Config aus config.json neu geladen")
 
@@ -1919,10 +1973,13 @@ def _patch_moonshot_payload(payload: Dict[str, Any], api_url: str) -> None:
         _log(f"Moonshot-Fixes: {'; '.join(fixes)}")
 
 
-def _clean_payload(payload: Dict[str, Any], keep_tools: bool = False) -> Dict[str, Any]:
+def _clean_payload(payload: Dict[str, Any], keep_tools: bool = False,
+                   keep_top_k: bool = False) -> Dict[str, Any]:
     if not payload.get("stream") and "stream_options" in payload:
         payload.pop("stream_options")
-    strip_keys = ["stop_sequences", "safety_settings", "response_format", "top_k"]
+    strip_keys = ["stop_sequences", "safety_settings", "response_format"]
+    if not keep_top_k:
+        strip_keys.append("top_k")
     if not keep_tools:
         strip_keys += ["tool_choice", "tools", "functions", "function_call"]
     for key in strip_keys:
@@ -1955,6 +2012,57 @@ def _api_headers(api_key: str) -> Dict[str, str]:
 # Payload-Builder ── Pass-Through
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _patch_local_sampling_payload(payload: Dict[str, Any]) -> None:
+    """Setzt empfohlene Sampling-Parameter fuer lokale Modelle (Laguna-S-2.1).
+
+    Empfohlen aus poolside/Laguna-S-2.1 Diskussion #23:
+      temp=0.7, top_p=0.95, top_k=20, min_p=0.0
+      DRY: multiplier=0.8, base=1.75, allowed_length=3, penalty_last_n=-1
+      chat_template_kwargs: enable_thinking=true, preserve_thinking=true
+    """
+    payload["temperature"] = LOCAL_TEMPERATURE
+    payload["top_p"] = LOCAL_TOP_P
+    payload["top_k"] = LOCAL_TOP_K
+    payload["min_p"] = LOCAL_MIN_P
+
+    # DRY-Parameter (llama.cpp / vLLM kompatibel)
+    if LOCAL_DRY_MULTIPLIER > 0:
+        payload["dry_multiplier"] = LOCAL_DRY_MULTIPLIER
+        payload["dry_base"] = LOCAL_DRY_BASE
+        payload["dry_allowed_length"] = LOCAL_DRY_ALLOWED_LENGTH
+        payload["dry_penalty_last_n"] = LOCAL_DRY_PENALTY_LAST_N
+        payload["dry_sequence_breaker"] = LOCAL_DRY_SEQUENCE_BREAKER
+
+    # chat_template_kwargs (vLLM / llama.cpp --jinja)
+    payload["chat_template_kwargs"] = {
+        "enable_thinking": LOCAL_ENABLE_THINKING,
+        "preserve_thinking": LOCAL_PRESERVE_THINKING,
+    }
+
+    _log(f"Local-Sampling: temp={LOCAL_TEMPERATURE}, top_p={LOCAL_TOP_P}, "
+         f"top_k={LOCAL_TOP_K}, min_p={LOCAL_MIN_P}, "
+         f"dry_mult={LOCAL_DRY_MULTIPLIER}, dry_base={LOCAL_DRY_BASE}, "
+         f"thinking={LOCAL_ENABLE_THINKING}, preserve={LOCAL_PRESERVE_THINKING}")
+
+
+def _inject_local_anti_loop_system(messages: List[Dict[str, Any]]) -> None:
+    """Injiziert Anti-Loop-System-Prompt fuer lokale Modelle.
+
+    Wird NACH der ersten System-Message (falls vorhanden) eingefuegt,
+    damit der Modell-eigene System-Prompt Vorrang hat.
+    """
+    if not LOCAL_ANTI_LOOP_SYSTEM_PROMPT.strip():
+        return
+    insert_idx = 0
+    if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+        insert_idx = 1
+    messages.insert(insert_idx, {
+        "role": "system",
+        "content": LOCAL_ANTI_LOOP_SYSTEM_PROMPT,
+    })
+    _log("Local-Anti-Loop-System-Prompt injiziert")
+
+
 def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int = 0) -> Dict[str, Any]:
     defs = _model_defs(category)
     cat = defs[def_idx] if defs and def_idx < len(defs) else _model_defs("light")[0]
@@ -1976,11 +2084,16 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
     if not cat.get("is_vision", False):
         _sanitize_image_urls_inplace(messages, "Passthrough")
 
+    # Laguna-S-2.1 / Local-Model: Sampling + Anti-Loop
+    if category == "local":
+        _patch_local_sampling_payload(payload)
+        _inject_local_anti_loop_system(messages)
+
     _patch_moonshot_payload(payload, cat.get("api_url", ""))
     _patch_max_tokens_payload(payload, cat)
     _patch_reasoning_effort_payload(payload, cat)
 
-    return _clean_payload(payload, keep_tools=True)
+    return _clean_payload(payload, keep_tools=True, keep_top_k=(category == "local"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
