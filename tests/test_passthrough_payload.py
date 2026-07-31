@@ -493,7 +493,7 @@ def test_detect_read_loop_below_threshold():
     old_threshold = proxy.READ_LOOP_THRESHOLD
     proxy.READ_LOOP_THRESHOLD = 3
     try:
-        result = proxy._detect_read_loop_inplace(msgs, category="local")
+        result = proxy._detect_read_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4")
         assert result is False
         assert len(msgs) == 7  # keine Intervention, 7 Messages unveraendert
     finally:
@@ -518,7 +518,7 @@ def test_detect_read_loop_triggers():
     old_threshold = proxy.READ_LOOP_THRESHOLD
     proxy.READ_LOOP_THRESHOLD = 3
     try:
-        result = proxy._detect_read_loop_inplace(msgs, category="local")
+        result = proxy._detect_read_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4")
         assert result is True
         # User-Msg + 1.Read + 1.ToolResult + Intervention = 4
         assert len(msgs) == 4
@@ -533,7 +533,7 @@ def test_detect_read_loop_triggers():
 
 
 def test_detect_read_loop_cloud_model_ignored():
-    """Cloud-Modelle (light/strong/vision) → keine Detection."""
+    """Nicht-Laguna-Modelle → keine Detection (egal welche Kategorie)."""
     msgs = [
         _make_read_msg("/a.py", 1, 10),
         _make_read_msg("/a.py", 1, 10),
@@ -544,10 +544,10 @@ def test_detect_read_loop_cloud_model_ignored():
     old_threshold = proxy.READ_LOOP_THRESHOLD
     proxy.READ_LOOP_THRESHOLD = 3
     try:
-        assert proxy._detect_read_loop_inplace(msgs, category="light") is False
-        assert proxy._detect_read_loop_inplace(msgs, category="strong") is False
-        assert proxy._detect_read_loop_inplace(msgs, category="vision") is False
-        assert proxy._detect_read_loop_inplace(msgs, category="") is False
+        assert proxy._detect_read_loop_inplace(msgs, category="light", model_name="gpt-4.1-mini") is False
+        assert proxy._detect_read_loop_inplace(msgs, category="strong", model_name="claude-sonnet-4-20250514") is False
+        assert proxy._detect_read_loop_inplace(msgs, category="vision", model_name="gpt-4o") is False
+        assert proxy._detect_read_loop_inplace(msgs, category="local", model_name="") is False
     finally:
         proxy.READ_LOOP_THRESHOLD = old_threshold
 
@@ -564,7 +564,7 @@ def test_detect_read_loop_different_files_no_trigger():
     old_threshold = proxy.READ_LOOP_THRESHOLD
     proxy.READ_LOOP_THRESHOLD = 3
     try:
-        assert proxy._detect_read_loop_inplace(msgs, category="local") is False
+        assert proxy._detect_read_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4") is False
     finally:
         proxy.READ_LOOP_THRESHOLD = old_threshold
 
@@ -582,7 +582,7 @@ def test_detect_read_loop_different_lines_no_trigger():
     proxy.READ_LOOP_THRESHOLD = 3
     proxy.READ_LOOP_FILE_THRESHOLD = 8
     try:
-        assert proxy._detect_read_loop_inplace(msgs, category="local") is False
+        assert proxy._detect_read_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4") is False
     finally:
         proxy.READ_LOOP_THRESHOLD = old_threshold
         proxy.READ_LOOP_FILE_THRESHOLD = old_file_threshold
@@ -600,7 +600,7 @@ def test_detect_read_loop_disabled():
     old_threshold = proxy.READ_LOOP_THRESHOLD
     proxy.READ_LOOP_THRESHOLD = 0
     try:
-        assert proxy._detect_read_loop_inplace(msgs, category="local") is False
+        assert proxy._detect_read_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4") is False
     finally:
         proxy.READ_LOOP_THRESHOLD = old_threshold
 
@@ -620,7 +620,7 @@ def test_detect_read_loop_interrupted_sequence():
     proxy.READ_LOOP_FILE_THRESHOLD = 8
     try:
         # max consecutive = 2, nicht > 3; file-crawl: 4x /a.py in 5, nicht > 8
-        assert proxy._detect_read_loop_inplace(msgs, category="local") is False
+        assert proxy._detect_read_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4") is False
     finally:
         proxy.READ_LOOP_THRESHOLD = old_threshold
         proxy.READ_LOOP_FILE_THRESHOLD = old_file_threshold
@@ -642,7 +642,7 @@ def test_detect_file_crawl_triggers():
     proxy.READ_LOOP_FILE_WINDOW = 12
     proxy.READ_LOOP_FILE_KEEP = 1
     try:
-        result = proxy._detect_read_loop_inplace(msgs, category="local")
+        result = proxy._detect_read_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4")
         assert result is True
         last = msgs[-1]
         assert last["role"] == "user"
@@ -680,7 +680,7 @@ def test_file_crawl_truncation_removes_tail():
     proxy.READ_LOOP_FILE_KEEP = 1
     try:
         before = len(msgs)
-        assert proxy._detect_read_loop_inplace(msgs, category="local") is True
+        assert proxy._detect_read_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4") is True
         assert len(msgs) < before
         # Kein Search-Tail mehr
         assert not any(
@@ -719,7 +719,7 @@ def test_detect_response_loop_flags_repeated_search():
     proxy._RESPONSE_LOOP_THRESHOLD = 3
     try:
         reasons, blocked_names = proxy._detect_response_loop(
-            body, new_tc, category="local")
+            body, new_tc, category="local", model_name="poolside/Laguna-S-2.1-NVFP4")
         assert reasons
         assert "grep_search" in blocked_names
     finally:
@@ -749,7 +749,7 @@ def test_detect_response_loop_allows_different_search():
     proxy._RESPONSE_LOOP_THRESHOLD = 3
     try:
         reasons, blocked_names = proxy._detect_response_loop(
-            body, new_tc, category="local")
+            body, new_tc, category="local", model_name="poolside/Laguna-S-2.1-NVFP4")
         assert reasons == []
         assert blocked_names == []
     finally:
@@ -783,7 +783,7 @@ def test_detect_response_loop_flags_file_crawl_continue():
     proxy.READ_LOOP_FILE_WINDOW = 12
     try:
         reasons, blocked_names = proxy._detect_response_loop(
-            body, new_tc, category="local")
+            body, new_tc, category="local", model_name="poolside/Laguna-S-2.1-NVFP4")
         assert reasons
         assert "read_file" in blocked_names
     finally:
@@ -856,7 +856,7 @@ def test_detect_search_loop_triggers():
     old_threshold = proxy.SEARCH_LOOP_THRESHOLD
     proxy.SEARCH_LOOP_THRESHOLD = 3
     try:
-        result = proxy._detect_search_loop_inplace(msgs, category="local")
+        result = proxy._detect_search_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4")
         assert result is True
         # 1.Search + 1.NoMatchResult + Intervention = 3
         assert len(msgs) == 3
@@ -880,7 +880,7 @@ def test_detect_search_loop_below_threshold():
     old_threshold = proxy.SEARCH_LOOP_THRESHOLD
     proxy.SEARCH_LOOP_THRESHOLD = 3
     try:
-        result = proxy._detect_search_loop_inplace(msgs, category="local")
+        result = proxy._detect_search_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4")
         assert result is False
         assert len(msgs) == 6  # unveraendert
     finally:
@@ -888,7 +888,7 @@ def test_detect_search_loop_below_threshold():
 
 
 def test_detect_search_loop_cloud_model_ignored():
-    """Cloud-Modelle → keine Search-Loop-Detection."""
+    """Nicht-Laguna-Modelle → keine Search-Loop-Detection."""
     msgs = []
     for i in range(5):
         cid = f"call_{i}"
@@ -898,9 +898,9 @@ def test_detect_search_loop_cloud_model_ignored():
     old_threshold = proxy.SEARCH_LOOP_THRESHOLD
     proxy.SEARCH_LOOP_THRESHOLD = 3
     try:
-        assert proxy._detect_search_loop_inplace(msgs, category="light") is False
-        assert proxy._detect_search_loop_inplace(msgs, category="strong") is False
-        assert proxy._detect_search_loop_inplace(msgs, category="") is False
+        assert proxy._detect_search_loop_inplace(msgs, category="light", model_name="gpt-4.1-mini") is False
+        assert proxy._detect_search_loop_inplace(msgs, category="strong", model_name="claude-sonnet-4-20250514") is False
+        assert proxy._detect_search_loop_inplace(msgs, category="local", model_name="") is False
     finally:
         proxy.SEARCH_LOOP_THRESHOLD = old_threshold
 
@@ -918,7 +918,7 @@ def test_detect_search_loop_with_results_no_trigger_when_repeat_disabled():
     proxy.SEARCH_LOOP_THRESHOLD = 3
     proxy.SEARCH_REPEAT_THRESHOLD = 0
     try:
-        assert proxy._detect_search_loop_inplace(msgs, category="local") is False
+        assert proxy._detect_search_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4") is False
     finally:
         proxy.SEARCH_LOOP_THRESHOLD = old_threshold
         proxy.SEARCH_REPEAT_THRESHOLD = old_repeat
@@ -937,7 +937,7 @@ def test_detect_search_repeat_loop_with_results_triggers():
     proxy.SEARCH_LOOP_THRESHOLD = 3
     proxy.SEARCH_REPEAT_THRESHOLD = 3
     try:
-        result = proxy._detect_search_loop_inplace(msgs, category="local")
+        result = proxy._detect_search_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4")
         assert result is True
         last = msgs[-1]
         assert last["role"] == "user"
@@ -973,7 +973,7 @@ def test_detect_search_loop_interrupted_by_success():
     proxy.SEARCH_REPEAT_THRESHOLD = 0
     try:
         # max consecutive no-match = 2, nicht > 3
-        assert proxy._detect_search_loop_inplace(msgs, category="local") is False
+        assert proxy._detect_search_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4") is False
     finally:
         proxy.SEARCH_LOOP_THRESHOLD = old_threshold
         proxy.SEARCH_REPEAT_THRESHOLD = old_repeat
@@ -992,7 +992,7 @@ def test_detect_search_loop_different_queries_no_trigger():
     proxy.SEARCH_LOOP_THRESHOLD = 3
     proxy.SEARCH_REPEAT_THRESHOLD = 3
     try:
-        assert proxy._detect_search_loop_inplace(msgs, category="local") is False
+        assert proxy._detect_search_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4") is False
     finally:
         proxy.SEARCH_LOOP_THRESHOLD = old_threshold
         proxy.SEARCH_REPEAT_THRESHOLD = old_repeat
@@ -1011,7 +1011,7 @@ def test_detect_search_loop_disabled():
     proxy.SEARCH_LOOP_THRESHOLD = 0
     proxy.SEARCH_REPEAT_THRESHOLD = 0
     try:
-        assert proxy._detect_search_loop_inplace(msgs, category="local") is False
+        assert proxy._detect_search_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4") is False
     finally:
         proxy.SEARCH_LOOP_THRESHOLD = old_threshold
         proxy.SEARCH_REPEAT_THRESHOLD = old_repeat
@@ -1039,7 +1039,7 @@ def test_detect_search_loop_file_search_tool():
     old_threshold = proxy.SEARCH_LOOP_THRESHOLD
     proxy.SEARCH_LOOP_THRESHOLD = 3
     try:
-        result = proxy._detect_search_loop_inplace(msgs, category="local")
+        result = proxy._detect_search_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4")
         assert result is True
         last = msgs[-1]
         assert "STOP" in last["content"]
@@ -1087,7 +1087,7 @@ def test_generic_tool_loop_triggers():
     old_threshold = proxy.GENERIC_TOOL_LOOP_THRESHOLD
     proxy.GENERIC_TOOL_LOOP_THRESHOLD = 3
     try:
-        result = proxy._detect_generic_tool_loop_inplace(msgs, category="local")
+        result = proxy._detect_generic_tool_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4")
         assert result is True
         last = msgs[-1]
         assert last["role"] == "user"
@@ -1108,7 +1108,7 @@ def test_generic_tool_loop_below_threshold():
     old_threshold = proxy.GENERIC_TOOL_LOOP_THRESHOLD
     proxy.GENERIC_TOOL_LOOP_THRESHOLD = 3
     try:
-        result = proxy._detect_generic_tool_loop_inplace(msgs, category="local")
+        result = proxy._detect_generic_tool_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4")
         assert result is False
     finally:
         proxy.GENERIC_TOOL_LOOP_THRESHOLD = old_threshold
@@ -1126,7 +1126,7 @@ def test_generic_tool_loop_different_args_no_trigger():
     old_threshold = proxy.GENERIC_TOOL_LOOP_THRESHOLD
     proxy.GENERIC_TOOL_LOOP_THRESHOLD = 3
     try:
-        result = proxy._detect_generic_tool_loop_inplace(msgs, category="local")
+        result = proxy._detect_generic_tool_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4")
         assert result is False
     finally:
         proxy.GENERIC_TOOL_LOOP_THRESHOLD = old_threshold
@@ -1143,14 +1143,14 @@ def test_generic_tool_loop_disabled():
     old_threshold = proxy.GENERIC_TOOL_LOOP_THRESHOLD
     proxy.GENERIC_TOOL_LOOP_THRESHOLD = 0
     try:
-        result = proxy._detect_generic_tool_loop_inplace(msgs, category="local")
+        result = proxy._detect_generic_tool_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4")
         assert result is False
     finally:
         proxy.GENERIC_TOOL_LOOP_THRESHOLD = old_threshold
 
 
 def test_generic_tool_loop_cloud_model_ignored():
-    """Cloud-Kategorien → keine Detection."""
+    """Nicht-Laguna-Modelle → keine Detection."""
     msgs = []
     for i in range(5):
         cid = f"call_t{i}"
@@ -1160,8 +1160,8 @@ def test_generic_tool_loop_cloud_model_ignored():
     old_threshold = proxy.GENERIC_TOOL_LOOP_THRESHOLD
     proxy.GENERIC_TOOL_LOOP_THRESHOLD = 3
     try:
-        assert proxy._detect_generic_tool_loop_inplace(msgs, category="light") is False
-        assert proxy._detect_generic_tool_loop_inplace(msgs, category="strong") is False
+        assert proxy._detect_generic_tool_loop_inplace(msgs, category="light", model_name="gpt-4.1-mini") is False
+        assert proxy._detect_generic_tool_loop_inplace(msgs, category="strong", model_name="claude-sonnet-4-20250514") is False
     finally:
         proxy.GENERIC_TOOL_LOOP_THRESHOLD = old_threshold
 
@@ -1184,7 +1184,7 @@ def test_generic_tool_loop_interrupted_by_different_tool():
     old_threshold = proxy.GENERIC_TOOL_LOOP_THRESHOLD
     proxy.GENERIC_TOOL_LOOP_THRESHOLD = 3
     try:
-        result = proxy._detect_generic_tool_loop_inplace(msgs, category="local")
+        result = proxy._detect_generic_tool_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4")
         assert result is False  # nur 2 trailing, nicht >3
     finally:
         proxy.GENERIC_TOOL_LOOP_THRESHOLD = old_threshold
@@ -1204,7 +1204,7 @@ def test_generic_tool_loop_skips_read_and_search():
     old_threshold = proxy.GENERIC_TOOL_LOOP_THRESHOLD
     proxy.GENERIC_TOOL_LOOP_THRESHOLD = 3
     try:
-        result = proxy._detect_generic_tool_loop_inplace(msgs, category="local")
+        result = proxy._detect_generic_tool_loop_inplace(msgs, category="local", model_name="poolside/Laguna-S-2.1-NVFP4")
         assert result is False  # read/search haben eigene Detection
     finally:
         proxy.GENERIC_TOOL_LOOP_THRESHOLD = old_threshold
@@ -1233,7 +1233,7 @@ def test_detect_response_loop_flags_generic_tool_repeat():
     proxy.GENERIC_TOOL_LOOP_THRESHOLD = 3
     try:
         reasons, blocked_names = proxy._detect_response_loop(
-            body, new_tc, category="local")
+            body, new_tc, category="local", model_name="poolside/Laguna-S-2.1-NVFP4")
         assert reasons
         assert "manage_todo_list" in blocked_names
     finally:
@@ -1264,7 +1264,7 @@ def test_detect_response_loop_allows_different_generic_args():
     proxy.GENERIC_TOOL_LOOP_THRESHOLD = 3
     try:
         reasons, blocked_names = proxy._detect_response_loop(
-            body, new_tc, category="local")
+            body, new_tc, category="local", model_name="poolside/Laguna-S-2.1-NVFP4")
         assert reasons == []
         assert blocked_names == []
     finally:

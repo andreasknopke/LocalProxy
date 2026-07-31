@@ -302,7 +302,7 @@ HINDSIGHT_DIR: Path = Path(os.getenv("HINDSIGHT_DIR", "./data/.hindsight_memory"
 # ── Tool-Result-Capping ────────────────────────────────────────────────────
 TOOL_RESULT_CAP: int = int(os.getenv("TOOL_RESULT_CAP", "0"))
 
-# ── Laguna-S-2.1 / Local-Model Sampling & Anti-Loop ───────────────────────
+# ── Laguna-S-2.1 Sampling & Anti-Loop ─────────────────────────────────────
 # Empfohlene Parameter aus poolside/Laguna-S-2.1 Diskussion #23:
 #   temp=0.7, top_p=0.95, top_k=20, min_p=0.0
 #   DRY: multiplier=0.8, base=1.75, allowed_length=3, penalty_last_n=-1
@@ -334,7 +334,7 @@ LOCAL_ANTI_LOOP_SYSTEM_PROMPT: str = os.getenv(
     "6. Always produce reasoning in <think> tags before taking action."
 )
 
-# ── Read-Loop-Detection (NUR lokales Modell) ───────────────────────────────
+# ── Read-Loop-Detection (NUR Laguna-S-2.1) ─────────────────────────────────
 # Erkennt wenn ein Modell dieselbe Datei mit denselben Zeilen >N mal liest
 # und injiziert eine Interventions-Message.
 READ_LOOP_THRESHOLD: int = int(os.getenv("READ_LOOP_THRESHOLD", "3"))
@@ -360,7 +360,7 @@ READ_LOOP_FILE_INTERVENTION: str = os.getenv(
     "create_file to implement the change, or ask a specific question. Go on."
 )
 
-# ── Generic Tool-Loop-Detection (NUR lokales Modell) ──────────────────────
+# ── Generic Tool-Loop-Detection (NUR Laguna-S-2.1) ─────────────────────────
 # Erkennt wenn ein beliebiges Tool (z.B. manage_todo_list, create_file, etc.)
 # mit identischen Argumenten >N mal hintereinander aufgerufen wird.
 # Default 0 = deaktiviert (opt-in), damit legitime Wiederholungen nicht blockiert werden.
@@ -374,7 +374,7 @@ GENERIC_TOOL_LOOP_INTERVENTION: str = os.getenv(
     "replace_string_in_file/create_file, run a test, or respond to the user. Go on."
 )
 
-# ── Search-Loop-Detection (NUR lokales Modell) ─────────────────────────────
+# ── Search-Loop-Detection (NUR Laguna-S-2.1) ────────────────────────────────
 # No-Match-Loops: gleiche Suche >N mal ohne Treffer.
 SEARCH_LOOP_THRESHOLD: int = int(os.getenv("SEARCH_LOOP_THRESHOLD", "3"))
 # Repeat-Loops: gleiche Suche >N mal — AUCH mit Treffern (Spam/Exploration-Loop).
@@ -398,7 +398,7 @@ SEARCH_REPEAT_INTERVENTION: str = os.getenv(
 )
 
 # Response-Level Enforcement: blockiert Tool-Calls die trotz Historie-Intervention
-# erneut denselben Loop fortsetzen. Default aktiv (3) fuer local.
+# erneut denselben Loop fortsetzen. Default aktiv (3) fuer Laguna-S-2.1.
 # 0 = deaktiviert.
 _RESPONSE_LOOP_THRESHOLD: int = int(os.getenv("RESPONSE_LOOP_THRESHOLD", "3"))
 # Hinweis: Bei geblocktem Response-Loop liefert der Proxy KEINE passive
@@ -415,6 +415,18 @@ RESPONSE_LOOP_REDIRECT_TEXT: str = os.getenv(
     "oder formuliere eine konkrete Antwort. Wiederhole nicht die geblockten "
     "Read/Search-Calls. Go on."
 )
+
+
+# ── Laguna-S-2.1 Modell-Erkennung ─────────────────────────────────────────
+# Loop-Schutz (Read/Search/Generic/Response) und Sampling-Patches gelten
+# ausschliesslich fuer Laguna-S-2.1 Modelle — egal ob local oder cloud,
+# egal welche Quantisierung (NVFP4, GGUF, etc.).
+_LAGUNA_MODEL_RE = re.compile(r"laguna", re.IGNORECASE)
+
+
+def _is_laguna_model(model_name: str) -> bool:
+    """True wenn der Modellname ein Laguna-S-2.1 Modell ist (case-insensitive)."""
+    return bool(model_name and _LAGUNA_MODEL_RE.search(model_name))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1345,14 +1357,15 @@ def _collect_generic_tool_entries(
 
 def _detect_generic_tool_loop_inplace(
     messages: List[Dict[str, Any]], label: str = "Payload",
-    category: str = "",
+    category: str = "", model_name: str = "",
 ) -> bool:
     """Erkennt wenn ein beliebiges Tool (z.B. manage_todo_list) mit identischen
     Argumenten >GENERIC_TOOL_LOOP_THRESHOLD mal hintereinander aufgerufen wird.
 
     Trunciert ab dem 2. Vorkommen bis zum Ende + Intervention.
+    Nur fuer Laguna-S-2.1 Modelle aktiv.
     """
-    if category != "local":
+    if not _is_laguna_model(model_name):
         return False
     if GENERIC_TOOL_LOOP_THRESHOLD <= 0:
         return False
@@ -1386,9 +1399,10 @@ def _detect_generic_tool_loop_inplace(
 
 
 def _detect_read_loop_inplace(messages: List[Dict[str, Any]], label: str = "Payload",
-                              category: str = "") -> bool:
+                              category: str = "", model_name: str = "") -> bool:
     """Erkennt Read-Loops: gleiche Datei + gleiche Zeilen >N mal hintereinander.
-    NUR fuer lokale Modelle (category='local'). Cloud-Modelle werden nicht beeinflusst.
+    NUR fuer Laguna-S-2.1 Modelle (local oder cloud). Alle anderen Modelle
+    werden nicht beeinflusst.
 
     AKTIVE INTERVENTION durch Truncation: Ab dem Loop-Start wird ALLES bis zum
     Ende entfernt und durch eine Intervention ersetzt. Das verhindert, dass
@@ -1400,7 +1414,7 @@ def _detect_read_loop_inplace(messages: List[Dict[str, Any]], label: str = "Payl
       2. File-Crawl: gleiche Datei (verschiedene Zeilen) >READ_LOOP_FILE_THRESHOLD mal
          in den letzten READ_LOOP_FILE_WINDOW Reads
     """
-    if category != "local":
+    if not _is_laguna_model(model_name):
         return False
     if READ_LOOP_THRESHOLD <= 0:
         return False
@@ -1544,8 +1558,8 @@ def _is_no_match_result(text: str) -> bool:
 
 
 def _detect_search_loop_inplace(messages: List[Dict[str, Any]], label: str = "Payload",
-                                category: str = "") -> bool:
-    """Erkennt Search-Loops fuer lokale Modelle.
+                                category: str = "", model_name: str = "") -> bool:
+    """Erkennt Search-Loops fuer Laguna-S-2.1 Modelle (local oder cloud).
 
     Zwei Modi:
       1. No-Match-Loop: gleiche Signatur >SEARCH_LOOP_THRESHOLD mit No-Match
@@ -1554,7 +1568,7 @@ def _detect_search_loop_inplace(messages: List[Dict[str, Any]], label: str = "Pa
     Nur TRAILING-Sequenzen am Ende der Historie zaehlen. Bei Erkennung:
     Truncation ab dem 2. Vorkommen bis zum Ende + Intervention.
     """
-    if category != "local":
+    if not _is_laguna_model(model_name):
         return False
     if SEARCH_LOOP_THRESHOLD <= 0 and SEARCH_REPEAT_THRESHOLD <= 0:
         return False
@@ -1647,12 +1661,13 @@ def _sanitize_image_urls_inplace(messages: List[Dict[str, Any]], label: str = "P
 
 
 def _detect_response_loop(body: Dict[str, Any], tool_calls: List[Dict[str, Any]],
-                          category: str = "") -> Tuple[List[str], List[str]]:
+                          category: str = "", model_name: str = "") -> Tuple[List[str], List[str]]:
     """Detect-only Loop-Check fuer die Modell-Response.
 
     Gibt (loop_reasons, blocked_tool_names) zurueck. Blockiert nichts.
+    Nur fuer Laguna-S-2.1 Modelle aktiv.
     """
-    if category != "local" or _RESPONSE_LOOP_THRESHOLD <= 0 or not tool_calls:
+    if not _is_laguna_model(model_name) or _RESPONSE_LOOP_THRESHOLD <= 0 or not tool_calls:
         return [], []
 
     messages = body.get("messages", [])
@@ -1758,8 +1773,10 @@ def _filter_looping_response_tool_calls(
     body: Dict[str, Any],
     tool_calls: List[Dict[str, Any]],
     category: str = "",
+    model_name: str = "",
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Filtert Tool-Calls aus der Modell-Response die einen aktiven Loop fortsetzen.
+    Nur fuer Laguna-S-2.1 Modelle aktiv.
 
     Blockiert:
       - read_file derselben Datei wenn trailing file-crawl / exact-read-loop
@@ -1767,7 +1784,7 @@ def _filter_looping_response_tool_calls(
 
     Gibt (kept_tool_calls, removed_tool_calls) zurueck.
     """
-    if category != "local" or _RESPONSE_LOOP_THRESHOLD <= 0 or not tool_calls:
+    if not _is_laguna_model(model_name) or _RESPONSE_LOOP_THRESHOLD <= 0 or not tool_calls:
         return list(tool_calls), []
 
     messages = body.get("messages", [])
@@ -1877,9 +1894,9 @@ def _filter_looping_response_tool_calls(
 
 
 def _check_response_loop(body: Dict[str, Any], tool_calls: List[Dict[str, Any]],
-                         category: str = "") -> bool:
+                         category: str = "", model_name: str = "") -> bool:
     """True wenn ALLE tool_calls als Loop gefiltert wuerden."""
-    kept, removed = _filter_looping_response_tool_calls(body, tool_calls, category)
+    kept, removed = _filter_looping_response_tool_calls(body, tool_calls, category, model_name=model_name)
     return bool(removed) and not kept
 
 
@@ -2013,7 +2030,7 @@ def _api_headers(api_key: str) -> Dict[str, str]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _patch_local_sampling_payload(payload: Dict[str, Any]) -> None:
-    """Setzt empfohlene Sampling-Parameter fuer lokale Modelle (Laguna-S-2.1).
+    """Setzt empfohlene Sampling-Parameter fuer Laguna-S-2.1 Modelle (local oder cloud).
 
     Empfohlen aus poolside/Laguna-S-2.1 Diskussion #23:
       temp=0.7, top_p=0.95, top_k=20, min_p=0.0
@@ -2046,7 +2063,7 @@ def _patch_local_sampling_payload(payload: Dict[str, Any]) -> None:
 
 
 def _inject_local_anti_loop_system(messages: List[Dict[str, Any]]) -> None:
-    """Injiziert Anti-Loop-System-Prompt fuer lokale Modelle.
+    """Injiziert Anti-Loop-System-Prompt fuer Laguna-S-2.1 Modelle.
 
     Wird NACH der ersten System-Message (falls vorhanden) eingefuegt,
     damit der Modell-eigene System-Prompt Vorrang hat.
@@ -2078,14 +2095,14 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
 
     _cut_tool_results_inplace(messages, "Passthrough", TOOL_RESULT_CAP)
 
-    _detect_read_loop_inplace(messages, "Passthrough", category=category)
-    _detect_search_loop_inplace(messages, "Passthrough", category=category)
+    _detect_read_loop_inplace(messages, "Passthrough", category=category, model_name=cat["model_name"])
+    _detect_search_loop_inplace(messages, "Passthrough", category=category, model_name=cat["model_name"])
 
     if not cat.get("is_vision", False):
         _sanitize_image_urls_inplace(messages, "Passthrough")
 
-    # Laguna-S-2.1 / Local-Model: Sampling + Anti-Loop
-    if category == "local":
+    # Laguna-S-2.1: Sampling + Anti-Loop (egal ob local oder cloud)
+    if _is_laguna_model(cat["model_name"]):
         _patch_local_sampling_payload(payload)
         _inject_local_anti_loop_system(messages)
 
@@ -2093,7 +2110,7 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
     _patch_max_tokens_payload(payload, cat)
     _patch_reasoning_effort_payload(payload, cat)
 
-    return _clean_payload(payload, keep_tools=True, keep_top_k=(category == "local"))
+    return _clean_payload(payload, keep_tools=True, keep_top_k=_is_laguna_model(cat["model_name"]))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2989,15 +3006,20 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
 
     _strip_model_flags_from_messages(msgs)
 
+    # Log aktiven Index für die Kategorie
+    defs = _model_defs(category)
+    active_model = defs[active_idx]["model_name"] if defs and active_idx < len(defs) else "?"
+
     # ── Loop-Detection + Intervention auf REQUEST-Ebene ──
     # Laeuft frueh, damit auch Tool-Continuations und "go on"-Requests greifen.
     # Mutiert body["messages"] in-place (gleiche Liste wie msgs).
+    # Nur fuer Laguna-S-2.1 Modelle (local oder cloud).
     loop_intervened = False
     loop_reasons: List[str] = []
-    if category == "local" and isinstance(msgs, list):
-        read_hit = _detect_read_loop_inplace(msgs, "Passthrough", category=category)
-        search_hit = _detect_search_loop_inplace(msgs, "Passthrough", category=category)
-        generic_hit = _detect_generic_tool_loop_inplace(msgs, "Passthrough", category=category)
+    if _is_laguna_model(active_model) and isinstance(msgs, list):
+        read_hit = _detect_read_loop_inplace(msgs, "Passthrough", category=category, model_name=active_model)
+        search_hit = _detect_search_loop_inplace(msgs, "Passthrough", category=category, model_name=active_model)
+        generic_hit = _detect_generic_tool_loop_inplace(msgs, "Passthrough", category=category, model_name=active_model)
         loop_intervened = bool(read_hit or search_hit or generic_hit)
         if loop_intervened:
             last_iv = msgs[-1].get("content", "") if isinstance(msgs[-1], dict) else ""
@@ -3005,9 +3027,6 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
             _log(f"Loop-Intervention: history truncated + appended "
                  f"(read={read_hit}, search={search_hit}, generic={generic_hit})")
 
-    # Log aktiven Index für die Kategorie
-    defs = _model_defs(category)
-    active_model = defs[active_idx]["model_name"] if defs and active_idx < len(defs) else "?"
     _log(f"Kategorie: {category} (Flag={'--'+category if flag_category else 'default'}"
          f"{' Slot='+str(flag_slot) if flag_slot else ''}), "
          f"Idx={active_idx}, Modell={active_model}")
@@ -3024,6 +3043,7 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     outcome = await _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
     result = outcome.get("result", {})
     content = result.get("content", "") or ""
+    used_model = outcome.get("used_model", active_model)
 
     # Bei totalem Fehlschlag: Fehler-Text mit Prefx
     if outcome.get("all_failed"):
@@ -3034,8 +3054,8 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     # statt passivem Stopp-Text: Intervention in Messages injizieren und
     # einmal erneut aufrufen. Ergebnis ist dann produktiv.
     tool_calls = result.get("tool_calls")
-    if tool_calls and _RESPONSE_LOOP_THRESHOLD > 0 and category == "local":
-        resp_reasons, blocked_names = _detect_response_loop(body, tool_calls, category=category)
+    if tool_calls and _RESPONSE_LOOP_THRESHOLD > 0 and _is_laguna_model(used_model):
+        resp_reasons, blocked_names = _detect_response_loop(body, tool_calls, category=category, model_name=used_model)
         if resp_reasons:
             _log(f"RESPONSE-LOOP erkannt (non-stream): {resp_reasons}")
             reason_txt = "; ".join(resp_reasons)
@@ -3049,7 +3069,7 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
                     body, category, force_start_idx=force_start_idx)
                 retry_result = retry_outcome.get("result", {})
                 retry_tcs = retry_result.get("tool_calls")
-                retry_reasons, _ = _detect_response_loop(body, retry_tcs, category=category) if retry_tcs else ([], [])
+                retry_reasons, _ = _detect_response_loop(body, retry_tcs, category=category, model_name=used_model) if retry_tcs else ([], [])
                 if retry_tcs and not retry_reasons:
                     _log("RESPONSE-LOOP-Retry: Modell lieferte produktive tool_calls")
                     result = retry_result
@@ -3110,8 +3130,8 @@ async def _stream_events(body: Dict[str, Any], category: str,
     if tool_calls:
         tool_calls = _normalize_tool_calls(tool_calls) or tool_calls
 
-        if _RESPONSE_LOOP_THRESHOLD > 0 and category == "local":
-            resp_reasons, blocked_names = _detect_response_loop(body, tool_calls, category=category)
+        if _RESPONSE_LOOP_THRESHOLD > 0 and _is_laguna_model(used_model):
+            resp_reasons, blocked_names = _detect_response_loop(body, tool_calls, category=category, model_name=used_model)
             if resp_reasons:
                 _log(f"RESPONSE-LOOP erkannt (stream): {resp_reasons}")
                 reason_txt = "; ".join(resp_reasons)
@@ -3126,7 +3146,7 @@ async def _stream_events(body: Dict[str, Any], category: str,
                         body, category, force_start_idx=force_start_idx)
                     retry_result = retry_outcome.get("result", {})
                     retry_tcs = retry_result.get("tool_calls")
-                    retry_reasons, _ = _detect_response_loop(body, retry_tcs, category=category) if retry_tcs else ([], [])
+                    retry_reasons, _ = _detect_response_loop(body, retry_tcs, category=category, model_name=used_model) if retry_tcs else ([], [])
                     if retry_tcs and not retry_reasons:
                         _log("RESPONSE-LOOP-Retry (stream): produktive tool_calls")
                         result = retry_result
