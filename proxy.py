@@ -3110,8 +3110,36 @@ async def chat_completions_no_v1(request: Request):
 
 async def _stream_events(body: Dict[str, Any], category: str,
                           force_start_idx: Optional[int] = None) -> AsyncIterator[str]:
-    """2-Pass-Streaming: Erst Backend-Call mit Fallback-Loop, dann OpenAI-SSE an Copilot."""
-    outcome = await _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
+    """2-Pass-Streaming: Erst Backend-Call mit Fallback-Loop, dann OpenAI-SSE an Copilot.
+
+    Waehrend der Backend-Calls werden regelmaessig SSE-Keepalive-Kommentare
+    gesendet, damit der Client (VS Code Copilot, 300s HTTP-Timeout) die
+    Verbindung nicht als tot betrachtet und abbricht.
+    """
+    _KEEPALIVE_INTERVAL = 15  # Sekunden zwischen Keepalive-Kommentaren
+
+    # Backend-Call als Task starten, damit wir nebenbei Keepalives senden koennen
+    backend_task = asyncio.ensure_future(
+        _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
+    )
+
+    try:
+        # Waehrend der Backend laeuft: periodisch SSE-Keepalive senden
+        while not backend_task.done():
+            await asyncio.sleep(_KEEPALIVE_INTERVAL)
+            if not backend_task.done():
+                # SSE-Kommentar (wird von Clients ignoriert, haelt Verbindung alive)
+                yield ": keepalive\n\n"
+        # Task-Ergebnis abholen (propagiert ggf. CancelledError/Exception)
+        outcome = backend_task.result()
+    except (asyncio.CancelledError, GeneratorExit):
+        backend_task.cancel()
+        raise
+    except Exception:
+        if not backend_task.done():
+            backend_task.cancel()
+        raise
+
     result = outcome.get("result", {})
     content = result.get("content", "") or ""
     used_model = outcome.get("used_model", category)
@@ -3142,8 +3170,23 @@ async def _stream_events(body: Dict[str, Any], category: str,
                 msgs = body.get("messages", [])
                 if isinstance(msgs, list):
                     msgs.append({"role": "user", "content": retry_msg})
-                    retry_outcome = await _call_model_with_fallbacks(
-                        body, category, force_start_idx=force_start_idx)
+                    # Retry-Call ebenfalls mit Keepalive absichern
+                    retry_task = asyncio.ensure_future(
+                        _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
+                    )
+                    try:
+                        while not retry_task.done():
+                            await asyncio.sleep(_KEEPALIVE_INTERVAL)
+                            if not retry_task.done():
+                                yield ": keepalive\n\n"
+                        retry_outcome = retry_task.result()
+                    except (asyncio.CancelledError, GeneratorExit):
+                        retry_task.cancel()
+                        raise
+                    except Exception:
+                        if not retry_task.done():
+                            retry_task.cancel()
+                        raise
                     retry_result = retry_outcome.get("result", {})
                     retry_tcs = retry_result.get("tool_calls")
                     retry_reasons, _ = _detect_response_loop(body, retry_tcs, category=category, model_name=used_model) if retry_tcs else ([], [])
