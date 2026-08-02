@@ -1329,3 +1329,274 @@ def test_clean_payload_strips_top_k_for_cloud():
     payload = {"top_k": 20, "temperature": 0.7}
     proxy._clean_payload(payload, keep_tools=True, keep_top_k=False)
     assert "top_k" not in payload
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Co-Worker-Delegation (ask_coworker)
+# ═══════════════════════════════════════════════════════════════════════════
+
+import asyncio
+import time
+
+
+def _coworker_def(api_url: str = "http://localhost:9999/v1/chat/completions",
+                  model_name: str = "qwen3-coder") -> Dict[str, Any]:
+    """Standard-Co-Worker-Definition fuer Tests."""
+    return {
+        "api_url": api_url,
+        "api_key": "",
+        "model_name": model_name,
+        "max_tokens": 8192,
+        "use_max_completion_tokens": False,
+        "is_vision": False,
+        "timeout_seconds": 300,
+        "read_timeout_seconds": 120,
+        "retry_on_timeout": 0,
+        "retry_delay_seconds": 0,
+    }
+
+
+def _setup_coworker_configured(monkeypatch, reachable: bool = True,
+                               api_url: str = "http://localhost:9999/v1/chat/completions"):
+    """Monkeypatch: coworker konfiguriert + Health-Cache gesetzt."""
+    monkeypatch.setattr(proxy, "COWORKER_ENABLED", True)
+    monkeypatch.setattr(proxy, "_MODEL_CATEGORIES", {
+        **proxy._MODEL_CATEGORIES,
+        "coworker": _coworker_def(api_url=api_url),
+    })
+    monkeypatch.setattr(proxy, "_COWORKER_HEALTH_CACHE", {
+        "reachable": reachable,
+        "checked_at": time.time(),
+        "last_error": "" if reachable else "conn refused",
+    })
+
+
+def test_extract_flag_coworker():
+    cleaned, cat, slot = proxy._extract_model_flag("delegiere plan\n--coworker")
+    assert cat == "coworker"
+    assert slot is None
+    assert "--coworker" not in cleaned
+
+
+def test_extract_flag_coworker_strip_from_messages():
+    msgs = [{"role": "user", "content": "brainschreibung\n--coworker"}]
+    proxy._strip_model_flags_from_messages(msgs)
+    assert msgs[0]["content"] == "brainschreibung"
+
+
+def test_coworker_in_model_defs():
+    """coworker ist Single-Def-Dict wie local -> _model_defs gibt [dict] zurueck."""
+    proxy._MODEL_CATEGORIES["coworker"] = _coworker_def()
+    defs = proxy._model_defs("coworker")
+    assert len(defs) == 1
+    assert defs[0]["model_name"] == "qwen3-coder"
+
+
+def test_coworker_model_defs_empty_when_unconfigured():
+    """Ohne Konfiguration (leere api_url/model_name) ist coworker nicht nutzbar."""
+    proxy._MODEL_CATEGORIES["coworker"] = {
+        "api_url": "", "api_key": "", "model_name": "", "max_tokens": 4096,
+        "is_vision": False, "timeout_seconds": 300,
+    }
+    assert proxy._model_defs("coworker") == []
+
+
+def test_inject_coworker_tool_disabled(monkeypatch):
+    """COWORKER_ENABLED=False -> kein Tool injiziert."""
+    _setup_coworker_configured(monkeypatch)
+    monkeypatch.setattr(proxy, "COWORKER_ENABLED", False)
+    payload = {"messages": []}
+    assert proxy._inject_coworker_tool(payload) is False
+    assert "tools" not in payload
+
+
+def test_inject_coworker_tool_health_down(monkeypatch):
+    """Health-Check nicht bestanden -> kein Tool injiziert."""
+    _setup_coworker_configured(monkeypatch, reachable=False)
+    payload = {"messages": []}
+    assert proxy._inject_coworker_tool(payload) is False
+    assert "tools" not in payload
+
+
+def test_inject_coworker_tool_not_configured(monkeypatch):
+    """coworker ohne gueltige Definition -> kein Tool injiziert."""
+    monkeypatch.setattr(proxy, "COWORKER_ENABLED", True)
+    monkeypatch.setattr(proxy, "_MODEL_CATEGORIES", {
+        **proxy._MODEL_CATEGORIES,
+        "coworker": {"api_url": "", "api_key": "", "model_name": ""},
+    })
+    monkeypatch.setattr(proxy, "_COWORKER_HEALTH_CACHE", {
+        "reachable": True, "checked_at": time.time(), "last_error": "",
+    })
+    payload = {"messages": []}
+    assert proxy._inject_coworker_tool(payload) is False
+    assert "tools" not in payload
+
+
+def test_inject_coworker_tool_ok(monkeypatch):
+    """Health-OK + konfiguriert -> Tool mit korrektem Schema injiziert."""
+    _setup_coworker_configured(monkeypatch)
+    payload = {"messages": []}
+    assert proxy._inject_coworker_tool(payload) is True
+    tools = payload["tools"]
+    assert len(tools) == 1
+    fn = tools[0]["function"]
+    assert fn["name"] == "ask_coworker"
+    assert "task" in fn["parameters"]["properties"]
+    assert "context" in fn["parameters"]["properties"]
+    assert fn["parameters"]["required"] == ["task"]
+    assert payload.get("tool_choice") == "auto"
+
+
+def test_inject_coworker_tool_no_override_choice(monkeypatch):
+    """Bestehendes tool_choice wird nicht ueberschrieben."""
+    _setup_coworker_configured(monkeypatch)
+    payload = {"messages": [], "tool_choice": "none"}
+    proxy._inject_coworker_tool(payload)
+    assert payload["tool_choice"] == "none"
+
+
+def test_inject_coworker_tool_idempotent(monkeypatch):
+    """Doppelter Aufruf injiziert das Tool nur einmal."""
+    _setup_coworker_configured(monkeypatch)
+    payload = {"messages": []}
+    proxy._inject_coworker_tool(payload)
+    proxy._inject_coworker_tool(payload)
+    assert len(payload["tools"]) == 1
+
+
+def test_partition_tool_calls_mixed():
+    calls = [
+        {"id": "a", "function": {"name": "ask_coworker", "arguments": "{}"}},
+        {"id": "b", "function": {"name": "read_file", "arguments": "{}"}},
+        {"id": "c", "function": {"name": "ask_coworker", "arguments": "{}"}},
+    ]
+    cw, other = proxy._partition_tool_calls(calls)
+    assert len(cw) == 2
+    assert len(other) == 1
+    assert other[0]["function"]["name"] == "read_file"
+
+
+def test_partition_tool_calls_empty():
+    cw, other = proxy._partition_tool_calls(None)
+    assert cw == []
+    assert other == []
+
+
+def test_build_coworker_body_no_leakage(monkeypatch):
+    """Frische Session: nur system+user, keine History/Tools/reasoning."""
+    monkeypatch.setattr(proxy, "COWORKER_SYSTEM_PROMPT", "SysRolle")
+    monkeypatch.setattr(proxy, "COWORKER_TASK_CAP", 0)
+    body = proxy._build_coworker_body("plane task", "context snippet")
+    assert body["stream"] is False
+    assert "tools" not in body
+    assert "tool_calls" not in body
+    assert "reasoning_content" not in body
+    roles = [m["role"] for m in body["messages"]]
+    assert roles == ["system", "user"]
+    assert "context snippet" in body["messages"][1]["content"]
+
+
+def test_build_coworker_body_caps(monkeypatch):
+    """Task+Context werden auf task_cap_chars gekappt."""
+    monkeypatch.setattr(proxy, "COWORKER_TASK_CAP", 30)
+    monkeypatch.setattr(proxy, "COWORKER_SYSTEM_PROMPT", "SysRolle")
+    body = proxy._build_coworker_body("t" * 100, "")
+    content = body["messages"][1]["content"]
+    assert len(content) <= 30 + len("\n…[gekappt]")
+    assert content.endswith("…[gekappt]")
+
+
+def test_run_coworker_call_error_becomes_tool_result(monkeypatch):
+    """Co-Worker-Ausfall wird tool-result mit Fehlertext, kein Crash."""
+    monkeypatch.setattr(proxy, "_MODEL_CATEGORIES", {
+        **proxy._MODEL_CATEGORIES,
+        "coworker": _coworker_def(api_url="http://127.0.0.1:1/v1/chat/completions"),
+    })
+    tool_call = {"id": "call_1",
+                 "function": {"name": "ask_coworker",
+                              "arguments": json.dumps({"task": "x"})}}
+    msg = asyncio.run(proxy._run_coworker_call(tool_call))
+    assert msg["role"] == "tool"
+    assert msg["tool_call_id"] == "call_1"
+    assert msg["name"] == "ask_coworker"
+    assert "[Co-Worker nicht verfuegbar]" in msg["content"]
+
+
+def test_delegation_loop_content_only(monkeypatch):
+    """Keine tool_calls -> outcome wird direkt durchgereicht."""
+    async def fake_call(body, category, force_start_idx=None):
+        return {"result": {"status": "ok", "content": "direkt", "tool_calls": None},
+                "used_idx": 0, "used_model": "main", "attempts": [], "all_failed": False}
+    monkeypatch.setattr(proxy, "_call_model_with_fallbacks", fake_call)
+    body = {"messages": [{"role": "user", "content": "test"}]}
+    outcome = asyncio.run(proxy._delegation_loop(body, "local"))
+    assert outcome["result"]["content"] == "direkt"
+
+
+def test_delegation_loop_passthrough_other_tools(monkeypatch):
+    """Nur VS-Code-Tools -> unveraendert an VS Code durchreichen."""
+    async def fake_call(body, category, force_start_idx=None):
+        return {"result": {"status": "ok", "content": "", "tool_calls": [
+            {"id": "r1", "type": "function",
+             "function": {"name": "read_file", "arguments": json.dumps({"filePath": "x"})}},
+        ]}, "used_idx": 0, "used_model": "main", "attempts": [], "all_failed": False}
+    monkeypatch.setattr(proxy, "_call_model_with_fallbacks", fake_call)
+    body = {"messages": [{"role": "user", "content": "test"}]}
+    outcome = asyncio.run(proxy._delegation_loop(body, "local"))
+    tcs = outcome["result"]["tool_calls"]
+    assert len(tcs) == 1
+    assert tcs[0]["function"]["name"] == "read_file"
+
+
+def test_delegation_loop_mixed_turn_hint(monkeypatch):
+    """Gemischter Turn -> Hinweis injiziert, kein interner Co-Worker-Call."""
+    calls = {"n": 0}
+
+    async def fake_call(body, category, force_start_idx=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"result": {"status": "ok", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "ask_coworker", "arguments": json.dumps({"task": "t"})}},
+                {"id": "r1", "type": "function",
+                 "function": {"name": "read_file", "arguments": json.dumps({"filePath": "x"})}},
+            ]}, "used_idx": 0, "used_model": "main", "attempts": [], "all_failed": False}
+        return {"result": {"status": "ok", "content": "antwort", "tool_calls": None},
+                "used_idx": 0, "used_model": "main", "attempts": [], "all_failed": False}
+
+    monkeypatch.setattr(proxy, "_call_model_with_fallbacks", fake_call)
+    monkeypatch.setattr(proxy, "COWORKER_MAX_DELEGATIONS", 5)
+    body = {"messages": [{"role": "user", "content": "test"}]}
+    outcome = asyncio.run(proxy._delegation_loop(body, "local"))
+    assert outcome["result"]["content"] == "antwort"
+    assert any("[Proxy-Hinweis]" in m.get("content", "") for m in body["messages"])
+
+
+def test_delegation_loop_enforces_limit(monkeypatch):
+    """Nach max_delegations wird das Modell zur direkten Antwort gezwungen."""
+    calls = {"n": 0}
+
+    async def fake_run(tool_call):
+        return {"role": "tool", "tool_call_id": tool_call.get("id"),
+                "name": "ask_coworker", "content": "co-worker antwort"}
+
+    async def fake_call(body, category, force_start_idx=None):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            return {"result": {"status": "ok", "content": "", "tool_calls": [
+                {"id": f"c{calls['n']}", "type": "function",
+                 "function": {"name": "ask_coworker", "arguments": json.dumps({"task": "t"})}},
+            ]}, "used_idx": 0, "used_model": "main", "attempts": [], "all_failed": False}
+        return {"result": {"status": "ok", "content": "fertig", "tool_calls": None},
+                "used_idx": 0, "used_model": "main", "attempts": [], "all_failed": False}
+
+    monkeypatch.setattr(proxy, "_call_model_with_fallbacks", fake_call)
+    monkeypatch.setattr(proxy, "_run_coworker_call", fake_run)
+    monkeypatch.setattr(proxy, "COWORKER_MAX_DELEGATIONS", 2)
+    body = {"messages": [{"role": "user", "content": "test"}]}
+    outcome = asyncio.run(proxy._delegation_loop(body, "local"))
+    assert outcome["result"]["content"] == "fertig"
+    assert calls["n"] == 4  # 2 Delegations-Runden + Limit-Runde + Finale
+    found_limit = any("Limit erreicht" in str(m.get("content", "")) for m in body["messages"])
+    assert found_limit

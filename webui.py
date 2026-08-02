@@ -177,6 +177,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "retry_on_timeout": 2,
             "retry_delay_seconds": 5,
         },
+        "coworker": {
+            "api_url": "",
+            "api_key": "",
+            "model_name": "",
+            "max_tokens": 65536,
+            "use_max_completion_tokens": False,
+            "is_vision": False,
+            "timeout_seconds": 300,
+            "read_timeout_seconds": 120,
+            "retry_on_timeout": 2,
+            "retry_delay_seconds": 5,
+        },
         "light": [
             {
                 "label": "light primary",
@@ -253,6 +265,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "response_loop_threshold": 3,
         "generic_tool_loop_threshold": 3,
         "generic_tool_loop_intervention": "",
+        "coworker": {
+            "enabled": True,
+            "max_delegations_per_request": 2,
+            "task_cap_chars": 8000,
+            "result_cap_chars": 12000,
+            "health_interval_seconds": 60,
+            "probe_timeout_seconds": 5,
+            "system_prompt": "You are a co-worker coding model acting as a subagent for planning, code review, brainstorming and parallel implementation tasks. You receive a self-contained task and optional context. Answer with concrete, actionable output: for planning give a step-by-step plan; for review list issues with file/line references and concrete fixes; for coding give complete, idiomatic code. You have NO access to tools, the conversation history or the workspace — work only from what is given to you.",
+        },
         "local_sampling": {
             "temperature": 0.7,
             "top_p": 0.95,
@@ -363,6 +384,23 @@ def _normalize_model_categories(cfg: Dict[str, Any]) -> None:
         loc.setdefault("retry_delay_seconds", 5)
         loc.setdefault("use_max_completion_tokens", False)
         loc.setdefault("is_vision", False)
+    # coworker bleibt ebenfalls Single-Dict (wie local)
+    coworker_cat = cats.get("coworker")
+    if isinstance(coworker_cat, list):
+        cats["coworker"] = coworker_cat[0] if coworker_cat and isinstance(coworker_cat[0], dict) else cats.get("coworker")
+    if isinstance(cats.get("coworker"), dict):
+        cw = cats["coworker"]
+        cw.setdefault("label", "coworker")
+        cw.setdefault("api_url", "")
+        cw.setdefault("api_key", "")
+        cw.setdefault("model_name", "")
+        cw.setdefault("max_tokens", 65536)
+        cw.setdefault("timeout_seconds", 300)
+        cw.setdefault("read_timeout_seconds", 120)
+        cw.setdefault("retry_on_timeout", 2)
+        cw.setdefault("retry_delay_seconds", 5)
+        cw.setdefault("use_max_completion_tokens", False)
+        cw.setdefault("is_vision", False)
 
 
 def _load_config() -> Dict[str, Any]:
@@ -556,6 +594,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
         <label>Standard-Kategorie (wenn kein --flag im Prompt)</label>
         <select id="defaultCategory">
           <option value="local">local — lokales Modell</option>
+          <option value="coworker">coworker — Co-Worker (2. lokales Modell)</option>
           <option value="light">light — schnelles Cloud-Modell</option>
           <option value="strong">strong — leistungsstarkes Modell</option>
           <option value="vision">vision — multimodales Modell</option>
@@ -567,6 +606,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
       <h3>Modell-Kategorien</h3>
       <div class="model-tabs">
         <button data-model="local" class="active">local</button>
+        <button data-model="coworker">coworker</button>
         <button data-model="light">light</button>
         <button data-model="strong">strong</button>
         <button data-model="vision">vision</button>
@@ -621,6 +661,91 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
         </div>
         <button class="btn btn-primary" onclick="testCategory('local')" style="margin-top:8px">Test-Endpunkt</button>
         <div class="status-line" id="local_test_status"></div>
+      </div>
+
+      <div id="modelCard_coworker" class="model-card">
+        <div class="form-group">
+          <label>API URL (OpenAI-kompatibel)</label>
+          <input type="url" id="coworker_api_url" placeholder="http://192.168.x.x:8000/v1/chat/completions">
+          <div class="hint">Zweites lokales Modell auf separater Hardware. Wird als ask_coworker-Tool bei Kategorie 'local' injiziert (nur wenn Health-Check OK).</div>
+        </div>
+        <div class="form-group">
+          <label>API Key</label>
+          <input type="password" id="coworker_api_key" placeholder="sk-...">
+        </div>
+        <div class="form-group">
+          <label>Model Name</label>
+          <input type="text" id="coworker_model_name" placeholder="z.B. Qwen3-Coder">
+        </div>
+        <div class="row">
+          <div class="form-group">
+            <label>Max Tokens</label>
+            <input type="number" id="coworker_max_tokens" min="1" max="256000">
+          </div>
+          <div class="form-group">
+            <label>Timeout (Sekunden)</label>
+            <input type="number" id="coworker_timeout_seconds" min="10" max="3600">
+          </div>
+        </div>
+        <div class="row">
+          <div class="form-group">
+            <label>Read-Timeout (Sekunden)</label>
+            <input type="number" id="coworker_read_timeout_seconds" min="10" max="3600">
+          </div>
+          <div class="form-group">
+            <label>Auto-Retries bei Timeout</label>
+            <input type="number" id="coworker_retry_on_timeout" min="0" max="10">
+          </div>
+          <div class="form-group">
+            <label>Retry-Verzoegerung (s)</label>
+            <input type="number" id="coworker_retry_delay_seconds" min="1" max="120">
+          </div>
+        </div>
+        <div class="toggle-row">
+          <span>max_completion_tokens (statt max_tokens)</span>
+          <label class="toggle"><input type="checkbox" id="coworker_use_max_completion_tokens"><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+          <span>Vision (image_url Support)</span>
+          <label class="toggle"><input type="checkbox" id="coworker_is_vision"><span class="slider"></span></label>
+        </div>
+        <button class="btn btn-primary" onclick="testCategory('coworker')" style="margin-top:8px">Test-Endpunkt</button>
+        <div class="status-line" id="coworker_test_status"></div>
+
+        <h4 style="margin:16px 0 8px;color:#58a6ff;font-size:0.85rem;text-transform:uppercase;letter-spacing:0.5px">Delegation (ask_coworker)</h4>
+        <div class="toggle-row">
+          <span>Co-Worker-Delegation aktiviert</span>
+          <label class="toggle"><input type="checkbox" id="coworker_enabled" checked><span class="slider"></span></label>
+        </div>
+        <div class="row">
+          <div class="form-group">
+            <label>Max. Delegationen pro Request</label>
+            <input type="number" id="coworker_max_delegations" min="0" max="20">
+            <div class="hint">Schutz gegen Delegation-Loops (0=sofort blocken).</div>
+          </div>
+          <div class="form-group">
+            <label>Task-Cap (Zeichen)</label>
+            <input type="number" id="coworker_task_cap" min="100" max="100000">
+          </div>
+          <div class="form-group">
+            <label>Result-Cap (Zeichen)</label>
+            <input type="number" id="coworker_result_cap" min="100" max="100000">
+          </div>
+        </div>
+        <div class="row">
+          <div class="form-group">
+            <label>Health-Check-Intervall (s)</label>
+            <input type="number" id="coworker_health_interval" min="5" max="3600">
+          </div>
+          <div class="form-group">
+            <label>Probe-Timeout (s)</label>
+            <input type="number" id="coworker_probe_timeout" min="1" max="60">
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Co-Worker System-Prompt (Rolle als Subagent)</label>
+          <textarea id="coworker_system_prompt" rows="5" style="width:100%;font-family:monospace;font-size:0.8rem"></textarea>
+        </div>
       </div>
 
       <div id="modelCard_light" class="model-card">
@@ -1267,7 +1392,7 @@ async function loadConfig() {
 
     // Model categories
     const cats = cfg.model_categories || {};
-    for (const key of ['local','light','strong','vision']) {
+    for (const key of ['local','coworker','light','strong','vision']) {
       const c = cats[key];
       if (Array.isArray(c)) {
         // Array-Struktur (light/strong/vision): 3 Slots
@@ -1353,6 +1478,23 @@ async function loadConfig() {
     document.getElementById('local_preserve_thinking').checked = ls.preserve_thinking !== false;
     document.getElementById('local_anti_loop_system_prompt').value = ls.anti_loop_system_prompt || '';
 
+    // Co-Worker-Delegation Settings
+    const cw = tk.coworker || {};
+    const cwEnabledEl = document.getElementById('coworker_enabled');
+    if (cwEnabledEl) cwEnabledEl.checked = cw.enabled !== false;
+    const cwMaxEl = document.getElementById('coworker_max_delegations');
+    if (cwMaxEl) cwMaxEl.value = cw.max_delegations_per_request != null ? cw.max_delegations_per_request : 2;
+    const cwTaskEl = document.getElementById('coworker_task_cap');
+    if (cwTaskEl) cwTaskEl.value = cw.task_cap_chars != null ? cw.task_cap_chars : 8000;
+    const cwResultEl = document.getElementById('coworker_result_cap');
+    if (cwResultEl) cwResultEl.value = cw.result_cap_chars != null ? cw.result_cap_chars : 12000;
+    const cwHIntEl = document.getElementById('coworker_health_interval');
+    if (cwHIntEl) cwHIntEl.value = cw.health_interval_seconds != null ? cw.health_interval_seconds : 60;
+    const cwPTOEl = document.getElementById('coworker_probe_timeout');
+    if (cwPTOEl) cwPTOEl.value = cw.probe_timeout_seconds != null ? cw.probe_timeout_seconds : 5;
+    const cwSPEl = document.getElementById('coworker_system_prompt');
+    if (cwSPEl) cwSPEl.value = cw.system_prompt || '';
+
   } catch(e) {
     showToast('Fehler beim Laden: ' + e.message, 'error');
   }
@@ -1365,9 +1507,9 @@ async function saveConfig() {
   cfg.default_category = document.getElementById('defaultCategory').value;
 
   cfg.model_categories = {};
-  for (const key of ['local','light','strong','vision']) {
-    if (key === 'local') {
-      // local bleibt Single-Def Dict
+  for (const key of ['local','coworker','light','strong','vision']) {
+    if (key === 'local' || key === 'coworker') {
+      // local & coworker bleiben Single-Def Dict
       cfg.model_categories[key] = {
         label: document.getElementById(key + '_label_1')?.value || key,
         api_url: document.getElementById(key + '_api_url').value,
@@ -1431,6 +1573,15 @@ async function saveConfig() {
     response_loop_threshold: parseInt(document.getElementById('response_loop_threshold').value) || 0,
     generic_tool_loop_threshold: parseInt(document.getElementById('generic_tool_loop_threshold').value) || 0,
     generic_tool_loop_intervention: document.getElementById('generic_tool_loop_intervention').value || '',
+    coworker: {
+      enabled: document.getElementById('coworker_enabled')?.checked ?? true,
+      max_delegations_per_request: parseInt(document.getElementById('coworker_max_delegations')?.value) || 2,
+      task_cap_chars: parseInt(document.getElementById('coworker_task_cap')?.value) || 8000,
+      result_cap_chars: parseInt(document.getElementById('coworker_result_cap')?.value) || 12000,
+      health_interval_seconds: parseFloat(document.getElementById('coworker_health_interval')?.value) || 60,
+      probe_timeout_seconds: parseFloat(document.getElementById('coworker_probe_timeout')?.value) || 5,
+      system_prompt: document.getElementById('coworker_system_prompt')?.value || '',
+    },
     local_sampling: {
       temperature: parseFloat(document.getElementById('local_temperature').value) || 0.7,
       top_p: parseFloat(document.getElementById('local_top_p').value) || 0.95,
@@ -1746,7 +1897,7 @@ def create_webui_app() -> FastAPI:
     async def get_config():
         cfg = _load_config()
         # API keys maskieren
-        for key in ("local", "light", "strong", "vision"):
+        for key in ("local", "coworker", "light", "strong", "vision"):
             cat = cfg.get("model_categories", {}).get(key)
             if isinstance(cat, list):
                 for d in cat:
@@ -1766,7 +1917,7 @@ def create_webui_app() -> FastAPI:
         current = _load_config()
 
         # API-Keys: wenn maskiert (enthaelt bullet), alten Wert behalten
-        for key in ("local", "light", "strong", "vision"):
+        for key in ("local", "coworker", "light", "strong", "vision"):
             nc = new_cfg.get("model_categories", {}).get(key)
             cc = current.get("model_categories", {}).get(key)
             if nc is None or cc is None:
@@ -1809,7 +1960,7 @@ def create_webui_app() -> FastAPI:
         # wurde der Key nicht geaendert → echten Key aus Config nachladen
         if "\u2022" in api_key and len(api_key) > 8:
             cfg = _load_config()
-            for cat_key in ("local", "light", "strong", "vision"):
+            for cat_key in ("local", "coworker", "light", "strong", "vision"):
                 cat = cfg.get("model_categories", {}).get(cat_key)
                 if isinstance(cat, list):
                     for d in cat:

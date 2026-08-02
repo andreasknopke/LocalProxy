@@ -173,13 +173,30 @@ _MODEL_CATEGORIES: Dict[str, Any] = {
         {"label": "vision fallback 2", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "use_max_completion_tokens": False, "is_vision": True, "timeout_seconds": 180},
         {"label": "vision fallback 3", "api_url": "", "api_key": "", "model_name": "", "max_tokens": 65536, "use_max_completion_tokens": False, "is_vision": True, "timeout_seconds": 180},
     ],
+    # coworker: zweites lokales Modell auf separater Hardware (Co-Worker).
+    # Single-Def wie "local" (keine Fallback-Slots). Wird NUR bei aktiver
+    # Kategorie "local" als ask_coworker-Tool injiziert — und nur wenn der
+    # Health-Check das Modell als erreichbar meldet.
+    "coworker": {
+        "api_url": os.getenv("COWORKER_API_URL", ""),
+        "api_key": os.getenv("COWORKER_API_KEY", ""),
+        "model_name": os.getenv("COWORKER_MODEL_NAME", ""),
+        "max_tokens": int(os.getenv("COWORKER_MAX_TOKENS", "65536")),
+        "use_max_completion_tokens": os.getenv("COWORKER_USE_MAX_COMPLETION_TOKENS", "false").lower() in {"1", "true", "yes", "y", "on"},
+        "is_vision": os.getenv("COWORKER_IS_VISION", "false").lower() in {"1", "true", "yes", "y", "on"},
+        "timeout_seconds": float(os.getenv("COWORKER_TIMEOUT_SECONDS", "300")),
+        "read_timeout_seconds": float(os.getenv("COWORKER_READ_TIMEOUT_SECONDS", "120")),
+        "retry_on_timeout": int(os.getenv("COWORKER_RETRY_ON_TIMEOUT", "2")),
+        "retry_delay_seconds": float(os.getenv("COWORKER_RETRY_DELAY_SECONDS", "5")),
+        "label": "coworker primary",
+    },
 }
 
 DEFAULT_CATEGORY: str = os.getenv("DEFAULT_CATEGORY", "light")
 
 # ── Fallback-System ─────────────────────────────────────────────────────────
 # Aktueller aktiver Index pro Kategorie (light/strong/vision)
-_CATEGORY_ACTIVE_IDX: Dict[str, int] = {"local": 0, "light": 0, "strong": 0, "vision": 0}
+_CATEGORY_ACTIVE_IDX: Dict[str, int] = {"local": 0, "light": 0, "strong": 0, "vision": 0, "coworker": 0}
 
 COOLDOWN_FILE: Path = Path(os.getenv("COOLDOWN_FILE", str(Path(__file__).parent / "data" / "cooldowns.json")))
 COOLDOWN_DEFAULT_SECONDS: float = float(os.getenv("COOLDOWN_DEFAULT_SECONDS", "300"))
@@ -417,6 +434,29 @@ RESPONSE_LOOP_REDIRECT_TEXT: str = os.getenv(
 )
 
 
+# ── Co-Worker-Delegation (ask_coworker) ────────────────────────────────────
+# Zweites lokales Modell auf separater Hardware. Wird NUR bei aktiver
+# Kategorie "local" als ask_coworker-Tool in den Payload injiziert — und nur
+# wenn der Health-Check das Modell als erreichbar meldet.
+COWORKER_ENABLED: bool = os.getenv("COWORKER_ENABLED", "true").lower() in {"1", "true", "yes", "y", "on"}
+COWORKER_MAX_DELEGATIONS: int = int(os.getenv("COWORKER_MAX_DELEGATIONS", "2"))
+COWORKER_TASK_CAP: int = int(os.getenv("COWORKER_TASK_CAP", "8000"))
+COWORKER_RESULT_CAP: int = int(os.getenv("COWORKER_RESULT_CAP", "12000"))
+# Health-Check: wie oft der Co-Worker geprobt wird / wie lange ein Probe-Timeout dauern darf
+COWORKER_HEALTH_INTERVAL: float = float(os.getenv("COWORKER_HEALTH_INTERVAL", "60"))
+COWORKER_PROBE_TIMEOUT: float = float(os.getenv("COWORKER_PROBE_TIMEOUT", "5"))
+COWORKER_SYSTEM_PROMPT: str = os.getenv(
+    "COWORKER_SYSTEM_PROMPT",
+    "You are a co-worker coding model acting as a subagent for planning, code "
+    "review, brainstorming and parallel implementation tasks. You receive a "
+    "self-contained task and optional context. Answer with concrete, actionable "
+    "output: for planning give a step-by-step plan; for review list issues with "
+    "file/line references and concrete fixes; for coding give complete, idiomatic "
+    "code. You have NO access to tools, the conversation history or the workspace "
+    "— work only from what is given to you.",
+)
+
+
 # ── Laguna-S-2.1 Modell-Erkennung ─────────────────────────────────────────
 # Loop-Schutz (Read/Search/Generic/Response) und Sampling-Patches gelten
 # ausschliesslich fuer Laguna-S-2.1 Modelle — egal ob local oder cloud,
@@ -448,7 +488,7 @@ def _apply_config_file() -> None:
 
     saved_cats = cfg.get("model_categories", {})
     if isinstance(saved_cats, dict):
-        for key in ("local", "light", "strong", "vision"):
+        for key in ("local", "coworker", "light", "strong", "vision"):
             if key not in saved_cats:
                 continue
             sc = saved_cats[key]
@@ -542,7 +582,7 @@ def _apply_config_file() -> None:
     _log("Config aus config.json neu geladen")
 
     dc = cfg.get("default_category", "")
-    if dc in ("local", "light", "strong", "vision"):
+    if dc in ("local", "coworker", "light", "strong", "vision"):
         DEFAULT_CATEGORY = str(dc)
 
     global PROXY_PORT, PROXY_AUTH_ENABLED, PROXY_API_KEY
@@ -607,6 +647,22 @@ def _apply_config_file() -> None:
     if gt_intervention:
         GENERIC_TOOL_LOOP_INTERVENTION = str(gt_intervention)
 
+    global COWORKER_ENABLED, COWORKER_MAX_DELEGATIONS
+    global COWORKER_TASK_CAP, COWORKER_RESULT_CAP
+    global COWORKER_HEALTH_INTERVAL, COWORKER_PROBE_TIMEOUT
+    global COWORKER_SYSTEM_PROMPT
+    cw = tokens_cfg.get("coworker", {})
+    if isinstance(cw, dict) and cw:
+        COWORKER_ENABLED = bool(cw.get("enabled", COWORKER_ENABLED))
+        COWORKER_MAX_DELEGATIONS = int(cw.get("max_delegations_per_request", COWORKER_MAX_DELEGATIONS))
+        COWORKER_TASK_CAP = int(cw.get("task_cap_chars", COWORKER_TASK_CAP))
+        COWORKER_RESULT_CAP = int(cw.get("result_cap_chars", COWORKER_RESULT_CAP))
+        COWORKER_HEALTH_INTERVAL = float(cw.get("health_interval_seconds", COWORKER_HEALTH_INTERVAL))
+        COWORKER_PROBE_TIMEOUT = float(cw.get("probe_timeout_seconds", COWORKER_PROBE_TIMEOUT))
+        cw_prompt = cw.get("system_prompt", "")
+        if cw_prompt:
+            COWORKER_SYSTEM_PROMPT = str(cw_prompt)
+
     global LOCAL_TEMPERATURE, LOCAL_TOP_P, LOCAL_TOP_K, LOCAL_MIN_P
     global LOCAL_DRY_MULTIPLIER, LOCAL_DRY_BASE, LOCAL_DRY_ALLOWED_LENGTH
     global LOCAL_DRY_PENALTY_LAST_N, LOCAL_DRY_SEQUENCE_BREAKER
@@ -639,8 +695,8 @@ _apply_config_file()
 # Prompt-Flag-Extraktion ── Modell-Kategorie-Auswahl via --flag
 # ═══════════════════════════════════════════════════════════════════════════
 
-_MODEL_FLAG_PATTERN = re.compile(r'--(local|light|strong|vision)(?:\s+(\d+))?\s*$', re.IGNORECASE | re.MULTILINE)
-_VALID_CATEGORIES: Set[str] = {"local", "light", "strong", "vision"}
+_MODEL_FLAG_PATTERN = re.compile(r'--(local|light|strong|vision|coworker)(?:\s+(\d+))?\s*$', re.IGNORECASE | re.MULTILINE)
+_VALID_CATEGORIES: Set[str] = {"local", "light", "strong", "vision", "coworker"}
 _FLAG_PROXIMITY_MAX_CHARS = 300  # Flag muss in den letzten 300 Zeichen des Texts stehen
 
 
@@ -707,7 +763,7 @@ def _detect_reset_flag(text: str) -> bool:
 
 def _do_reset() -> None:
     """Setzt alle Kategorien auf Primary (Idx=0). Loescht Cooldowns."""
-    for key in ("light", "strong", "vision"):
+    for key in ("light", "strong", "vision", "coworker"):
         _CATEGORY_ACTIVE_IDX[key] = 0
     # Cooldowns leeren
     try:
@@ -2095,22 +2151,27 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
 
     _cut_tool_results_inplace(messages, "Passthrough", TOOL_RESULT_CAP)
 
-    _detect_read_loop_inplace(messages, "Passthrough", category=category, model_name=cat["model_name"])
-    _detect_search_loop_inplace(messages, "Passthrough", category=category, model_name=cat["model_name"])
+    # Laguna-S-2.1 Loop-Detection: derzeit deaktiviert (Laguna nicht mehr im Einsatz)
+    # _detect_read_loop_inplace(messages, "Passthrough", category=category, model_name=cat["model_name"])
+    # _detect_search_loop_inplace(messages, "Passthrough", category=category, model_name=cat["model_name"])
 
     if not cat.get("is_vision", False):
         _sanitize_image_urls_inplace(messages, "Passthrough")
 
-    # Laguna-S-2.1: Sampling + Anti-Loop (egal ob local oder cloud)
-    if _is_laguna_model(cat["model_name"]):
-        _patch_local_sampling_payload(payload)
-        _inject_local_anti_loop_system(messages)
+    # Laguna-S-2.1 Sampling + Anti-Loop: derzeit deaktiviert (Laguna nicht mehr im Einsatz)
+    # if _is_laguna_model(cat["model_name"]):
+    #     _patch_local_sampling_payload(payload)
+    #     _inject_local_anti_loop_system(messages)
 
     _patch_moonshot_payload(payload, cat.get("api_url", ""))
     _patch_max_tokens_payload(payload, cat)
     _patch_reasoning_effort_payload(payload, cat)
 
-    return _clean_payload(payload, keep_tools=True, keep_top_k=_is_laguna_model(cat["model_name"]))
+    # Co-Worker-Delegation: ask_coworker-Tool nur bei Kategorie=local + Health-OK
+    if category == "local":
+        _inject_coworker_tool(payload)
+
+    return _clean_payload(payload, keep_tools=True, keep_top_k=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2137,7 +2198,8 @@ def _inject_hindsight_context(messages: List[Dict[str, Any]]) -> None:
 # Modell-Call ── Single Model Request
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int = 0) -> Dict[str, Any]:
+async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int = 0,
+                             inject_hindsight: bool = True) -> Dict[str, Any]:
     defs = _model_defs(category)
     if not defs or def_idx >= len(defs):
         return {"category": category, "status": "error", "def_idx": def_idx,
@@ -2149,7 +2211,7 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
     payload = _build_passthrough_payload(body, category, def_idx=def_idx)
 
     messages = payload.get("messages", [])
-    if isinstance(messages, list):
+    if isinstance(messages, list) and inject_hindsight:
         _inject_hindsight_context(messages)
 
     model = cat["model_name"]
@@ -2375,6 +2437,309 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
             "duration_seconds": duration, "usage": None,
             "trigger_fallback": True,
         }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Co-Worker-Delegation ── ask_coworker Tool-Injection + interner Subagent-Call
+# ═══════════════════════════════════════════════════════════════════════════
+# Das Hauptmodell (Kategorie "local") bekommt ein synthetisches Tool
+# "ask_coworker" angeboten. Ruft es das Tool auf, arbeitet der Proxy den Call
+# intern an das Co-Worker-Modell ab (frische, minimale Session — KEINE
+# VS-Code-History, KEIN reasoning_content), fuegt das Ergebnis als tool-Message
+# ein und ruft das Hauptmodell erneut auf. Fuer VS Code bleibt alles unsichtbar.
+#
+# Aktivierung NUR bei Kategorie=local UND wenn der Health-Check den Co-Worker
+# als erreichbar meldet (Hauptrechner an).
+
+_COWORKER_TOOL_NAME = "ask_coworker"
+
+_COWORKER_TOOL_DEF: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": _COWORKER_TOOL_NAME,
+        "description": (
+            "Delegate a self-contained sub-task (planning, code review, "
+            "brainstorming, or parallel implementation) to a co-worker coding "
+            "model running on separate hardware. The co-worker has NO access to "
+            "this conversation or the workspace — put everything it needs into "
+            "task/context. Returns the co-worker's text answer."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The self-contained task or question for the co-worker.",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Optional context: code snippets, file excerpts, constraints — everything the co-worker needs.",
+                },
+            },
+            "required": ["task"],
+        },
+    },
+}
+
+# Health-Cache: wird vom periodischen Health-Check + Startup-Probe befuellt
+_COWORKER_HEALTH_CACHE: Dict[str, Any] = {
+    "reachable": False,
+    "checked_at": 0.0,
+    "last_error": "noch nicht geprueft",
+}
+
+
+def _coworker_configured() -> bool:
+    """True wenn die coworker-Kategorie eine gueltige Definition hat."""
+    return bool(_model_defs("coworker"))
+
+
+async def _probe_coworker() -> bool:
+    """Minimaler Ping ans Co-Worker-Modell. Erreichbar = HTTP < 500 (auch 4xx:
+    die Maschine lebt; ein 4xx liefert spaeter einen nutzbaren Fehlertext im
+    tool-result). Timeout/ConnectError = Maschine aus → unreachable."""
+    defs = _model_defs("coworker")
+    if not defs:
+        _COWORKER_HEALTH_CACHE.update({
+            "reachable": False,
+            "checked_at": time.time(),
+            "last_error": "nicht konfiguriert",
+        })
+        return False
+    cat = defs[0]
+    api_url = cat["api_url"].rstrip("/")
+    api_key = cat.get("api_key", "")
+    timeout = min(float(cat.get("timeout_seconds", 300)), COWORKER_PROBE_TIMEOUT)
+    probe_payload = {
+        "model": cat["model_name"],
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "stream": False,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, read=timeout)) as client:
+            resp = await client.post(api_url, json=probe_payload, headers=_api_headers(api_key))
+        reachable = resp.status_code < 500
+        _COWORKER_HEALTH_CACHE.update({
+            "reachable": reachable,
+            "checked_at": time.time(),
+            "last_error": "" if reachable else f"HTTP {resp.status_code}",
+        })
+        return reachable
+    except Exception as exc:
+        _COWORKER_HEALTH_CACHE.update({
+            "reachable": False,
+            "checked_at": time.time(),
+            "last_error": _safe_str(exc),
+        })
+        return False
+
+
+async def _coworker_health_loop() -> None:
+    """Periodischer Health-Check fuer den Co-Worker (Startup-Probe + Intervall)."""
+    try:
+        if _coworker_configured():
+            await _probe_coworker()
+            state = ("erreichbar" if _COWORKER_HEALTH_CACHE.get("reachable")
+                     else f"UNREACHABLE ({_COWORKER_HEALTH_CACHE.get('last_error', '?')})")
+            _log(f"Co-Worker Health-Check (Startup): {state}")
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        pass
+    while True:
+        try:
+            await asyncio.sleep(COWORKER_HEALTH_INTERVAL)
+            if not _coworker_configured():
+                _COWORKER_HEALTH_CACHE.update({"reachable": False, "last_error": "nicht konfiguriert"})
+                continue
+            await _probe_coworker()
+            state = ("erreichbar" if _COWORKER_HEALTH_CACHE.get("reachable")
+                     else f"UNREACHABLE ({_COWORKER_HEALTH_CACHE.get('last_error', '?')})")
+            _log(f"Co-Worker Health-Check: {state}")
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            pass
+
+
+def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
+    """Injiziert das ask_coworker-Tool in den Payload — NUR wenn aktiviert,
+    konfiguriert und laut Health-Check erreichbar. Returns True bei Injection."""
+    if not COWORKER_ENABLED:
+        return False
+    if not _coworker_configured():
+        return False
+    if not _COWORKER_HEALTH_CACHE.get("reachable", False):
+        _log("Co-Worker-Tool nicht injiziert: Health-Check nicht bestanden "
+             f"({_COWORKER_HEALTH_CACHE.get('last_error', '?')})")
+        return False
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        tools = []
+        payload["tools"] = tools
+    if any(isinstance(t, dict) and t.get("function", {}).get("name") == _COWORKER_TOOL_NAME
+           for t in tools):
+        return True  # bereits vorhanden
+    tools.append(copy.deepcopy(_COWORKER_TOOL_DEF))
+    if "tool_choice" not in payload:
+        payload["tool_choice"] = "auto"
+    _log("Co-Worker-Tool 'ask_coworker' injiziert (Health-OK)")
+    return True
+
+
+def _partition_tool_calls(tool_calls: Optional[List[Dict[str, Any]]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Teilt tool_calls in (coworker_calls, other_calls)."""
+    coworker: List[Dict[str, Any]] = []
+    others: List[Dict[str, Any]] = []
+    for tc in tool_calls or []:
+        if not isinstance(tc, dict):
+            continue
+        func = tc.get("function") or {}
+        name = str(func.get("name", "")).strip()
+        if name == _COWORKER_TOOL_NAME:
+            coworker.append(tc)
+        else:
+            others.append(tc)
+    return coworker, others
+
+
+def _build_coworker_body(task: str, context: str) -> Dict[str, Any]:
+    """Baut eine frische, minimale Session fuer den Co-Worker.
+    KEINE VS-Code-History, KEINE tool_calls, KEIN reasoning_content,
+    KEIN Hindsight. Nur System-Prompt + eine User-Message (task+context)."""
+    task = (task or "").strip()
+    context = (context or "").strip()
+    user_content = f"{task}\n\n## Context\n{context}" if context else task
+    if COWORKER_TASK_CAP > 0 and len(user_content) > COWORKER_TASK_CAP:
+        user_content = user_content[:COWORKER_TASK_CAP] + "\n…[gekappt]"
+    messages: List[Dict[str, Any]] = []
+    if COWORKER_SYSTEM_PROMPT.strip():
+        messages.append({"role": "system", "content": COWORKER_SYSTEM_PROMPT})
+    messages.append({"role": "user", "content": user_content})
+    return {
+        "model": "",
+        "messages": messages,
+        "stream": False,
+    }
+
+
+async def _run_coworker_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
+    """Fuehrt EINEN ask_coworker-Call intern aus und liefert eine tool-result
+    Message. Fehler werden NICHT geworfen, sondern als tool-content zurueck-
+    gegeben, damit das Hauptmodell weiterarbeiten kann."""
+    tool_call_id = tool_call.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+    args_raw = (tool_call.get("function") or {}).get("arguments", "{}")
+    try:
+        args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+        if not isinstance(args, dict):
+            args = {}
+    except (json.JSONDecodeError, ValueError, TypeError):
+        args = {}
+    task = str(args.get("task", "") or "")
+    context = str(args.get("context", "") or "")
+
+    started = time.perf_counter()
+    body = _build_coworker_body(task, context)
+    # inject_hindsight=False: kein Hindsight-Recall fuer Co-Worker-Calls
+    # (vermeidet Kontamination des Co-Worker-Sessions mit Haupt-History)
+    result = await _call_single_model(body, "coworker", 0, inject_hindsight=False)
+    duration = time.perf_counter() - started
+
+    if result.get("status") == "ok":
+        content = result.get("content", "") or ""
+        if COWORKER_RESULT_CAP > 0 and len(content) > COWORKER_RESULT_CAP:
+            content = content[:COWORKER_RESULT_CAP] + "\n…[gekappt]"
+        _log(f"Co-Worker OK duration={duration:.1f}s len={len(content)}")
+        return {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "name": _COWORKER_TOOL_NAME,
+            "content": content,
+        }
+
+    # Fehler: Health-Cache invalidieren (naechste Requests injizieren das Tool
+    # nicht mehr) + Fehlertext als tool-result.
+    _COWORKER_HEALTH_CACHE["reachable"] = False
+    err = result.get("content") or "unbekannter Fehler"
+    _log(f"Co-Worker FEHLER duration={duration:.1f}s: {_safe_str(err)[:200]}")
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "name": _COWORKER_TOOL_NAME,
+        "content": f"[Co-Worker nicht verfuegbar]\n{err}",
+    }
+
+
+async def _delegation_loop(body: Dict[str, Any], category: str,
+                           force_start_idx: Optional[int] = None) -> Dict[str, Any]:
+    """Hauptmodell aufrufen, ask_coworker-Calls intern abarbeiten, erneut
+    aufrufen — bis keine Delegation mehr gewuenscht wird oder das
+    max_delegations-Limit erreicht ist. Returns das finale outcome (Format
+    wie _call_model_with_fallbacks).
+
+    Wichtig: ask_coworker wird NUR intern abgearbeitet, wenn es der EINZIGE
+    Tool-Typ im Turn ist. Gemischte Turns (ask_coworker + VS-Code-Tools) werden
+    mit einem Hinweis beantwortet und neu aufgerufen — die History-
+    Rekonstruktion fuer gemischte Turns ist zu fragil.
+    """
+    rounds = 0
+    while True:
+        outcome = await _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
+        result = outcome.get("result", {})
+        tool_calls = result.get("tool_calls")
+        if not tool_calls:
+            return outcome  # fertig: keine Tool-Calls
+        coworker_calls, other_calls = _partition_tool_calls(tool_calls)
+        if not coworker_calls:
+            return outcome  # nur VS-Code-Tools → normal durchreichen
+
+        rounds += 1
+        if rounds > COWORKER_MAX_DELEGATIONS:
+            _log(f"Co-Worker-Delegation-Limit erreicht ({COWORKER_MAX_DELEGATIONS} Runden)")
+            msgs = body.get("messages", [])
+            msgs.append({"role": "user", "content":
+                "[Proxy] Co-Worker-Delegation-Limit erreicht. Beantworte die Aufgabe "
+                "jetzt direkt, ohne ask_coworker erneut aufzurufen."})
+            final_outcome = await _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
+            final_result = final_outcome.get("result", {})
+            final_tcs = final_result.get("tool_calls")
+            if final_tcs:
+                cw2, other2 = _partition_tool_calls(final_tcs)
+                if cw2 and not other2:
+                    # Modell will trotzdem weiter delegieren → hart stoppen
+                    final_result["tool_calls"] = None
+                    final_result["content"] = (
+                        (final_result.get("content") or "") + "\n\n[Proxy] "
+                        "Co-Worker-Delegation-Limit erreicht — Aufgabe ohne "
+                        "Co-Worker-Unterstuetzung beantwortet."
+                    )
+                elif cw2 and other2:
+                    # Nur coworker-Calls entfernen, VS-Code-Tools durchreichen
+                    final_result["tool_calls"] = other2
+            return final_outcome
+
+        if other_calls:
+            # Gemischter Turn: Hinweis injizieren + neu aufrufen. Die bisherigen
+            # assistant-tool_calls bleiben in der History ohne Ergebnisse — das
+            # Modell formuliert den naechsten Schritt neu (gleiches Muster wie
+            # der fruehere Loop-Retry).
+            _log(f"Gemischter Turn (ask_coworker + {len(other_calls)} andere Tools) "
+                 f"— Hinweis injizieren")
+            msgs = body.get("messages", [])
+            msgs.append({"role": "user", "content":
+                "[Proxy-Hinweis] Rufe ask_coworker nicht zusammen mit anderen Tools "
+                "auf. Fuehre entweder die anderen Tools aus ODER rufe ask_coworker "
+                "in einem separaten Turn allein auf."})
+            continue
+
+        # Reiner Co-Worker-Turn: intern abarbeiten (parallel, Hardware getrennt)
+        coworker_calls_norm = _normalize_tool_calls(coworker_calls) or coworker_calls
+        msgs = body.get("messages", [])
+        msgs.append({"role": "assistant", "content": None, "tool_calls": coworker_calls_norm})
+        results = await asyncio.gather(*[_run_coworker_call(tc) for tc in coworker_calls_norm])
+        msgs.extend(results)
+        _log(f"Co-Worker-Delegation Runde {rounds}: {len(coworker_calls_norm)} Call(s) abgearbeitet")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2796,7 +3161,7 @@ async def _run_startup_health_checks() -> None:
         except Exception:
             return f"HTTP {r.status_code}"
 
-    for key in ("local", "light", "strong", "vision"):
+    for key in ("local", "coworker", "light", "strong", "vision"):
         defs = _model_defs(key)
         for i, cat in enumerate(defs):
             api_url = str(cat.get("api_url", "")).rstrip("/")
@@ -2859,7 +3224,7 @@ async def _run_startup_health_checks() -> None:
 async def _startup_event() -> None:
     _log(f"LocalProxy v3.0 starting on port {PROXY_PORT}")
     _log(f"   Default:  {DEFAULT_CATEGORY}")
-    for key in ("local", "light", "strong", "vision"):
+    for key in ("local", "coworker", "light", "strong", "vision"):
         defs = _model_defs(key)
         if defs:
             for i, d in enumerate(defs):
@@ -2872,6 +3237,9 @@ async def _startup_event() -> None:
     # Stale active calls bereinigen (Vorfahre aus vorherigem Prozess-Lauf,
     # falls _ACTIVE_CALLS persistiert wurde oder der Prozess neu startete)
     _purge_stale_active_calls()
+
+    # Co-Worker-Health-Loop starten (Startup-Probe + periodischer Check)
+    asyncio.ensure_future(_coworker_health_loop())
 
     # Health-Checks nicht-blockierend im Hintergrund starten
     asyncio.ensure_future(_run_startup_health_checks())
@@ -2986,7 +3354,7 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
 
     # Slot-Nummer in 0-basierten Index umrechnen (--light 2 → Idx 1)
     force_start_idx: Optional[int] = None
-    if flag_slot is not None and category != "local":
+    if flag_slot is not None and category not in ("local", "coworker"):
         force_start_idx = flag_slot - 1  # Slot 1=Idx 0, Slot 2=Idx 1, Slot 3=Idx 2
         defs_validate = _model_defs(category)
         if force_start_idx >= len(defs_validate) or force_start_idx < 0:
@@ -3011,21 +3379,26 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     active_model = defs[active_idx]["model_name"] if defs and active_idx < len(defs) else "?"
 
     # ── Loop-Detection + Intervention auf REQUEST-Ebene ──
-    # Laeuft frueh, damit auch Tool-Continuations und "go on"-Requests greifen.
-    # Mutiert body["messages"] in-place (gleiche Liste wie msgs).
-    # Nur fuer Laguna-S-2.1 Modelle (local oder cloud).
-    loop_intervened = False
-    loop_reasons: List[str] = []
-    if _is_laguna_model(active_model) and isinstance(msgs, list):
-        read_hit = _detect_read_loop_inplace(msgs, "Passthrough", category=category, model_name=active_model)
-        search_hit = _detect_search_loop_inplace(msgs, "Passthrough", category=category, model_name=active_model)
-        generic_hit = _detect_generic_tool_loop_inplace(msgs, "Passthrough", category=category, model_name=active_model)
-        loop_intervened = bool(read_hit or search_hit or generic_hit)
-        if loop_intervened:
-            last_iv = msgs[-1].get("content", "") if isinstance(msgs[-1], dict) else ""
-            loop_reasons.append(str(last_iv)[:200])
-            _log(f"Loop-Intervention: history truncated + appended "
-                 f"(read={read_hit}, search={search_hit}, generic={generic_hit})")
+    # Laguna-S-2.1: derzeit auskommentiert (Laguna nicht mehr im Einsatz).
+    # loop_intervened = False
+    # loop_reasons: List[str] = []
+    # if _is_laguna_model(active_model) and isinstance(msgs, list):
+    #     read_hit = _detect_read_loop_inplace(msgs, "Passthrough", category=category, model_name=active_model)
+    #     search_hit = _detect_search_loop_inplace(msgs, "Passthrough", category=category, model_name=active_model)
+    #     generic_hit = _detect_generic_tool_loop_inplace(msgs, "Passthrough", category=category, model_name=active_model)
+    #     loop_intervened = bool(read_hit or search_hit or generic_hit)
+    #     if loop_intervened:
+    #         last_iv = msgs[-1].get("content", "") if isinstance(msgs[-1], dict) else ""
+    #         loop_reasons.append(str(last_iv)[:200])
+    #         _log(f"Loop-Intervention: history truncated + appended "
+    #              f"(read={read_hit}, search={search_hit}, generic={generic_hit})")
+
+    # Co-Worker-Health-Cache frisch halten (nicht-blockierend): Wenn der Cache
+    # aelter als das Health-Intervall ist, Probe im Hintergrund anstossen, damit
+    # der naechste Request den aktuellen Zustand sieht.
+    if category == "local" and COWORKER_ENABLED and _coworker_configured():
+        if time.time() - float(_COWORKER_HEALTH_CACHE.get("checked_at", 0.0)) > COWORKER_HEALTH_INTERVAL:
+            asyncio.ensure_future(_probe_coworker())
 
     _log(f"Kategorie: {category} (Flag={'--'+category if flag_category else 'default'}"
          f"{' Slot='+str(flag_slot) if flag_slot else ''}), "
@@ -3039,8 +3412,11 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
                      "X-Accel-Buffering": "no"},
         )
 
-    # Non-Streaming: Fallback-Chain nutzen
-    outcome = await _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
+    # Non-Streaming: Fallback-Chain nutzen (mit Co-Worker-Delegation bei local)
+    if category == "local":
+        outcome = await _delegation_loop(body, category, force_start_idx=force_start_idx)
+    else:
+        outcome = await _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
     result = outcome.get("result", {})
     content = result.get("content", "") or ""
     used_model = outcome.get("used_model", active_model)
@@ -3049,42 +3425,13 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     if outcome.get("all_failed"):
         content = f"[Proxy: ALLE Fallbacks fehlgeschlagen]\n{content}"
 
-    # Response-Level Loop-Retry (non-streaming):
-    # Wenn das Modell trotz Intervention einen Loop-Tool-Call ausgibt,
-    # statt passivem Stopp-Text: Intervention in Messages injizieren und
-    # einmal erneut aufrufen. Ergebnis ist dann produktiv.
     tool_calls = result.get("tool_calls")
-    if tool_calls and _RESPONSE_LOOP_THRESHOLD > 0 and _is_laguna_model(used_model):
-        resp_reasons, blocked_names = _detect_response_loop(body, tool_calls, category=category, model_name=used_model)
-        if resp_reasons:
-            _log(f"RESPONSE-LOOP erkannt (non-stream): {resp_reasons}")
-            reason_txt = "; ".join(resp_reasons)
-            retry_msg = RESPONSE_LOOP_REDIRECT_TEXT.format(
-                reasons=reason_txt,
-                tools=", ".join(blocked_names) if blocked_names else "read/search",
-            )
-            if isinstance(msgs, list):
-                msgs.append({"role": "user", "content": retry_msg})
-                retry_outcome = await _call_model_with_fallbacks(
-                    body, category, force_start_idx=force_start_idx)
-                retry_result = retry_outcome.get("result", {})
-                retry_tcs = retry_result.get("tool_calls")
-                retry_reasons, _ = _detect_response_loop(body, retry_tcs, category=category, model_name=used_model) if retry_tcs else ([], [])
-                if retry_tcs and not retry_reasons:
-                    _log("RESPONSE-LOOP-Retry: Modell lieferte produktive tool_calls")
-                    result = retry_result
-                    content = result.get("content", "") or ""
-                    tool_calls = retry_tcs
-                elif retry_result.get("content") and not retry_tcs:
-                    _log("RESPONSE-LOOP-Retry: Modell lieferte produktiven Content")
-                    result = retry_result
-                    content = result.get("content", "") or ""
-                    tool_calls = None
-                else:
-                    _log("RESPONSE-LOOP-Retry: weiterhin Loop oder leer — gebe Retry-Resultat zurueck")
-                    result = retry_result
-                    content = result.get("content", "") or content
-                    tool_calls = retry_tcs
+    # Response-Level Loop-Retry (non-streaming): Laguna-spezifisch, derzeit
+    # auskommentiert (Laguna nicht mehr im Einsatz).
+    # if tool_calls and _RESPONSE_LOOP_THRESHOLD > 0 and _is_laguna_model(used_model):
+    #     resp_reasons, blocked_names = _detect_response_loop(body, tool_calls, category=category, model_name=used_model)
+    #     if resp_reasons:
+    #         ... (siehe Git-History)
 
     response_payload = _build_response_payload(body, content, [result])
     asyncio.ensure_future(_hindsight.retain_async(body, content))
@@ -3118,10 +3465,17 @@ async def _stream_events(body: Dict[str, Any], category: str,
     """
     _KEEPALIVE_INTERVAL = 15  # Sekunden zwischen Keepalive-Kommentaren
 
-    # Backend-Call als Task starten, damit wir nebenbei Keepalives senden koennen
-    backend_task = asyncio.ensure_future(
-        _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
-    )
+    # Backend-Call als Task starten, damit wir nebenbei Keepalives senden koennen.
+    # Bei Kategorie=local laeuft die Co-Worker-Delegation intern mit (Keepalives
+    # schuetzen VS Code weiterhin gegen Timeouts waehrend der Delegation).
+    if category == "local":
+        backend_task = asyncio.ensure_future(
+            _delegation_loop(body, category, force_start_idx=force_start_idx)
+        )
+    else:
+        backend_task = asyncio.ensure_future(
+            _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
+        )
 
     try:
         # Waehrend der Backend laeuft: periodisch SSE-Keepalive senden
@@ -3152,62 +3506,15 @@ async def _stream_events(body: Dict[str, Any], category: str,
     if outcome.get("all_failed"):
         content = f"[Proxy: ALLE Fallbacks fehlgeschlagen]\n{content}"
 
-    # Response-Level Loop-Retry (streaming):
-    # Wenn das Modell einen Loop-Tool-Call ausgibt: Intervention in Messages
-    # injizieren und einmal erneut aufrufen statt Stopp-Text zu senden.
+    # Response-Level Loop-Retry (streaming): Laguna-spezifisch, derzeit
+    # auskommentiert (Laguna nicht mehr im Einsatz).
     if tool_calls:
         tool_calls = _normalize_tool_calls(tool_calls) or tool_calls
 
-        if _RESPONSE_LOOP_THRESHOLD > 0 and _is_laguna_model(used_model):
-            resp_reasons, blocked_names = _detect_response_loop(body, tool_calls, category=category, model_name=used_model)
-            if resp_reasons:
-                _log(f"RESPONSE-LOOP erkannt (stream): {resp_reasons}")
-                reason_txt = "; ".join(resp_reasons)
-                retry_msg = RESPONSE_LOOP_REDIRECT_TEXT.format(
-                    reasons=reason_txt,
-                    tools=", ".join(blocked_names) if blocked_names else "read/search",
-                )
-                msgs = body.get("messages", [])
-                if isinstance(msgs, list):
-                    msgs.append({"role": "user", "content": retry_msg})
-                    # Retry-Call ebenfalls mit Keepalive absichern
-                    retry_task = asyncio.ensure_future(
-                        _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
-                    )
-                    try:
-                        while not retry_task.done():
-                            await asyncio.sleep(_KEEPALIVE_INTERVAL)
-                            if not retry_task.done():
-                                yield ": keepalive\n\n"
-                        retry_outcome = retry_task.result()
-                    except (asyncio.CancelledError, GeneratorExit):
-                        retry_task.cancel()
-                        raise
-                    except Exception:
-                        if not retry_task.done():
-                            retry_task.cancel()
-                        raise
-                    retry_result = retry_outcome.get("result", {})
-                    retry_tcs = retry_result.get("tool_calls")
-                    retry_reasons, _ = _detect_response_loop(body, retry_tcs, category=category, model_name=used_model) if retry_tcs else ([], [])
-                    if retry_tcs and not retry_reasons:
-                        _log("RESPONSE-LOOP-Retry (stream): produktive tool_calls")
-                        result = retry_result
-                        content = result.get("content", "") or ""
-                        tool_calls = _normalize_tool_calls(retry_tcs) or retry_tcs
-                        used_model = retry_outcome.get("used_model", used_model)
-                    elif retry_result.get("content") and not retry_tcs:
-                        _log("RESPONSE-LOOP-Retry (stream): produktiver Content")
-                        result = retry_result
-                        content = result.get("content", "") or ""
-                        tool_calls = None
-                        used_model = retry_outcome.get("used_model", used_model)
-                    else:
-                        _log("RESPONSE-LOOP-Retry (stream): weiterhin Loop/leer — gebe Retry-Resultat zurueck")
-                        result = retry_result
-                        content = result.get("content", "") or content
-                        tool_calls = _normalize_tool_calls(retry_tcs) if retry_tcs else None
-                        used_model = retry_outcome.get("used_model", used_model)
+        # if _RESPONSE_LOOP_THRESHOLD > 0 and _is_laguna_model(used_model):
+        #     resp_reasons, blocked_names = _detect_response_loop(body, tool_calls, category=category, model_name=used_model)
+        #     if resp_reasons:
+        #         ... (siehe Git-History — Laguna-Retry deaktiviert)
 
     if tool_calls:
         stream_id = f"chatcmpl-spark-{uuid.uuid4().hex}"
@@ -3247,7 +3554,7 @@ async def list_models(request: Request):
         return JSONResponse(content=await _get_logs_handler(lines=int(logs_str)))
     await _auth_or_raise(request)
     models = []
-    for key in ("local", "light", "strong", "vision"):
+    for key in ("local", "coworker", "light", "strong", "vision"):
         defs = _model_defs(key)
         for i, d in enumerate(defs):
             models.append({
@@ -3275,6 +3582,7 @@ async def healthz(request: Request):
             } for i, d in enumerate(defs)]
             for key, defs in {
                 "local": _model_defs("local"),
+                "coworker": _model_defs("coworker"),
                 "light": _model_defs("light"),
                 "strong": _model_defs("strong"),
                 "vision": _model_defs("vision"),

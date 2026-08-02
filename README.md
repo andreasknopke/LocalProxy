@@ -23,11 +23,12 @@ VS Code Copilot  --POST /v1/chat/completions-->  FastAPI Gateway
   v                                                 v
 ```
 
-## 4 Modell-Kategorien
+## 5 Modell-Kategorien
 
 | Flag | Kategorie | Typischer Use-Case |
 |------|-----------|-------------------|
 | `--local` | Lokales Modell (vLLM/Qwen) | Offline, low-latency |
+| `--coworker` | Co-Worker (2. lokales Modell, separate Hardware) | Delegations-Ziel via `ask_coworker`-Tool |
 | `--light` | Schnelles Cloud-Modell (GPT-4.1-mini) | **Default**, schnelle Tasks |
 | `--strong` | Leistungsstarkes Modell (Claude Sonnet) | Komplexe Architektur, grose Rewrites |
 | `--vision` | Multimodales Modell (GPT-4o) | Bilder, Screenshots, Diagrams |
@@ -41,6 +42,30 @@ Jede Kategorie ist vollstandig konfigurierbar:
 - `max_tokens` — max. Antwort-Tokens
 - `is_vision` — wenn `true`, werden image_url-Parts nicht gestrippt
 - `timeout_seconds` — Timeout pro Request
+
+## Co-Worker-Delegation (ask_coworker)
+
+Bei aktiver Kategorie `--local` injiziert der Proxy ein synthetisches Tool
+`ask_coworker(task, context)` in den Payload — **nur wenn** der Health-Check
+das Co-Worker-Modell als erreichbar meldet (Hauptrechner an). Ruft das
+Hauptmodell das Tool auf, arbeitet der Proxy den Call intern an das
+Co-Worker-Modell ab (frische, minimale Session — keine VS-Code-History, kein
+Thinking-Leak, keine VS-Code-Tools) und ruft das Hauptmodell mit dem Ergebnis
+erneut auf. Fuer VS Code bleibt der gesamte Umweg unsichtbar; während der
+Delegation laufen die SSE-Keepalives weiter (kein Timeout).
+
+- Konfiguration: Kategorie `coworker` (single-dict, wie `local`) in der WebUI
+- Einstellungen unter `tokens.coworker`: `enabled`, `max_delegations_per_request`,
+  `task_cap_chars`, `result_cap_chars`, `health_interval_seconds`,
+  `probe_timeout_seconds`, `system_prompt`
+- Health-Check: periodischer Ping (Intervall konfigurierbar); bei Ausfall wird
+das Tool nicht mehr injiziert, ein laufender Call liefert einen Fehlertext als
+tool-result (Hauptmodell antwortet trotzdem)
+- Gemischte Turns (ask_coworker + VS-Code-Tool gleichzeitig) werden mit einem
+Hinweis an das Modell zurueckgegeben (keine fragile History-Rekonstruktion)
+- Env-Vars: `COWORKER_API_URL/KEY/MODEL_NAME/...`, `COWORKER_ENABLED`,
+  `COWORKER_MAX_DELEGATIONS`, `COWORKER_TASK_CAP`, `COWORKER_RESULT_CAP`,
+  `COWORKER_HEALTH_INTERVAL`, `COWORKER_PROBE_TIMEOUT`, `COWORKER_SYSTEM_PROMPT`
 
 ## Quickstart
 
