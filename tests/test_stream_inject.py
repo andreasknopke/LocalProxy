@@ -305,15 +305,66 @@ def test_coworker_phase_streams_reasoning_live(monkeypatch):
     sse = _collect_sse(proxy._stream_coworker_phase(calls, coworker_state))
     joined = "\n".join(sse)
 
+    # Reasoning streamt live als eigener Context
     assert "Co-Worker denkt" in joined
     assert "weiter" in joined
     assert '"reasoning_content"' in joined
+    # Antwort streamt LIVE token-fuer-token (Header + Content als Content-Chunks)
+    assert "[Proxy] Co-Worker-Antwort:" in joined
+    assert "Ergebnis: mach X" in joined
+    assert "<think>" not in joined
 
     results = coworker_state["coworker_results"]
     assert len(results) == 1
     assert results[0]["role"] == "tool"
     assert results[0]["content"] == "Ergebnis: mach X"
     assert results[0]["reasoning_content"] == "Co-Worker denkt weiter"
+
+
+def test_coworker_phase_streams_think_tags_live(monkeypatch):
+    """Co-Worker mit <think>-Tags im content (vLLM Qwen3): Reasoning wird als
+    reasoning_content gemappt und gestreamt, Antwort-Content streamt live."""
+    async def fake_single(body, category, def_idx, inject_hindsight=True):
+        yield {"type": "chunk", "choice": {"delta": {"content": "<think>ueberleg</think>Ergebnis"}, "finish_reason": None}}
+        yield {"type": "done"}
+
+    monkeypatch.setattr(proxy, "_stream_single_model_events", fake_single)
+    calls = [{"id": "call_1", "function": {"name": "ask_coworker",
+             "arguments": '{"task": "T"}'}}]
+    coworker_state: Dict[str, Any] = {"stream_id": "test-stream", "model": "local-model"}
+    sse = _collect_sse(proxy._stream_coworker_phase(calls, coworker_state))
+    joined = "\n".join(sse)
+
+    assert "ueberleg" in joined
+    assert '"reasoning_content"' in joined
+    assert "<think>" not in joined
+    assert "Ergebnis" in joined
+    assert "[Proxy] Co-Worker-Antwort:" in joined
+
+    results = coworker_state["coworker_results"]
+    assert results[0]["content"] == "Ergebnis"
+    assert results[0]["reasoning_content"] == "ueberleg"
+
+
+def test_coworker_phase_streams_error(monkeypatch):
+    """Fehler beim Co-Worker werden ebenfalls live sichtbar gestreamt."""
+    async def fake_single(body, category, def_idx, inject_hindsight=True):
+        yield {"type": "error", "status_code": 500, "content": "Model kaputt",
+               "trigger_fallback": True}
+
+    monkeypatch.setattr(proxy, "_stream_single_model_events", fake_single)
+    calls = [{"id": "call_1", "function": {"name": "ask_coworker",
+             "arguments": '{"task": "T"}'}}]
+    coworker_state: Dict[str, Any] = {"stream_id": "test-stream", "model": "local-model"}
+    sse = _collect_sse(proxy._stream_coworker_phase(calls, coworker_state))
+    joined = "\n".join(sse)
+
+    assert "[Proxy] Co-Worker-Antwort:" in joined
+    assert "Model kaputt" in joined
+    results = coworker_state["coworker_results"]
+    assert len(results) == 1
+    assert results[0]["role"] == "tool"
+    assert "Model kaputt" in results[0]["content"]
 
 
 def test_local_events_strips_coworker_reasoning_from_history(monkeypatch):
@@ -416,6 +467,11 @@ def test_local_events_coworker_stream_inject(monkeypatch):
             {"role": "tool", "tool_call_id": "call_1", "name": "ask_coworker",
              "content": "Co-Worker sagt: mach X"}
         ]
+        # Realer Pfad: Header + Antwort-Content streamen LIVE waehrend der Phase
+        yield proxy._format_openai_stream_chunk("local-model", content="\n\n[Proxy] Co-Worker-Antwort:\n",
+                                                include_role=False, chunk_id="test")
+        yield proxy._format_openai_stream_chunk("local-model", content="Co-Worker sagt: mach X",
+                                                include_role=False, chunk_id="test")
         yield ": keepalive\n\n"
 
     async def noop_retain(body, content):

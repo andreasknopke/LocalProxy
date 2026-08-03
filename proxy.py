@@ -4199,9 +4199,11 @@ async def _stream_coworker_call(tool_call: Dict[str, Any], queue: asyncio.Queue,
     (delta.reasoning_content) — der User sieht, worueber der Co-Worker
     nachdenkt, waehrend er arbeitet.
 
-    Die Antwort-Content wird gesammelt und zurueckgegeben; _stream_local_events
-    injiziert sie als [Proxy] Co-Worker-Antwort. Returns die tool-result
-    Message (inkl. 'reasoning_content' fuer Reporting/Logs)."""
+    Die Antwort-Content streamt LIVE token-fuer-token an VS Code durch
+    (einmal "[Proxy] Co-Worker-Antwort:"-Header, dann die Text-Chunks) —
+    so gibt es waehrend der Co-Worker-Arbeit keine toten Phasen und kein
+    Timeout-Gefuehl. Returns die tool-result Message (inkl.
+    'reasoning_content' fuer Reporting/Logs)."""
     tool_call_id = tool_call.get("id") or f"call_{uuid.uuid4().hex[:12]}"
     args_raw = (tool_call.get("function") or {}).get("arguments", "{}")
     try:
@@ -4221,11 +4223,25 @@ async def _stream_coworker_call(tool_call: Dict[str, Any], queue: asyncio.Queue,
     has_explicit_reasoning = False
     status = "failed"
     err_text = "unbekannter Fehler"
+    answer_header_sent = False
 
     async def push_reasoning(rc: str) -> None:
         reasoning_parts.append(rc)
         await queue.put(_format_openai_stream_chunk(
             model, reasoning_content=rc, include_role=False, chunk_id=stream_id))
+
+    async def push_content(c: str) -> None:
+        """Streamt die Antwort-Content LIVE an VS Code (token-fuer-token).
+        Einmal pro Call wird der '[Proxy] Co-Worker-Antwort:'-Header davor
+        gesetzt — so sieht der User den Co-Worker-Text waehrend er entsteht."""
+        nonlocal answer_header_sent
+        if not answer_header_sent:
+            await queue.put(_format_openai_stream_chunk(
+                model, content="\n\n[Proxy] Co-Worker-Antwort:\n",
+                include_role=False, chunk_id=stream_id))
+            answer_header_sent = True
+        await queue.put(_format_openai_stream_chunk(
+            model, content=c, include_role=False, chunk_id=stream_id))
 
     try:
         async for ev in _stream_single_model_events(body, "coworker", 0, inject_hindsight=False):
@@ -4241,12 +4257,14 @@ async def _stream_coworker_call(tool_call: Dict[str, Any], queue: asyncio.Queue,
                 if isinstance(c, str) and c:
                     if has_explicit_reasoning:
                         content_parts.append(c)
+                        await push_content(c)
                     else:
                         reasoning_part, content_part = _split_think_chunk(c, think_state)
                         if reasoning_part:
                             await push_reasoning(reasoning_part)
                         if content_part:
                             content_parts.append(content_part)
+                            await push_content(content_part)
             elif ev_type == "done":
                 status = "ok"
             elif ev_type == "error":
@@ -4259,6 +4277,7 @@ async def _stream_coworker_call(tool_call: Dict[str, Any], queue: asyncio.Queue,
                 await push_reasoning(pending)
             else:
                 content_parts.append(pending)
+                await push_content(pending)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -4283,13 +4302,24 @@ async def _stream_coworker_call(tool_call: Dict[str, Any], queue: asyncio.Queue,
             "reasoning_content": reasoning or None,
         }
 
+    # Fehlertext ebenfalls sichtbar streamen (sonst wuerde der User nichts sehen)
     _COWORKER_HEALTH_CACHE["reachable"] = False
     _log(f"Co-Worker-Stream FEHLER duration={duration:.1f}s: {err_text[:200]}")
+    err_display = f"[Co-Worker nicht verfuegbar]\n{err_text}"
+    try:
+        if not answer_header_sent:
+            await queue.put(_format_openai_stream_chunk(
+                model, content="\n\n[Proxy] Co-Worker-Antwort:\n",
+                include_role=False, chunk_id=stream_id))
+        await queue.put(_format_openai_stream_chunk(
+            model, content=err_display, include_role=False, chunk_id=stream_id))
+    except Exception:
+        pass
     return {
         "role": "tool",
         "tool_call_id": tool_call_id,
         "name": _COWORKER_TOOL_NAME,
-        "content": f"[Co-Worker nicht verfuegbar]\n{err_text}",
+        "content": err_display,
         "reasoning_content": reasoning or None,
     }
 
@@ -4299,9 +4329,8 @@ async def _stream_coworker_phase(coworker_calls_norm: List[Dict[str, Any]],
     """Fuehrt die Co-Worker-Calls (parallel, separate Hardware) intern aus.
 
     Das reasoning_content der Co-Worker wird LIVE als eigener Reasoning-Context
-    (delta.reasoning_content) an VS Code gestreamt. Die Antwort-Content wird
-    gesammelt und in _stream_local_events als [Proxy] Co-Worker-Antwort-Inject
-    gezeigt.
+    (delta.reasoning_content) an VS Code gestreamt; die Antwort-Content streamt
+    LIVE token-fuer-token mit "[Proxy] Co-Worker-Antwort:"-Header.
 
     Yields Keepalive-SSE-Kommentare, damit VS Code waehrend der (langen)
     Co-Worker-Arbeit nicht timeoutet. Die tool-result Messages landen in
@@ -4321,12 +4350,19 @@ async def _stream_coworker_phase(coworker_calls_norm: List[Dict[str, Any]],
             raise
         except Exception as exc:
             _log(f"Co-Worker-Stream EXCEPTION call#{idx}: {_safe_str(exc)}")
+            err_text = f"[Co-Worker nicht verfuegbar]\n{_safe_str(exc)}"
             results[idx] = {
                 "role": "tool",
                 "tool_call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
                 "name": _COWORKER_TOOL_NAME,
-                "content": f"[Co-Worker nicht verfuegbar]\n{_safe_str(exc)}",
+                "content": err_text,
             }
+            try:
+                await queue.put(_format_openai_stream_chunk(
+                    model, content=f"\n\n[Proxy] Co-Worker-Antwort:\n{err_text}",
+                    include_role=False, chunk_id=stream_id))
+            except Exception:
+                pass
         done_count += 1
 
     tasks = [asyncio.ensure_future(run_one(i, tc)) for i, tc in enumerate(coworker_calls_norm)]
@@ -4367,7 +4403,8 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
           2. das reasoning_content des Co-Workers streamt LIVE als eigener
              Reasoning-Context an VS Code durch (Issue: Reasoning des
              Co-Workers sichtbar machen)
-          3. "[Proxy] Co-Worker-Antwort:\n<content>"
+          3. die Co-Worker-Antwort streamt LIVE token-fuer-token (mit
+             "[Proxy] Co-Worker-Antwort:"-Header)
           4. danach streamt das Hauptmodell live weiter — der User sieht,
              was es mit der Antwort macht.
       * VS-Code-Tools (read_file etc.) werden unveraendert an Copilot
@@ -4490,15 +4527,9 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
             r.pop("reasoning_content", None)
         msgs.extend(results)
 
-        # 3) Stream-Inject: Co-Worker-Antwort
-        for r in results:
-            answer = (r.get("content") or "").strip()
-            if answer:
-                yield _format_openai_stream_chunk(
-                    model,
-                    content=f"\n\n[Proxy] Co-Worker-Antwort:\n{answer}",
-                    include_role=not state.get("role_sent"), chunk_id=stream_id)
-                state["role_sent"] = True
+        # 3) Die Co-Worker-Antwort wurde bereits waehrend der Phase LIVE
+        #    token-fuer-token gestreamt (siehe _stream_coworker_call/push_content)
+        #    — kein One-Shot-Inject mehr noetig.
 
         # 4) Naechste Runde: Hauptmodell verarbeitet die Antwort (live gestreamt)
         continue

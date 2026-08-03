@@ -70,7 +70,9 @@ streamt der Proxy bei `--local` das Backend live mit `stream=True`:
   1. `[Proxy] Delegation an Co-Worker: <task>…` — sobald übergeben wird
   2. das **Reasoning des Co-Workers streamt live als eigener Reasoning-Context**
      an VS Code durch — man sieht, worüber der Co-Worker nachdenkt
-  3. `[Proxy] Co-Worker-Antwort:\n<content>` — die Rückantwort des Co-Workers
+  3. die **Co-Worker-Antwort streamt live token-für-token** an VS Code durch
+     (mit `[Proxy] Co-Worker-Antwort:`-Header) — kein Text-Burst am Ende,
+     keine toten Phasen während der Co-Worker-Arbeit, kein Timeout-Gefühl
   4. danach streamt das Hauptmodell live weiter — man sieht, was es mit der
      Antwort macht
 - Keepalives halten die Verbindung auch bei langen Denkpausen und während der
