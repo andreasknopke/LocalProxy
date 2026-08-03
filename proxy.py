@@ -1083,6 +1083,174 @@ def _extract_choice_content(result: Dict[str, Any]) -> str:
     return content or ""
 
 
+def _normalize_reasoning_value(val: Any) -> Optional[str]:
+    """Normalisiert einen Reasoning-Wert aus verschiedenen Backend-Strukturen:
+      - str: direkt
+      - list: Content-Parts (z.B. {"type":"text","text":"..."}) -> konkateniert
+      - dict: {"text": ...} / {"content": ...} / {"reasoning_content": ...}
+    Returns str oder None."""
+    if val is None:
+        return None
+    if isinstance(val, str):
+        return val if val.strip() else None
+    if isinstance(val, list):
+        parts: List[str] = []
+        for p in val:
+            if isinstance(p, dict):
+                for k in ("text", "content", "reasoning", "thinking", "reasoning_content"):
+                    v = p.get(k)
+                    if v is not None:
+                        parts.append(str(v))
+                        break
+            elif p is not None:
+                parts.append(str(p))
+        joined = "".join(parts).strip()
+        return joined or None
+    if isinstance(val, dict):
+        for k in ("text", "content", "reasoning_content", "reasoning", "thinking"):
+            v = val.get(k)
+            if v is not None and str(v).strip():
+                return str(v)
+        return None
+    s = str(val)
+    return s if s.strip() else None
+
+
+def _extract_reasoning_from_delta(delta: Dict[str, Any]) -> Optional[str]:
+    """Extrahiert Reasoning aus einem Stream-Delta bzw. einer Message.
+
+    Mappt die verschiedenen Backend-Strukturen auf einheitliches
+    reasoning_content:
+      - reasoning_content (DeepSeek / vLLM Qwen3-Parser)
+      - reasoning (Ollama / LM Studio, auch als Liste/Objekt)
+      - thinking (manche Server)
+    """
+    if not isinstance(delta, dict):
+        return None
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        val = delta.get(key)
+        if val is not None:
+            norm = _normalize_reasoning_value(val)
+            if norm:
+                return norm
+    return None
+
+
+def _find_trailing_tag_prefix(s: str, tag: str) -> Optional[str]:
+    """Findet das laengste Suffix von s, das ein ECHTES Praefix (kuerzer als
+    tag) von tag ist. Returns None wenn keins existiert (dann ist kein
+    angebrochenes Tag am Ende)."""
+    if not s:
+        return None
+    max_len = min(len(s), len(tag) - 1)
+    for cut in range(max_len, 0, -1):
+        suffix = s[-cut:]
+        if tag[:len(suffix)].lower() == suffix.lower():
+            return suffix
+    return None
+
+
+def _split_think_chunk(chunk: str, state: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """Streaming-Variante: verarbeitet einen Content-Chunk und liefert
+    (reasoning_part, content_part) fuer <think>...</think>-Bloecke.
+
+    <think>-Bloecke koennen ueber Chunk-Grenzen verteilt sein; `state` haelt
+    (in_think, pending) — pending ist ein am Chunk-Ende angebrochenes Tag,
+    das auf den naechsten Chunk wartet."""
+    in_think = bool(state.get("in_think", False))
+    s = str(state.get("pending", "") or "") + chunk
+    state["pending"] = ""
+    reasoning_out: List[str] = []
+    content_out: List[str] = []
+    while s:
+        if not in_think:
+            m = re.search(r"<think\s*>", s, re.IGNORECASE)
+            if m:
+                content_out.append(s[:m.start()])
+                in_think = True
+                s = s[m.end():]
+                continue
+            prefix = _find_trailing_tag_prefix(s, "<think>")
+            if prefix is not None:
+                content_out.append(s[:-len(prefix)])
+                s = prefix
+                break
+            content_out.append(s)
+            s = ""
+        else:
+            m = re.search(r"</think\s*>", s, re.IGNORECASE)
+            if m:
+                reasoning_out.append(s[:m.start()])
+                in_think = False
+                s = s[m.end():]
+                continue
+            prefix = _find_trailing_tag_prefix(s, "</think>")
+            if prefix is not None:
+                reasoning_out.append(s[:-len(prefix)])
+                s = prefix
+                break
+            reasoning_out.append(s)
+            s = ""
+    state["in_think"] = in_think
+    state["pending"] = s
+    reasoning = "".join(reasoning_out) or None
+    content = "".join(content_out) or None
+    return reasoning, content
+
+
+def _split_think_content(content: str) -> Tuple[str, Optional[str]]:
+    """Trennt <think>...</think>-Bloecke aus einem KOMPLETTEN Content-String.
+    Returns (clean_content, reasoning) — reasoning=None wenn kein Block."""
+    if not content:
+        return content, None
+    reasoning_parts: List[str] = []
+    clean_parts: List[str] = []
+    pos = 0
+    in_think = False
+    while pos < len(content):
+        if not in_think:
+            m = re.search(r"<think\s*>", content[pos:], re.IGNORECASE)
+            if not m:
+                clean_parts.append(content[pos:])
+                break
+            clean_parts.append(content[pos:pos + m.start()])
+            in_think = True
+            pos += m.end()
+        else:
+            m = re.search(r"</think\s*>", content[pos:], re.IGNORECASE)
+            if not m:
+                reasoning_parts.append(content[pos:])
+                break
+            reasoning_parts.append(content[pos:pos + m.start()])
+            in_think = False
+            pos += m.end()
+    if not reasoning_parts:
+        return content, None
+    reasoning = "".join(reasoning_parts).strip()
+    clean = "".join(clean_parts)
+    return clean, reasoning or None
+
+
+def _extract_message_parts(result: Dict[str, Any]) -> Tuple[str, Optional[str], Optional[List[Dict[str, Any]]]]:
+    """Extrahiert (content, reasoning_content, tool_calls) aus einer Chat-Response.
+
+    Mappt verschiedene Reasoning-Strukturen in einheitliches reasoning_content:
+      - message.reasoning_content / .reasoning / .thinking
+      - <think>...</think> im content (vLLM Qwen3 preserve_thinking) -> wird
+        aus dem content herausgetrennt und als reasoning_content gemappt.
+    """
+    message = _extract_choice_message(result)
+    tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+    reasoning_content = _extract_reasoning_from_delta(message) if isinstance(message, dict) else None
+    content = _extract_choice_content(result)
+    if not reasoning_content and content:
+        clean, think_r = _split_think_content(content)
+        if think_r:
+            reasoning_content = think_r
+            content = clean
+    return content, reasoning_content, tool_calls
+
+
 def _is_tool_continuation(messages: Sequence[Dict[str, Any]]) -> bool:
     if not messages:
         return False
@@ -2304,9 +2472,7 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
         if response.status_code == 200:
             result = response.json()
             message = _extract_choice_message(result)
-            tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
-            reasoning_content = message.get("reasoning_content") if isinstance(message, dict) else None
-            content = _extract_choice_content(result)
+            content, reasoning_content, tool_calls = _extract_message_parts(result)
             if tool_calls:
                 _log(f"Model returned structured tool_calls: {len(tool_calls)}")
             if reasoning_content:
@@ -2359,9 +2525,7 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
                         if response2.status_code == 200:
                             result = response2.json()
                             message = _extract_choice_message(result)
-                            tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
-                            reasoning_content = message.get("reasoning_content") if isinstance(message, dict) else None
-                            content = _extract_choice_content(result)
+                            content, reasoning_content, tool_calls = _extract_message_parts(result)
                             _log(f"   → Retry mit max_completion_tokens ERFOLGREICH! Model={model_name}")
                             return {
                                 "category": category, "def_idx": def_idx, "status": "ok",
@@ -2393,9 +2557,7 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
                     if response2.status_code == 200:
                         result = response2.json()
                         message = _extract_choice_message(result)
-                        tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
-                        reasoning_content = message.get("reasoning_content") if isinstance(message, dict) else None
-                        content = _extract_choice_content(result)
+                        content, reasoning_content, tool_calls = _extract_message_parts(result)
                         _log(f"   → Retry ohne reasoning_effort ERFOLGREICH!")
                         return {
                             "category": category, "def_idx": def_idx, "status": "ok",
@@ -2656,6 +2818,7 @@ async def _run_coworker_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
             "tool_call_id": tool_call_id,
             "name": _COWORKER_TOOL_NAME,
             "content": content,
+            "reasoning_content": result.get("reasoning_content"),
         }
 
     # Fehler: Health-Cache invalidieren (naechste Requests injizieren das Tool
@@ -2668,6 +2831,7 @@ async def _run_coworker_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
         "tool_call_id": tool_call_id,
         "name": _COWORKER_TOOL_NAME,
         "content": f"[Co-Worker nicht verfuegbar]\n{err}",
+        "reasoning_content": None,
     }
 
 
@@ -2738,6 +2902,9 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
         msgs = body.get("messages", [])
         msgs.append({"role": "assistant", "content": None, "tool_calls": coworker_calls_norm})
         results = await asyncio.gather(*[_run_coworker_call(tc) for tc in coworker_calls_norm])
+        # reasoning_content nicht an das Hauptmodell schicken (nur Reporting)
+        for r in results:
+            r.pop("reasoning_content", None)
         msgs.extend(results)
         _log(f"Co-Worker-Delegation Runde {rounds}: {len(coworker_calls_norm)} Call(s) abgearbeitet")
 
@@ -2917,6 +3084,9 @@ def _build_response_payload(
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
 
+    message: Dict[str, Any] = {"role": "assistant", "content": combined_text}
+    if reasoning_content:
+        message["reasoning_content"] = reasoning_content
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
@@ -2924,7 +3094,7 @@ def _build_response_payload(
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": combined_text},
+            "message": message,
             "finish_reason": "stop",
         }],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
@@ -3883,7 +4053,9 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
         "finish_reason": None, "all_failed": False,
         "mid_stream_error": None, "error_content": None,
         "def_idx": 0, "model": category,
+        "has_explicit_reasoning": False,
     })
+    think_state: Dict[str, Any] = {"in_think": False, "pending": ""}
 
     defs = _model_defs(category)
     if not defs:
@@ -3960,11 +4132,9 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
             if choice.get("finish_reason"):
                 state["finish_reason"] = choice["finish_reason"]
 
-            rc = delta.get("reasoning_content")
-            if rc is None:
-                rc = delta.get("reasoning")
+            rc = _extract_reasoning_from_delta(delta)
             if rc:
-                rc = str(rc)
+                state["has_explicit_reasoning"] = True
                 state["reasoning"] = (state.get("reasoning") or "") + rc
                 yield _format_openai_stream_chunk(
                     state.get("model", category), reasoning_content=rc,
@@ -3974,16 +4144,45 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
 
             c = delta.get("content")
             if isinstance(c, str) and c:
-                state["content"] = (state.get("content") or "") + c
-                yield _format_openai_stream_chunk(
-                    state.get("model", category), content=c,
-                    include_role=not state.get("role_sent"),
-                    chunk_id=state.get("stream_id"))
-                state["role_sent"] = True
+                if state.get("has_explicit_reasoning"):
+                    # Backend liefert Reasoning in eigenem Feld → content unveraendert
+                    state["content"] = (state.get("content") or "") + c
+                    yield _format_openai_stream_chunk(
+                        state.get("model", category), content=c,
+                        include_role=not state.get("role_sent"),
+                        chunk_id=state.get("stream_id"))
+                    state["role_sent"] = True
+                else:
+                    # <think>...</think> im content (vLLM Qwen3 preserve_thinking)
+                    # → als eigenen Reasoning-Context mappen, Rest als content
+                    reasoning_part, content_part = _split_think_chunk(c, think_state)
+                    if reasoning_part:
+                        state["reasoning"] = (state.get("reasoning") or "") + reasoning_part
+                        yield _format_openai_stream_chunk(
+                            state.get("model", category), reasoning_content=reasoning_part,
+                            include_role=not state.get("role_sent"),
+                            chunk_id=state.get("stream_id"))
+                        state["role_sent"] = True
+                    if content_part:
+                        state["content"] = (state.get("content") or "") + content_part
+                        yield _format_openai_stream_chunk(
+                            state.get("model", category), content=content_part,
+                            include_role=not state.get("role_sent"),
+                            chunk_id=state.get("stream_id"))
+                        state["role_sent"] = True
 
             tcs = delta.get("tool_calls")
             if tcs:
                 _accumulate_stream_tool_calls(state, tcs)
+
+        # Angebrochene <think>-Tags am Turn-Ende flushen (Modell stoppt selten
+        # mitten in einem Tag, aber falls doch: in reasoning/content nachladen)
+        if think_state.get("pending"):
+            pending = think_state.pop("pending", "")
+            if think_state.get("in_think"):
+                state["reasoning"] = (state.get("reasoning") or "") + pending
+            else:
+                state["content"] = (state.get("content") or "") + pending
     finally:
         if not task.done():
             task.cancel()
@@ -3991,36 +4190,168 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
             await task
         except (asyncio.CancelledError, Exception):
             pass
+
+
+async def _stream_coworker_call(tool_call: Dict[str, Any], queue: asyncio.Queue,
+                                model: str, stream_id: str) -> Dict[str, Any]:
+    """Fuehrt EINEN ask_coworker-Call intern aus und streamt dabei dessen
+    reasoning_content LIVE als eigenen Reasoning-Context an VS Code durch
+    (delta.reasoning_content) — der User sieht, worueber der Co-Worker
+    nachdenkt, waehrend er arbeitet.
+
+    Die Antwort-Content wird gesammelt und zurueckgegeben; _stream_local_events
+    injiziert sie als [Proxy] Co-Worker-Antwort. Returns die tool-result
+    Message (inkl. 'reasoning_content' fuer Reporting/Logs)."""
+    tool_call_id = tool_call.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+    args_raw = (tool_call.get("function") or {}).get("arguments", "{}")
+    try:
+        args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+        if not isinstance(args, dict):
+            args = {}
+    except (json.JSONDecodeError, ValueError, TypeError):
+        args = {}
+    task = str(args.get("task", "") or "")
+    context = str(args.get("context", "") or "")
+
+    started = time.perf_counter()
+    body = _build_coworker_body(task, context)
+    content_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    think_state: Dict[str, Any] = {"in_think": False, "pending": ""}
+    has_explicit_reasoning = False
+    status = "failed"
+    err_text = "unbekannter Fehler"
+
+    async def push_reasoning(rc: str) -> None:
+        reasoning_parts.append(rc)
+        await queue.put(_format_openai_stream_chunk(
+            model, reasoning_content=rc, include_role=False, chunk_id=stream_id))
+
+    try:
+        async for ev in _stream_single_model_events(body, "coworker", 0, inject_hindsight=False):
+            ev_type = ev.get("type") if isinstance(ev, dict) else None
+            if ev_type == "chunk":
+                choice = ev.get("choice") or {}
+                delta = choice.get("delta") or {}
+                rc = _extract_reasoning_from_delta(delta)
+                if rc:
+                    has_explicit_reasoning = True
+                    await push_reasoning(rc)
+                c = delta.get("content")
+                if isinstance(c, str) and c:
+                    if has_explicit_reasoning:
+                        content_parts.append(c)
+                    else:
+                        reasoning_part, content_part = _split_think_chunk(c, think_state)
+                        if reasoning_part:
+                            await push_reasoning(reasoning_part)
+                        if content_part:
+                            content_parts.append(content_part)
+            elif ev_type == "done":
+                status = "ok"
+            elif ev_type == "error":
+                err_text = ev.get("content") or err_text
+                status = "failed"
+        # Angebrochene <think>-Tags am Ende flushen
+        if think_state.get("pending"):
+            pending = think_state.pop("pending", "")
+            if think_state.get("in_think"):
+                await push_reasoning(pending)
+            else:
+                content_parts.append(pending)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        err_text = _safe_str(exc)
+        status = "failed"
+        _log(f"Co-Worker-Stream FEHLER: {err_text[:200]}")
+
+    duration = time.perf_counter() - started
+    content = "".join(content_parts).strip()
+    reasoning = "".join(reasoning_parts).strip()
+
+    if status == "ok":
+        if COWORKER_RESULT_CAP > 0 and len(content) > COWORKER_RESULT_CAP:
+            content = content[:COWORKER_RESULT_CAP] + "\n…[gekappt]"
+        _log(f"Co-Worker-Stream OK duration={duration:.1f}s len={len(content)} "
+             f"reasoning={len(reasoning)}")
+        return {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "name": _COWORKER_TOOL_NAME,
+            "content": content,
+            "reasoning_content": reasoning or None,
+        }
+
+    _COWORKER_HEALTH_CACHE["reachable"] = False
+    _log(f"Co-Worker-Stream FEHLER duration={duration:.1f}s: {err_text[:200]}")
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "name": _COWORKER_TOOL_NAME,
+        "content": f"[Co-Worker nicht verfuegbar]\n{err_text}",
+        "reasoning_content": reasoning or None,
+    }
 
 
 async def _stream_coworker_phase(coworker_calls_norm: List[Dict[str, Any]],
-                                 state: Dict[str, Any]) -> AsyncIterator[str]:
-    """Fuehrt die Co-Worker-Calls (parallel) intern aus.
+                                 coworker_state: Dict[str, Any]) -> AsyncIterator[str]:
+    """Fuehrt die Co-Worker-Calls (parallel, separate Hardware) intern aus.
+
+    Das reasoning_content der Co-Worker wird LIVE als eigener Reasoning-Context
+    (delta.reasoning_content) an VS Code gestreamt. Die Antwort-Content wird
+    gesammelt und in _stream_local_events als [Proxy] Co-Worker-Antwort-Inject
+    gezeigt.
 
     Yields Keepalive-SSE-Kommentare, damit VS Code waehrend der (langen)
     Co-Worker-Arbeit nicht timeoutet. Die tool-result Messages landen in
-    state['coworker_results'].
+    coworker_state['coworker_results'] (inkl. 'reasoning_content').
     """
-    async def run() -> List[Dict[str, Any]]:
-        return await asyncio.gather(*[_run_coworker_call(tc) for tc in coworker_calls_norm])
+    model = coworker_state.get("model", "local")
+    stream_id = coworker_state.get("stream_id") or f"chatcmpl-spark-{uuid.uuid4().hex}"
+    queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+    results: List[Optional[Dict[str, Any]]] = [None] * len(coworker_calls_norm)
+    done_count = 0
 
-    task = asyncio.ensure_future(run())
-    try:
-        while True:
-            done, _ = await asyncio.wait({task}, timeout=_STREAM_KEEPALIVE_INTERVAL)
-            if task in done:
-                break
-            yield ": keepalive\n\n"
-        results = task.result()
-        state["coworker_results"] = results
-        _log(f"Co-Worker-Phase beendet: {len(results)} Ergebnis(se)")
-    finally:
-        if not task.done():
-            task.cancel()
+    async def run_one(idx: int, tc: Dict[str, Any]) -> None:
+        nonlocal done_count
         try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
+            results[idx] = await _stream_coworker_call(tc, queue, model, stream_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log(f"Co-Worker-Stream EXCEPTION call#{idx}: {_safe_str(exc)}")
+            results[idx] = {
+                "role": "tool",
+                "tool_call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                "name": _COWORKER_TOOL_NAME,
+                "content": f"[Co-Worker nicht verfuegbar]\n{_safe_str(exc)}",
+            }
+        done_count += 1
+
+    tasks = [asyncio.ensure_future(run_one(i, tc)) for i, tc in enumerate(coworker_calls_norm)]
+    try:
+        while done_count < len(tasks):
+            try:
+                sse = await asyncio.wait_for(queue.get(), timeout=_STREAM_KEEPALIVE_INTERVAL)
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+                continue
+            yield sse
+        # Queue-Reste nach allen Calls drainen
+        while True:
+            try:
+                yield queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    coworker_state["coworker_results"] = [r for r in results if r is not None]
+    _log(f"Co-Worker-Phase beendet: {len(coworker_state['coworker_results'])} Ergebnis(se)")
 
 
 async def _stream_local_events(body: Dict[str, Any], category: str,
@@ -4033,8 +4364,11 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
       * ask_coworker-Calls werden intern abgearbeitet. Dabei werden per
         Stream-Inject sichtbar gemacht:
           1. "[Proxy] Delegation an Co-Worker: <task>…"
-          2. "[Proxy] Co-Worker-Antwort:\n<content>"
-          3. danach streamt das Hauptmodell live weiter — der User sieht,
+          2. das reasoning_content des Co-Workers streamt LIVE als eigener
+             Reasoning-Context an VS Code durch (Issue: Reasoning des
+             Co-Workers sichtbar machen)
+          3. "[Proxy] Co-Worker-Antwort:\n<content>"
+          4. danach streamt das Hauptmodell live weiter — der User sieht,
              was es mit der Antwort macht.
       * VS-Code-Tools (read_file etc.) werden unveraendert an Copilot
         durchgereicht.
@@ -4144,11 +4478,16 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
             include_role=not state.get("role_sent"), chunk_id=stream_id)
         state["role_sent"] = True
 
-        # 2) Co-Worker-Calls ausfuehren (Keepalives halten VS Code am Leben)
-        coworker_state: Dict[str, Any] = {}
+        # 2) Co-Worker-Calls ausfuehren (Reasoning streamt live als eigener
+        #    Reasoning-Context; Keepalives halten VS Code am Leben)
+        coworker_state: Dict[str, Any] = {"stream_id": stream_id, "model": model}
         async for sse in _stream_coworker_phase(coworker_calls_norm, coworker_state):
             yield sse
         results = coworker_state.get("coworker_results", [])
+        # reasoning_content nicht in die History schreiben (nur Reporting —
+        # der User sieht es bereits live als Reasoning-Context in VS Code)
+        for r in results:
+            r.pop("reasoning_content", None)
         msgs.extend(results)
 
         # 3) Stream-Inject: Co-Worker-Antwort

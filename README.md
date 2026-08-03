@@ -61,10 +61,17 @@ streamt der Proxy bei `--local` das Backend live mit `stream=True`:
 - **Thinking (`reasoning_content`) und Antwort fliessen live an VS Code durch**
   — der User sieht sofort, dass das Modell arbeitet (wichtig bei langsamen
   lokalen Modellen, keine leeren Phasen, kein Timeout-Gefuehl).
+- **Reasoning-Mapping**: Reasoning wird einheitlich als `reasoning_content` an
+  VS Code gemappt — egal in welcher Struktur das Backend liefert:
+  `reasoning_content` (DeepSeek/vLLM-Qwen3-Parser), `reasoning` (Ollama/LM
+  Studio, auch als Liste/Objekt), `thinking` oder `<think>...</think>`-Tags im
+  content (vLLM Qwen3 mit `preserve_thinking`).
 - **Co-Worker-Delegation wird per Stream-Inject sichtbar gemacht:**
   1. `[Proxy] Delegation an Co-Worker: <task>…` — sobald übergeben wird
-  2. `[Proxy] Co-Worker-Antwort:\n<content>` — die Rückantwort des Co-Workers
-  3. danach streamt das Hauptmodell live weiter — man sieht, was es mit der
+  2. das **Reasoning des Co-Workers streamt live als eigener Reasoning-Context**
+     an VS Code durch — man sieht, worüber der Co-Worker nachdenkt
+  3. `[Proxy] Co-Worker-Antwort:\n<content>` — die Rückantwort des Co-Workers
+  4. danach streamt das Hauptmodell live weiter — man sieht, was es mit der
      Antwort macht
 - Keepalives halten die Verbindung auch bei langen Denkpausen und während der
   Co-Worker-Arbeit am Leben (kein 300s-Timeout).
