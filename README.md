@@ -51,8 +51,24 @@ das Co-Worker-Modell als erreichbar meldet (Hauptrechner an). Ruft das
 Hauptmodell das Tool auf, arbeitet der Proxy den Call intern an das
 Co-Worker-Modell ab (frische, minimale Session — keine VS-Code-History, kein
 Thinking-Leak, keine VS-Code-Tools) und ruft das Hauptmodell mit dem Ergebnis
-erneut auf. Fuer VS Code bleibt der gesamte Umweg unsichtbar; während der
-Delegation laufen die SSE-Keepalives weiter (kein Timeout).
+erneut auf.
+
+### Live-Streaming + Stream-Inject (Kategorie `local`)
+
+Anders als die Cloud-Kategorien (2-Pass: erst komplett rechnen, dann senden)
+streamt der Proxy bei `--local` das Backend live mit `stream=True`:
+
+- **Thinking (`reasoning_content`) und Antwort fliessen live an VS Code durch**
+  — der User sieht sofort, dass das Modell arbeitet (wichtig bei langsamen
+  lokalen Modellen, keine leeren Phasen, kein Timeout-Gefuehl).
+- **Co-Worker-Delegation wird per Stream-Inject sichtbar gemacht:**
+  1. `[Proxy] Delegation an Co-Worker: <task>…` — sobald übergeben wird
+  2. `[Proxy] Co-Worker-Antwort:\n<content>` — die Rückantwort des Co-Workers
+  3. danach streamt das Hauptmodell live weiter — man sieht, was es mit der
+     Antwort macht
+- Keepalives halten die Verbindung auch bei langen Denkpausen und während der
+  Co-Worker-Arbeit am Leben (kein 300s-Timeout).
+- VS-Code-Tools (`read_file` etc.) werden unverändert an Copilot durchgereicht.
 
 - Konfiguration: Kategorie `coworker` (single-dict, wie `local`) in der WebUI
 - Einstellungen unter `tokens.coworker`: `enabled`, `max_delegations_per_request`,

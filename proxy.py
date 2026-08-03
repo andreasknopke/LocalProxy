@@ -3465,17 +3465,20 @@ async def _stream_events(body: Dict[str, Any], category: str,
     """
     _KEEPALIVE_INTERVAL = 15  # Sekunden zwischen Keepalive-Kommentaren
 
-    # Backend-Call als Task starten, damit wir nebenbei Keepalives senden koennen.
-    # Bei Kategorie=local laeuft die Co-Worker-Delegation intern mit (Keepalives
-    # schuetzen VS Code weiterhin gegen Timeouts waehrend der Delegation).
+    # Kategorie=local: Live-Streaming mit Co-Worker-Stream-Inject (kein 2-Pass).
+    # reasoning_content (Thinking) und content fliessen live an VS Code durch,
+    # damit der User sofort sieht, dass das Modell arbeitet (kein Timeout-Gefuehl).
+    # Delegation + Co-Worker-Antwort werden per Stream-Inject sichtbar gemacht.
     if category == "local":
-        backend_task = asyncio.ensure_future(
-            _delegation_loop(body, category, force_start_idx=force_start_idx)
-        )
-    else:
-        backend_task = asyncio.ensure_future(
-            _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
-        )
+        async for sse in _stream_local_events(body, category, force_start_idx):
+            yield sse
+        return
+
+    # Backend-Call als Task starten, damit wir nebenbei Keepalives senden koennen.
+    # (Nur fuer Nicht-Local-Kategorien; local nutzt _stream_local_events oben.)
+    backend_task = asyncio.ensure_future(
+        _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
+    )
 
     try:
         # Waehrend der Backend laeuft: periodisch SSE-Keepalive senden
@@ -3544,6 +3547,622 @@ async def _stream_events(body: Dict[str, Any], category: str,
             reasoning_content=reasoning_content,
         )
         yield _format_openai_stream_chunk(used_model, "", finish_reason="stop")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Live-Streaming fuer Kategorie=local ── inkl. Co-Worker-Stream-Inject
+# ═══════════════════════════════════════════════════════════════════════════
+# Lokale Modelle sind oft langsam. Statt (wie bei Cloud-Kategorien) erst auf
+# die komplette Antwort zu warten (2-Pass) wird hier das Backend mit
+# stream=True aufgerufen:
+#
+#   * reasoning_content (Thinking) und content fliessen LIVE an VS Code durch —
+#     der User sieht sofort, dass das Modell arbeitet, und es entstehen keine
+#     leeren Phasen, die in Timeouts laufen wuerden.
+#   * Keepalive-Kommentare halten die Verbindung auch dann am Leben, wenn das
+#     lokale Modell zwischen zwei Tokens lange braucht oder der Co-Worker
+#     arbeitet.
+#   * ask_coworker-Calls werden intern abgearbeitet; per Stream-Inject wird
+#     sichtbar gemacht: (1) dass delegiert wird, (2) die Co-Worker-Antwort,
+#     (3) danach, wie das Hauptmodell die Antwort verarbeitet (live gestreamt).
+
+_STREAM_KEEPALIVE_INTERVAL = 15  # Sekunden zwischen Keepalive-Kommentaren
+
+
+def _build_forward_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Baut die tool_calls-Chunks fuer VS Code (OpenAI-Stream-Format).
+
+    Erwartet tool_calls im normalisierten Format (id/function.name/arguments)
+    und liefert die Liste, die als delta.tool_calls an Copilot geht.
+    """
+    first_tcs: List[Dict[str, Any]] = []
+    for i, tc in enumerate(tool_calls):
+        func = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+        args = func.get("arguments", "")
+        if not isinstance(args, str):
+            try:
+                args = json.dumps(args, ensure_ascii=False)
+            except Exception:
+                args = str(args)
+        first_tcs.append({
+            "index": i,
+            "id": tc.get("id", f"call_{uuid.uuid4().hex}"),
+            "type": "function",
+            "function": {"name": func.get("name", ""), "arguments": args},
+        })
+    return first_tcs
+
+
+def _accumulate_stream_tool_calls(state: Dict[str, Any], deltas: List[Dict[str, Any]]) -> None:
+    """Akkumuliert streamed Tool-Call-Deltas (OpenAI-Format) in state['tool_calls'].
+
+    Waehrend des Streams ist state['tool_calls'] ein Dict {index: call}, weil
+    Argumente ueber mehrere Chunks hinweg zusammengesetzt werden. Am Turn-Ende
+    konvertiert _finalize_stream_tool_calls das Dict in eine Liste.
+    """
+    acc = state.get("tool_calls")
+    if not isinstance(acc, dict):
+        acc = {}
+        state["tool_calls"] = acc
+    for tc in deltas:
+        if not isinstance(tc, dict):
+            continue
+        idx = tc.get("index", 0)
+        entry = acc.get(idx)
+        if not isinstance(entry, dict):
+            entry = {"id": None, "type": "function", "function": {"name": "", "arguments": ""}}
+            acc[idx] = entry
+        if tc.get("id"):
+            entry["id"] = tc["id"]
+        fn = tc.get("function")
+        if isinstance(fn, dict):
+            if fn.get("name"):
+                entry["function"]["name"] = str(fn["name"])
+            args = fn.get("arguments")
+            if args is not None:
+                entry["function"]["arguments"] = (entry["function"]["arguments"] or "") + str(args)
+
+
+def _finalize_stream_tool_calls(state: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """Konvertiert den Tool-Call-Akkumulator in eine Liste im erwarteten Format.
+    Returns None wenn keine (vollstaendigen) Tool-Calls vorhanden."""
+    acc = state.get("tool_calls")
+    if not isinstance(acc, dict) or not acc:
+        state["tool_calls"] = []
+        return None
+    calls: List[Dict[str, Any]] = []
+    for idx in sorted(acc.keys()):
+        e = acc[idx]
+        if not isinstance(e, dict):
+            continue
+        fn = e.get("function") if isinstance(e.get("function"), dict) else {}
+        name = str(fn.get("name", "")).strip()
+        if not name:
+            continue
+        args = fn.get("arguments", "")
+        calls.append({
+            "index": idx,
+            "id": e.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+            "type": "function",
+            "function": {"name": name, "arguments": args or "{}"},
+        })
+    state["tool_calls"] = calls
+    return calls or None
+
+
+def _coworker_task_preview(coworker_calls: List[Dict[str, Any]], max_chars: int = 200) -> str:
+    """Kurze Vorschau der task-Arguments fuer den Stream-Inject-Hinweis."""
+    for tc in coworker_calls:
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+        args_raw = fn.get("arguments", "{}")
+        try:
+            args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+            if not isinstance(args, dict):
+                args = {}
+        except (json.JSONDecodeError, ValueError, TypeError):
+            args = {}
+        task = str(args.get("task", "") or "").strip()
+        if task:
+            return task if len(task) <= max_chars else task[:max_chars] + "…"
+    return "Sub-Task"
+
+
+async def _read_stream_error(response: httpx.Response) -> str:
+    """Liest den Fehlertext aus einer Nicht-200-Stream-Response."""
+    try:
+        body = await response.aread()
+        err_body = json.loads(body.decode("utf-8", errors="replace"))
+        if isinstance(err_body.get("error"), dict):
+            return _safe_str(err_body["error"].get("message", ""))
+        if isinstance(err_body.get("error"), str):
+            return _safe_str(err_body["error"])
+        return _safe_str(err_body.get("message") or err_body.get("detail") or err_body)
+    except Exception:
+        return f"HTTP {response.status_code}"
+
+
+async def _stream_single_model_events(body: Dict[str, Any], category: str, def_idx: int = 0,
+                                      inject_hindsight: bool = True) -> AsyncIterator[Dict[str, Any]]:
+    """Streaming-Backend-Call (OpenAI-SSE) fuer EIN Modell. Yields Events:
+      {"type": "chunk", "choice": <choices[0]>}   — pro SSE-Chunk
+      {"type": "done"}                            — Stream sauber beendet
+      {"type": "error", "status_code": int|None, "content": str, "trigger_fallback": bool}
+
+    Gleiche Retry-/Cooldown-Logik wie _call_single_model (non-streaming), aber
+    mit stream=True. Timeout/Connect-Fehler werden beim Oeffnen des Streams
+    mit retry_on_timeout behandelt; Mid-Stream-Abbruche liefern ein error-Event
+    (die Chunks davor sind bereits an den Client gegangen).
+    """
+    defs = _model_defs(category)
+    if not defs or def_idx >= len(defs):
+        yield {"type": "error", "status_code": None,
+               "content": f"Keine gueltige Modell-Definition fuer {category}[{def_idx}]",
+               "trigger_fallback": False}
+        return
+    cat = defs[def_idx]
+    started = time.perf_counter()
+
+    payload = _build_passthrough_payload(body, category, def_idx=def_idx)
+    payload["stream"] = True
+
+    messages = payload.get("messages", [])
+    if isinstance(messages, list) and inject_hindsight:
+        _inject_hindsight_context(messages)
+
+    model = cat["model_name"]
+    api_url = cat["api_url"].rstrip("/")
+    api_key = cat.get("api_key", "")
+    timeout = float(cat.get("timeout_seconds", 300))
+    read_timeout = float(cat.get("read_timeout_seconds", timeout))
+    # Streaming: Read-Timeout grosszuegig ansetzen — langsame lokale Modelle
+    # brauchen manchmal lange bis zum ersten Token bzw. zwischen Tokens.
+    if read_timeout < timeout:
+        read_timeout = timeout
+
+    msg_count = len(messages) if isinstance(messages, list) else 0
+    total_chars = sum(len(str(m.get("content", ""))) for m in (messages if isinstance(messages, list) else []))
+    _log(f"Stream call cat={category}[{def_idx}] model={model} "
+         f"messages={msg_count} chars={total_chars} timeout={timeout:.0f}s read_timeout={read_timeout:.0f}s")
+
+    req_id = f"stream_{category}_{def_idx}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    _dump_debug_payload(req_id, f"stream_{category}_{def_idx}", payload, extra={
+        "category": category, "def_idx": def_idx, "model": model,
+        "timeout": timeout, "messages_count": msg_count, "streaming": True,
+    })
+    _register_debug_request(req_id, {
+        "type": "model_call_start", "streaming": True,
+        "category": category, "def_idx": def_idx, "model": model,
+        "messages_count": msg_count, "chars": total_chars,
+        "timeout": timeout,
+    })
+    _register_active_call(req_id, {
+        "agent_key": category, "def_idx": def_idx, "model": model,
+        "phase": "passthrough-stream",
+    })
+
+    max_retries = int(cat.get("retry_on_timeout", 0))
+    retry_delay = float(cat.get("retry_delay_seconds", 5))
+    _http_timeout = httpx.Timeout(timeout, read=read_timeout)
+
+    try:
+        async with httpx.AsyncClient(timeout=_http_timeout) as client:
+            # ── Stream oeffnen (Connect/Timeout-Retry wie non-streaming) ──
+            stream_ctx = None
+            entered = False
+            last_exc: Optional[Exception] = None
+            response: Optional[httpx.Response] = None
+            for attempt in range(1 + max_retries):
+                try:
+                    stream_ctx = client.stream("POST", api_url, json=payload,
+                                               headers=_api_headers(api_key))
+                    response = await stream_ctx.__aenter__()
+                    entered = True
+                    last_exc = None
+                    break
+                except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError, OSError) as exc:
+                    last_exc = exc
+                    if stream_ctx is not None and entered:
+                        try:
+                            await stream_ctx.__aexit__(None, None, None)
+                        except Exception:
+                            pass
+                        entered = False
+                        stream_ctx = None
+                    duration_so_far = time.perf_counter() - started
+                    if attempt < max_retries:
+                        _log(f"Stream TIMEOUT/CONN cat={category}[{def_idx}] attempt={attempt+1}/{1+max_retries} "
+                             f"duration={duration_so_far:.1f}s type={type(exc).__name__}: {_safe_str(exc)}")
+                        _log(f"   → Auto-Retry in {retry_delay:.0f}s...")
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        _log(f"Stream TIMEOUT/CONN cat={category}[{def_idx}] attempt={attempt+1}/{1+max_retries} "
+                             f"duration={duration_so_far:.1f}s type={type(exc).__name__}: {_safe_str(exc)} — KEINE Retries mehr")
+
+            if last_exc is not None:
+                # Alle Retries erschoepft — Timeout/ConnectionError vor Stream-Beginn
+                duration = time.perf_counter() - started
+                exc_type = type(last_exc).__name__
+                exc_msg = _safe_str(last_exc)
+                _finish_active_call(req_id, "error", {"duration_seconds": duration, "error": exc_msg,
+                                                       "attempts": 1 + max_retries})
+                _log(f"Stream ERROR cat={category}[{def_idx}] duration={duration:.1f}s type={exc_type}: {exc_msg} "
+                     f"(nach {1+max_retries} Versuchen)")
+                _start_cooldown(category, def_idx, duration_override=30.0)
+                yield {"type": "error", "status_code": None,
+                       "content": _safe_str(f"Stream error nach {duration:.0f}s ({exc_type}, {1+max_retries} attempts): {exc_msg}"),
+                       "trigger_fallback": True}
+                return
+
+            try:
+                if response.status_code != 200:
+                    err_detail = await _read_stream_error(response)
+                    duration = time.perf_counter() - started
+                    _finish_active_call(req_id, "error", {"duration_seconds": duration, "error": err_detail})
+                    _log(f"Stream STATUS {response.status_code} cat={category}[{def_idx}] "
+                         f"duration={duration:.1f}s: {err_detail}")
+                    should_fallback = True
+                    if response.status_code == 400:
+                        should_fallback = False
+                        _log(f"   → 400 im Stream (Payload-Problem), kein Fallback: {err_detail}")
+                    elif response.status_code == 429:
+                        ra = _retry_after_seconds(response.status_code, getattr(response, "headers", {}))
+                        _start_cooldown(category, def_idx, duration_override=ra)
+                        _log(f"   → Rate-Limit: Cooldown fuer {category}[{def_idx}]={model}")
+                    elif response.status_code in (401, 403):
+                        _log(f"   → Auth-Fehler, kein Cooldown (Config-Fehler)")
+                    elif response.status_code >= 500:
+                        _start_cooldown(category, def_idx, duration_override=60.0)
+                        _log(f"   → Server-Fehler: Cooldown (60s) fuer {category}[{def_idx}]={model}")
+                    yield {"type": "error", "status_code": response.status_code,
+                           "content": _safe_str(f"Model status {response.status_code}: {err_detail}"),
+                           "trigger_fallback": should_fallback}
+                    return
+
+                # ── SSE-Stream lesen und Events weiterreichen ──
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[len("data:"):].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(data)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    choices = chunk.get("choices")
+                    if not isinstance(choices, list) or not choices:
+                        continue
+                    yield {"type": "chunk", "choice": choices[0]}
+
+                duration = time.perf_counter() - started
+                _finish_active_call(req_id, "done", {"duration_seconds": duration})
+                _log(f"Stream OK cat={category}[{def_idx}] duration={duration:.1f}s")
+                yield {"type": "done"}
+            except (httpx.TimeoutException, httpx.ReadError, httpx.ConnectError, OSError) as exc:
+                # Mid-Stream-Abbruch (nachdem ggf. schon Chunks geliefert wurden)
+                duration = time.perf_counter() - started
+                exc_type = type(exc).__name__
+                _finish_active_call(req_id, "error", {"duration_seconds": duration, "error": _safe_str(exc)})
+                _log(f"Stream ABBRUCH cat={category}[{def_idx}] duration={duration:.1f}s "
+                     f"type={exc_type}: {_safe_str(exc)}")
+                yield {"type": "error", "status_code": None,
+                       "content": _safe_str(f"Stream abgebrochen nach {duration:.0f}s ({exc_type}): {exc}"),
+                       "trigger_fallback": True}
+            except asyncio.CancelledError:
+                # Client-Disconnect / Task-Abbruch
+                duration = time.perf_counter() - started
+                _finish_active_call(req_id, "cancelled", {"duration_seconds": duration})
+                _log(f"Stream CANCELLED cat={category}[{def_idx}] duration={duration:.1f}s (Client-Disconnect)")
+                raise
+            finally:
+                if entered and stream_ctx is not None:
+                    try:
+                        await stream_ctx.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+    except asyncio.CancelledError:
+        # Aufraeumen falls der Abbruch VOR dem inneren try kam (z.B. im Retry-Sleep)
+        _finish_active_call(req_id, "cancelled", {"duration_seconds": time.perf_counter() - started})
+        raise
+
+
+async def _stream_backend_turn(body: Dict[str, Any], category: str,
+                               force_start_idx: Optional[int],
+                               state: Dict[str, Any]) -> AsyncIterator[str]:
+    """Fuehrt EINEN Streaming-Backend-Turn aus (mit Fallback ueber die defs).
+
+    Yields SSE-Strings an VS Code — inkl. Keepalive-Kommentaren, wenn das
+    lokale Modell zwischen zwei Tokens laenger braucht als der Keepalive-
+    Intervall. Mutiert `state` (per Turn zurueckgesetzt):
+      content / reasoning / tool_calls (Akkumulator) / finish_reason /
+      model / all_failed / mid_stream_error / error_content / role_sent (bleibt)
+    """
+    state.update({
+        "content": "", "reasoning": "", "tool_calls": {},
+        "finish_reason": None, "all_failed": False,
+        "mid_stream_error": None, "error_content": None,
+        "def_idx": 0, "model": category,
+    })
+
+    defs = _model_defs(category)
+    if not defs:
+        state["all_failed"] = True
+        state["error_content"] = f"Kategorie '{category}' hat keine konfigurierten Modelle"
+        return
+
+    start_idx = force_start_idx if force_start_idx is not None else _CATEGORY_ACTIVE_IDX.get(category, 0)
+    if start_idx >= len(defs):
+        start_idx = 0
+    indices: List[int] = [start_idx] + [i for i in range(len(defs)) if i != start_idx]
+
+    queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+
+    async def worker() -> None:
+        """Liest Events vom Backend und legt sie in die Queue.
+        Fallback: Pre-Stream-Fehler → naechstes def probieren."""
+        last_err: Optional[Dict[str, Any]] = None
+        for idx in indices:
+            if idx != start_idx and _is_in_cooldown(category, idx):
+                continue
+            forwarded = False
+            state["model"] = defs[idx].get("model_name", "?")
+            state["def_idx"] = idx
+            try:
+                async for ev in _stream_single_model_events(body, category, idx):
+                    ev_type = ev.get("type") if isinstance(ev, dict) else None
+                    if ev_type == "chunk":
+                        forwarded = True
+                        await queue.put(ev)
+                    elif ev_type == "done":
+                        # Erfolg: aktiven Index merken (wie non-streaming Fallback)
+                        _CATEGORY_ACTIVE_IDX[category] = idx
+                        await queue.put(ev)
+                        return
+                    elif ev_type == "error":
+                        last_err = ev
+                        if forwarded:
+                            state["mid_stream_error"] = ev.get("content", "Stream-Fehler")
+                            await queue.put({"type": "__end__"})
+                            return
+                        break  # Pre-Stream-Fehler → naechstes def
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _log(f"Stream-Turn EXCEPTION cat={category} idx={idx}: {_safe_str(exc)}")
+                last_err = {"type": "error", "status_code": None,
+                            "content": _safe_str(exc), "trigger_fallback": True}
+                break
+        # Alle defs fehlgeschlagen (vor Stream-Beginn)
+        state["all_failed"] = True
+        state["error_content"] = (last_err or {}).get("content", "Unbekannter Stream-Fehler")
+        await queue.put({"type": "__end__"})
+
+    task = asyncio.ensure_future(worker())
+    try:
+        while True:
+            try:
+                ev = await asyncio.wait_for(queue.get(), timeout=_STREAM_KEEPALIVE_INTERVAL)
+            except asyncio.TimeoutError:
+                # Modell arbeitet noch, aber es kommt gerade kein Token —
+                # SSE-Kommentar haelt die VS-Code-Verbindung am Leben.
+                yield ": keepalive\n\n"
+                continue
+
+            ev_type = ev.get("type") if isinstance(ev, dict) else None
+            if ev_type in ("done", "__end__"):
+                break
+            if ev_type != "chunk":
+                continue
+
+            choice = ev.get("choice") or {}
+            delta = choice.get("delta") or {}
+            if choice.get("finish_reason"):
+                state["finish_reason"] = choice["finish_reason"]
+
+            rc = delta.get("reasoning_content")
+            if rc is None:
+                rc = delta.get("reasoning")
+            if rc:
+                rc = str(rc)
+                state["reasoning"] = (state.get("reasoning") or "") + rc
+                yield _format_openai_stream_chunk(
+                    state.get("model", category), reasoning_content=rc,
+                    include_role=not state.get("role_sent"),
+                    chunk_id=state.get("stream_id"))
+                state["role_sent"] = True
+
+            c = delta.get("content")
+            if isinstance(c, str) and c:
+                state["content"] = (state.get("content") or "") + c
+                yield _format_openai_stream_chunk(
+                    state.get("model", category), content=c,
+                    include_role=not state.get("role_sent"),
+                    chunk_id=state.get("stream_id"))
+                state["role_sent"] = True
+
+            tcs = delta.get("tool_calls")
+            if tcs:
+                _accumulate_stream_tool_calls(state, tcs)
+    finally:
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+async def _stream_coworker_phase(coworker_calls_norm: List[Dict[str, Any]],
+                                 state: Dict[str, Any]) -> AsyncIterator[str]:
+    """Fuehrt die Co-Worker-Calls (parallel) intern aus.
+
+    Yields Keepalive-SSE-Kommentare, damit VS Code waehrend der (langen)
+    Co-Worker-Arbeit nicht timeoutet. Die tool-result Messages landen in
+    state['coworker_results'].
+    """
+    async def run() -> List[Dict[str, Any]]:
+        return await asyncio.gather(*[_run_coworker_call(tc) for tc in coworker_calls_norm])
+
+    task = asyncio.ensure_future(run())
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=_STREAM_KEEPALIVE_INTERVAL)
+            if task in done:
+                break
+            yield ": keepalive\n\n"
+        results = task.result()
+        state["coworker_results"] = results
+        _log(f"Co-Worker-Phase beendet: {len(results)} Ergebnis(se)")
+    finally:
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+async def _stream_local_events(body: Dict[str, Any], category: str,
+                               force_start_idx: Optional[int] = None) -> AsyncIterator[str]:
+    """Live-Streaming fuer Kategorie=local inkl. Co-Worker-Stream-Inject.
+
+    Ablauf pro Runde:
+      * _stream_backend_turn streamt das Hauptmodell live (Thinking + content).
+      * Endet der Turn ohne Tool-Calls → finish_chunk, fertig.
+      * ask_coworker-Calls werden intern abgearbeitet. Dabei werden per
+        Stream-Inject sichtbar gemacht:
+          1. "[Proxy] Delegation an Co-Worker: <task>…"
+          2. "[Proxy] Co-Worker-Antwort:\n<content>"
+          3. danach streamt das Hauptmodell live weiter — der User sieht,
+             was es mit der Antwort macht.
+      * VS-Code-Tools (read_file etc.) werden unveraendert an Copilot
+        durchgereicht.
+    """
+    stream_id = f"chatcmpl-spark-{uuid.uuid4().hex}"
+    state: Dict[str, Any] = {"stream_id": stream_id, "role_sent": False}
+    rounds = 0
+    hard_limit = False
+
+    while True:
+        async for sse in _stream_backend_turn(body, category, force_start_idx, state):
+            yield sse
+
+        model = state.get("model", category)
+
+        # ── Alle Modelle fehlgeschlagen (vor Stream-Beginn) ──
+        if state.get("all_failed"):
+            _log(f"Stream: ALLE Fallbacks fehlgeschlagen cat={category}: {state.get('error_content','?')}")
+            yield _format_openai_stream_chunk(
+                model,
+                content=f"[Proxy: Stream-Fehler] {state.get('error_content','')}",
+                include_role=not state.get("role_sent"), chunk_id=stream_id)
+            yield _format_openai_stream_chunk(model, "", finish_reason="stop", chunk_id=stream_id)
+            return
+
+        # ── Mid-Stream-Abbruch (Chunks kamen, dann Fehler) ──
+        if state.get("mid_stream_error"):
+            yield _format_openai_stream_chunk(
+                model,
+                content=f"\n\n[Proxy: Stream abgebrochen] {state.get('mid_stream_error','')}",
+                include_role=not state.get("role_sent"), chunk_id=stream_id)
+            yield _format_openai_stream_chunk(model, "", finish_reason="stop", chunk_id=stream_id)
+            return
+
+        tool_calls = _finalize_stream_tool_calls(state)
+
+        # ── Keine Tool-Calls: Turn normal beenden ──
+        if not tool_calls:
+            content = state.get("content", "") or ""
+            fr = state.get("finish_reason") or "stop"
+            yield _format_openai_stream_chunk(model, "", finish_reason=fr, chunk_id=stream_id)
+            if content.strip():
+                asyncio.ensure_future(_hindsight.retain_async(body, content))
+            return
+
+        coworker_calls, other_calls = _partition_tool_calls(tool_calls)
+
+        # ── Delegations-Limit: hart stoppen falls weiter delegiert wird ──
+        if hard_limit and coworker_calls:
+            if not other_calls:
+                _log("Co-Worker-Delegation-Limit: hart gestoppt (Modell wollte weiter delegieren)")
+                yield _format_openai_stream_chunk(
+                    model,
+                    content="\n\n[Proxy] Co-Worker-Delegation-Limit erreicht — Aufgabe ohne "
+                            "Co-Worker-Unterstuetzung beantwortet.",
+                    include_role=not state.get("role_sent"), chunk_id=stream_id)
+                yield _format_openai_stream_chunk(model, "", finish_reason="stop", chunk_id=stream_id)
+                return
+            # Nur coworker-Calls entfernen, VS-Code-Tools durchreichen
+            yield _format_openai_stream_chunk(
+                model, include_role=True,
+                tool_calls=_build_forward_tool_calls(other_calls), chunk_id=stream_id)
+            yield _format_openai_stream_chunk(model, finish_reason="tool_calls", chunk_id=stream_id)
+            return
+
+        # ── Nur VS-Code-Tools: an Copilot durchreichen ──
+        if not coworker_calls:
+            yield _format_openai_stream_chunk(
+                model, include_role=True,
+                tool_calls=_build_forward_tool_calls(tool_calls), chunk_id=stream_id)
+            yield _format_openai_stream_chunk(model, finish_reason="tool_calls", chunk_id=stream_id)
+            return
+
+        rounds += 1
+
+        # ── Delegations-Limit erreicht: finale Runde ohne weitere Delegation ──
+        if rounds > COWORKER_MAX_DELEGATIONS:
+            _log(f"Co-Worker-Delegation-Limit erreicht ({COWORKER_MAX_DELEGATIONS} Runden)")
+            msgs = body.get("messages", [])
+            msgs.append({"role": "user", "content":
+                "[Proxy] Co-Worker-Delegation-Limit erreicht. Beantworte die Aufgabe "
+                "jetzt direkt, ohne ask_coworker erneut aufzurufen."})
+            hard_limit = True
+            continue
+
+        # ── Gemischter Turn: Hinweis injizieren + neu aufrufen ──
+        if other_calls:
+            _log(f"Gemischter Turn (ask_coworker + {len(other_calls)} andere Tools) "
+                 f"— Hinweis injizieren")
+            msgs = body.get("messages", [])
+            msgs.append({"role": "user", "content":
+                "[Proxy-Hinweis] Rufe ask_coworker nicht zusammen mit anderen Tools "
+                "auf. Fuehre entweder die anderen Tools aus ODER rufe ask_coworker "
+                "in einem separaten Turn allein auf."})
+            continue
+
+        # ── Reiner Co-Worker-Turn: intern abarbeiten + Stream-Inject ──
+        coworker_calls_norm = _normalize_tool_calls(coworker_calls) or coworker_calls
+        msgs = body.get("messages", [])
+        msgs.append({"role": "assistant", "content": None, "tool_calls": coworker_calls_norm})
+
+        # 1) Stream-Inject: Delegations-Hinweis (User sieht, dass uebergeben wird)
+        preview = _coworker_task_preview(coworker_calls_norm)
+        yield _format_openai_stream_chunk(
+            model,
+            content=f"\n\n[Proxy] Delegation an Co-Worker: {preview}…",
+            include_role=not state.get("role_sent"), chunk_id=stream_id)
+        state["role_sent"] = True
+
+        # 2) Co-Worker-Calls ausfuehren (Keepalives halten VS Code am Leben)
+        coworker_state: Dict[str, Any] = {}
+        async for sse in _stream_coworker_phase(coworker_calls_norm, coworker_state):
+            yield sse
+        results = coworker_state.get("coworker_results", [])
+        msgs.extend(results)
+
+        # 3) Stream-Inject: Co-Worker-Antwort
+        for r in results:
+            answer = (r.get("content") or "").strip()
+            if answer:
+                yield _format_openai_stream_chunk(
+                    model,
+                    content=f"\n\n[Proxy] Co-Worker-Antwort:\n{answer}",
+                    include_role=not state.get("role_sent"), chunk_id=stream_id)
+                state["role_sent"] = True
+
+        # 4) Naechste Runde: Hauptmodell verarbeitet die Antwort (live gestreamt)
+        continue
 
 
 # ── /v1/models ─────────────────────────────────────────────────────────────
