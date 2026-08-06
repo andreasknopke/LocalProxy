@@ -1507,6 +1507,97 @@ def test_build_coworker_body_caps(monkeypatch):
     assert content.endswith("…[gekappt]")
 
 
+def test_build_coworker_body_appends_extra_context(monkeypatch):
+    """Automatisch angehaengter Datei-Kontext landet in der User-Message —
+    der Co-Worker bekommt die relevanten Dateiinhalte auch ohne task/context."""
+    monkeypatch.setattr(proxy, "COWORKER_SYSTEM_PROMPT", "SysRolle")
+    monkeypatch.setattr(proxy, "COWORKER_TASK_CAP", 0)
+    body = proxy._build_coworker_body(
+        "review this", "kurz",
+        extra_context="### Datei: proxy.py\nprint('hi')")
+    content = body["messages"][1]["content"]
+    assert "review this" in content
+    assert "### Datei: proxy.py" in content
+    assert "print('hi')" in content
+
+
+def test_build_coworker_body_task_cap_does_not_cut_files(monkeypatch):
+    """Task/Context-Cap gilt nur fuer task+context; der angehaengte
+    Datei-Kontext bleibt erhalten (sonst wuerden Dateien bei kleinem Cap
+    komplett verloren gehen)."""
+    monkeypatch.setattr(proxy, "COWORKER_TASK_CAP", 30)
+    monkeypatch.setattr(proxy, "COWORKER_SYSTEM_PROMPT", "SysRolle")
+    body = proxy._build_coworker_body(
+        "t" * 100, "", extra_context="### Datei: a.py\n" + "x" * 500)
+    content = body["messages"][1]["content"]
+    assert "…[gekappt]" in content
+    assert "### Datei: a.py" in content
+    assert "x" * 500 in content
+
+
+def test_extract_conversation_files_attachments():
+    """file-Parts aus user-Messages (VS-Code-Attachments) werden extrahiert,
+    inkl. verschachteltem part['file'] und dedupliziert nach Pfad."""
+    msgs = [
+        {"role": "user", "content": [
+            {"type": "text", "text": "review das hier"},
+            {"type": "file", "file": {"path": "proxy.py", "content": "def main(): pass"}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "file", "file": {"path": "proxy.py", "content": "def main(): pass"}},
+            {"type": "file", "file": {"path": "webui.py", "content": "print('ui')"}},
+        ]},
+        {"role": "assistant", "content": "ich schau mir das an"},
+    ]
+    out = proxy._extract_conversation_files(msgs, max_chars=0)
+    assert "### Datei: proxy.py" in out
+    assert "def main(): pass" in out
+    assert "### Datei: webui.py" in out
+    assert "ich schau mir das an" not in out
+    # proxy.py nur einmal (dedupliziert)
+    assert out.count("### Datei: proxy.py") == 1
+
+
+def test_extract_conversation_files_tool_results():
+    """Tool-Ergebnisse (read_file etc.) zaehlen als Datei-Kontext."""
+    msgs = [
+        {"role": "user", "content": "mach was"},
+        {"role": "tool", "name": "read_file", "tool_call_id": "c1",
+         "content": "=== proxy.py (1-50) ===\nimport os"},
+        {"role": "tool", "name": "read_file", "tool_call_id": "c2",
+         "content": "=== webui.py (1-10) ===\nprint('ui')"},
+        {"role": "tool", "name": "read_file", "tool_call_id": "c3",
+         "content": "=== proxy.py (1-50) ===\nimport os"},
+    ]
+    out = proxy._extract_conversation_files(msgs, max_chars=0)
+    assert "### Tool-Ergebnis (read_file)" in out
+    assert "import os" in out
+    assert "print('ui')" in out
+    # identischer Tool-Text nur einmal
+    assert out.count("import os") == 1
+
+
+def test_extract_conversation_files_cap():
+    """Budget kappt den Kontext und markiert das."""
+    msgs = [
+        {"role": "user", "content": [
+            {"type": "file", "file": {"path": "a.py", "content": "x" * 2000}},
+        ]},
+        {"role": "tool", "name": "read_file", "tool_call_id": "c1",
+         "content": "y" * 2000},
+    ]
+    out = proxy._extract_conversation_files(msgs, max_chars=500)
+    assert "gekappt" in out
+    assert len(out) < 600
+
+
+def test_extract_conversation_files_empty():
+    assert proxy._extract_conversation_files([], max_chars=0) == ""
+    assert proxy._extract_conversation_files(None, max_chars=0) == ""
+    assert proxy._extract_conversation_files(
+        [{"role": "user", "content": "nur text"}], max_chars=0) == ""
+
+
 def test_run_coworker_call_error_becomes_tool_result(monkeypatch):
     """Co-Worker-Ausfall wird tool-result mit Fehlertext, kein Crash."""
     monkeypatch.setattr(proxy, "_MODEL_CATEGORIES", {
@@ -1577,7 +1668,7 @@ def test_delegation_loop_enforces_limit(monkeypatch):
     """Nach max_delegations wird das Modell zur direkten Antwort gezwungen."""
     calls = {"n": 0}
 
-    async def fake_run(tool_call):
+    async def fake_run(tool_call, extra_context=None):
         return {"role": "tool", "tool_call_id": tool_call.get("id"),
                 "name": "ask_coworker", "content": "co-worker antwort"}
 

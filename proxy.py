@@ -442,6 +442,9 @@ COWORKER_ENABLED: bool = os.getenv("COWORKER_ENABLED", "true").lower() in {"1", 
 COWORKER_MAX_DELEGATIONS: int = int(os.getenv("COWORKER_MAX_DELEGATIONS", "2"))
 COWORKER_TASK_CAP: int = int(os.getenv("COWORKER_TASK_CAP", "8000"))
 COWORKER_RESULT_CAP: int = int(os.getenv("COWORKER_RESULT_CAP", "12000"))
+# Automatisch angehaengter Datei-Kontext (VS-Code-Attachments + Tool-Ergebnisse)
+# fuer ask_coworker-Calls: Budget in Zeichen, 0 = deaktiviert.
+COWORKER_FILES_CAP: int = int(os.getenv("COWORKER_FILES_CAP", "60000"))
 # Health-Check: wie oft der Co-Worker geprobt wird / wie lange ein Probe-Timeout dauern darf
 COWORKER_HEALTH_INTERVAL: float = float(os.getenv("COWORKER_HEALTH_INTERVAL", "60"))
 COWORKER_PROBE_TIMEOUT: float = float(os.getenv("COWORKER_PROBE_TIMEOUT", "5"))
@@ -649,6 +652,7 @@ def _apply_config_file() -> None:
 
     global COWORKER_ENABLED, COWORKER_MAX_DELEGATIONS
     global COWORKER_TASK_CAP, COWORKER_RESULT_CAP
+    global COWORKER_FILES_CAP
     global COWORKER_HEALTH_INTERVAL, COWORKER_PROBE_TIMEOUT
     global COWORKER_SYSTEM_PROMPT
     cw = tokens_cfg.get("coworker", {})
@@ -657,6 +661,7 @@ def _apply_config_file() -> None:
         COWORKER_MAX_DELEGATIONS = int(cw.get("max_delegations_per_request", COWORKER_MAX_DELEGATIONS))
         COWORKER_TASK_CAP = int(cw.get("task_cap_chars", COWORKER_TASK_CAP))
         COWORKER_RESULT_CAP = int(cw.get("result_cap_chars", COWORKER_RESULT_CAP))
+        COWORKER_FILES_CAP = int(cw.get("files_cap_chars", COWORKER_FILES_CAP))
         COWORKER_HEALTH_INTERVAL = float(cw.get("health_interval_seconds", COWORKER_HEALTH_INTERVAL))
         COWORKER_PROBE_TIMEOUT = float(cw.get("probe_timeout_seconds", COWORKER_PROBE_TIMEOUT))
         cw_prompt = cw.get("system_prompt", "")
@@ -2622,9 +2627,11 @@ _COWORKER_TOOL_DEF: Dict[str, Any] = {
         "description": (
             "Delegate a self-contained sub-task (planning, code review, "
             "brainstorming, or parallel implementation) to a co-worker coding "
-            "model running on separate hardware. The co-worker has NO access to "
-            "this conversation or the workspace — put everything it needs into "
-            "task/context. Returns the co-worker's text answer."
+            "model running on separate hardware. The proxy AUTOMATICALLY "
+            "appends the file contents from this conversation (attached files "
+            "and read/search tool results) to the co-worker's context — "
+            "task/context can stay concise and does NOT need to repeat the "
+            "files. Returns the co-worker's text answer."
         ),
         "parameters": {
             "type": "object",
@@ -2766,15 +2773,94 @@ def _partition_tool_calls(tool_calls: Optional[List[Dict[str, Any]]]) -> Tuple[L
     return coworker, others
 
 
-def _build_coworker_body(task: str, context: str) -> Dict[str, Any]:
+def _extract_conversation_files(messages: Optional[List[Dict[str, Any]]],
+                                max_chars: int = 0) -> str:
+    """Extrahiert Dateiinhalte aus der Chat-History fuer den Co-Worker:
+    - VS-Code-Attachments: content-Array-Parts mit type=="file"
+      (path + content, auch verschachtelt unter part["file"])
+    - Tool-Ergebnisse (read_file/grep_search etc.): role=="tool" messages
+    Dedupliziert nach Dateipfad bzw. identischem Text. Returns einen
+    formatierten Block oder '' wenn nichts relevantes gefunden wurde.
+    max_chars<=0 => unbegrenzt."""
+    budget = max_chars if max_chars and max_chars > 0 else 10 ** 9
+    blocks: List[str] = []
+    used = 0
+    truncated = False
+    seen_paths: Set[str] = set()
+    seen_texts: Set[str] = set()
+
+    def add_block(label: str, text: str) -> None:
+        nonlocal used, truncated
+        text = (text or "").strip()
+        if not text:
+            return
+        block = f"### {label}\n{text}"
+        if used + len(block) > budget:
+            truncated = True
+            return
+        blocks.append(block)
+        used += len(block)
+
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "file":
+                    continue
+                f = part.get("file")
+                if isinstance(f, dict):
+                    path = str(f.get("path") or f.get("name") or "").strip()
+                    text = str(f.get("content") or f.get("text") or "").strip()
+                else:
+                    path = str(part.get("path") or part.get("name") or "").strip()
+                    text = str(part.get("content") or "").strip()
+                if not path or not text:
+                    continue
+                key = path.lower()
+                if key in seen_paths:
+                    continue
+                seen_paths.add(key)
+                add_block(f"Datei: {path}", text)
+        elif msg.get("role") == "tool":
+            name = str(msg.get("name") or msg.get("tool_name") or "tool").strip()
+            text = content if isinstance(content, str) else _normalize_text(content)
+            text = text.strip()
+            if not text:
+                continue
+            h = _simple_hash(text)
+            if h in seen_texts:
+                continue
+            seen_texts.add(h)
+            add_block(f"Tool-Ergebnis ({name})", text)
+    if truncated:
+        blocks.append("…[Datei-Kontext gekappt: Budget "
+                      f"{budget if budget < 10 ** 9 else 'unbegrenzt'} Zeichen]")
+    return "\n\n".join(blocks)
+
+
+def _build_coworker_body(task: str, context: str,
+                         extra_context: Optional[str] = None) -> Dict[str, Any]:
     """Baut eine frische, minimale Session fuer den Co-Worker.
     KEINE VS-Code-History, KEINE tool_calls, KEIN reasoning_content,
-    KEIN Hindsight. Nur System-Prompt + eine User-Message (task+context)."""
+    KEIN Hindsight. Nur System-Prompt + eine User-Message (task+context).
+
+    extra_context: automatisch angehaengte Dateiinhalte aus dem Chat
+    (VS-Code-Attachments + Tool-Ergebnisse) — damit der Co-Worker auch bei
+    komplexen Fragen IMMER alle relevanten Dateiinhalte bekommt, selbst wenn
+    das Hauptmodell sie nicht in task/context uebernommen hat."""
     task = (task or "").strip()
     context = (context or "").strip()
+    extra = (extra_context or "").strip()
     user_content = f"{task}\n\n## Context\n{context}" if context else task
     if COWORKER_TASK_CAP > 0 and len(user_content) > COWORKER_TASK_CAP:
         user_content = user_content[:COWORKER_TASK_CAP] + "\n…[gekappt]"
+    if extra:
+        user_content += (
+            "\n\n## Dateiinhalte aus dem Chat (vom Proxy automatisch "
+            "angehaengt — gehoeren zum aktuellen Kontext)\n" + extra
+        )
     messages: List[Dict[str, Any]] = []
     if COWORKER_SYSTEM_PROMPT.strip():
         messages.append({"role": "system", "content": COWORKER_SYSTEM_PROMPT})
@@ -2786,7 +2872,8 @@ def _build_coworker_body(task: str, context: str) -> Dict[str, Any]:
     }
 
 
-async def _run_coworker_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
+async def _run_coworker_call(tool_call: Dict[str, Any],
+                             extra_context: Optional[str] = None) -> Dict[str, Any]:
     """Fuehrt EINEN ask_coworker-Call intern aus und liefert eine tool-result
     Message. Fehler werden NICHT geworfen, sondern als tool-content zurueck-
     gegeben, damit das Hauptmodell weiterarbeiten kann."""
@@ -2802,7 +2889,7 @@ async def _run_coworker_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
     context = str(args.get("context", "") or "")
 
     started = time.perf_counter()
-    body = _build_coworker_body(task, context)
+    body = _build_coworker_body(task, context, extra_context=extra_context)
     # inject_hindsight=False: kein Hindsight-Recall fuer Co-Worker-Calls
     # (vermeidet Kontamination des Co-Worker-Sessions mit Haupt-History)
     result = await _call_single_model(body, "coworker", 0, inject_hindsight=False)
@@ -2848,6 +2935,13 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
     Rekonstruktion fuer gemischte Turns ist zu fragil.
     """
     rounds = 0
+    # Datei-Kontext aus der Chat-History einmalig extrahieren — der Co-Worker
+    # bekommt IMMER die relevanten Dateiinhalte, auch wenn das Hauptmodell sie
+    # nicht in task/context uebernommen hat.
+    files_context = _extract_conversation_files(body.get("messages"), COWORKER_FILES_CAP)
+    if files_context:
+        _log(f"Co-Worker-Delegation: {len(files_context)} chars Datei-Kontext "
+             f"automatisch angehaengt")
     while True:
         outcome = await _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
         result = outcome.get("result", {})
@@ -2901,7 +2995,9 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
         coworker_calls_norm = _normalize_tool_calls(coworker_calls) or coworker_calls
         msgs = body.get("messages", [])
         msgs.append({"role": "assistant", "content": None, "tool_calls": coworker_calls_norm})
-        results = await asyncio.gather(*[_run_coworker_call(tc) for tc in coworker_calls_norm])
+        results = await asyncio.gather(
+            *[_run_coworker_call(tc, extra_context=files_context)
+              for tc in coworker_calls_norm])
         # reasoning_content nicht an das Hauptmodell schicken (nur Reporting)
         for r in results:
             r.pop("reasoning_content", None)
@@ -4193,7 +4289,8 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
 
 
 async def _stream_coworker_call(tool_call: Dict[str, Any], queue: asyncio.Queue,
-                                model: str, stream_id: str) -> Dict[str, Any]:
+                                model: str, stream_id: str,
+                                extra_context: Optional[str] = None) -> Dict[str, Any]:
     """Fuehrt EINEN ask_coworker-Call intern aus und streamt dabei dessen
     reasoning_content LIVE als eigenen Reasoning-Context an VS Code durch
     (delta.reasoning_content) — der User sieht, worueber der Co-Worker
@@ -4216,7 +4313,7 @@ async def _stream_coworker_call(tool_call: Dict[str, Any], queue: asyncio.Queue,
     context = str(args.get("context", "") or "")
 
     started = time.perf_counter()
-    body = _build_coworker_body(task, context)
+    body = _build_coworker_body(task, context, extra_context=extra_context)
     content_parts: List[str] = []
     reasoning_parts: List[str] = []
     think_state: Dict[str, Any] = {"in_think": False, "pending": ""}
@@ -4338,6 +4435,7 @@ async def _stream_coworker_phase(coworker_calls_norm: List[Dict[str, Any]],
     """
     model = coworker_state.get("model", "local")
     stream_id = coworker_state.get("stream_id") or f"chatcmpl-spark-{uuid.uuid4().hex}"
+    files_context = coworker_state.get("files_context") or ""
     queue: asyncio.Queue = asyncio.Queue(maxsize=256)
     results: List[Optional[Dict[str, Any]]] = [None] * len(coworker_calls_norm)
     done_count = 0
@@ -4345,7 +4443,8 @@ async def _stream_coworker_phase(coworker_calls_norm: List[Dict[str, Any]],
     async def run_one(idx: int, tc: Dict[str, Any]) -> None:
         nonlocal done_count
         try:
-            results[idx] = await _stream_coworker_call(tc, queue, model, stream_id)
+            results[idx] = await _stream_coworker_call(
+                tc, queue, model, stream_id, extra_context=files_context)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -4412,6 +4511,13 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
     """
     stream_id = f"chatcmpl-spark-{uuid.uuid4().hex}"
     state: Dict[str, Any] = {"stream_id": stream_id, "role_sent": False}
+    # Datei-Kontext aus der Chat-History einmalig extrahieren — der Co-Worker
+    # bekommt IMMER die relevanten Dateiinhalte, auch wenn das Hauptmodell sie
+    # nicht in task/context uebernommen hat.
+    files_context = _extract_conversation_files(body.get("messages"), COWORKER_FILES_CAP)
+    if files_context:
+        _log(f"Co-Worker-Stream: {len(files_context)} chars Datei-Kontext "
+             f"automatisch angehaengt")
     rounds = 0
     hard_limit = False
 
@@ -4517,7 +4623,8 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
 
         # 2) Co-Worker-Calls ausfuehren (Reasoning streamt live als eigener
         #    Reasoning-Context; Keepalives halten VS Code am Leben)
-        coworker_state: Dict[str, Any] = {"stream_id": stream_id, "model": model}
+        coworker_state: Dict[str, Any] = {"stream_id": stream_id, "model": model,
+                                          "files_context": files_context}
         async for sse in _stream_coworker_phase(coworker_calls_norm, coworker_state):
             yield sse
         results = coworker_state.get("coworker_results", [])

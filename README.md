@@ -81,8 +81,15 @@ streamt der Proxy bei `--local` das Backend live mit `stream=True`:
 
 - Konfiguration: Kategorie `coworker` (single-dict, wie `local`) in der WebUI
 - Einstellungen unter `tokens.coworker`: `enabled`, `max_delegations_per_request`,
-  `task_cap_chars`, `result_cap_chars`, `health_interval_seconds`,
+  `task_cap_chars`, `result_cap_chars`, `files_cap_chars`, `health_interval_seconds`,
   `probe_timeout_seconds`, `system_prompt`
+- **Automatischer Datei-Kontext**: Bei jedem `ask_coworker`-Call haengt der Proxy
+  die Dateiinhalte aus dem Chat automatisch an die Co-Worker-Session an
+  (VS-Code-Attachments + `read_file`/Search-Tool-Ergebnisse, dedupliziert nach
+  Pfad/Inhalt, gedeckelt durch `files_cap_chars`, default 60000). Damit bekommt
+  der Co-Worker auch bei komplexen Fragen IMMER die relevanten Dateiinhalte —
+  selbst wenn das Hauptmodell sie nicht in `task`/`context` uebernommen hat.
+  0 = deaktiviert.
 - Health-Check: periodischer Ping (Intervall konfigurierbar); bei Ausfall wird
 das Tool nicht mehr injiziert, ein laufender Call liefert einen Fehlertext als
 tool-result (Hauptmodell antwortet trotzdem)
@@ -90,7 +97,8 @@ tool-result (Hauptmodell antwortet trotzdem)
 Hinweis an das Modell zurueckgegeben (keine fragile History-Rekonstruktion)
 - Env-Vars: `COWORKER_API_URL/KEY/MODEL_NAME/...`, `COWORKER_ENABLED`,
   `COWORKER_MAX_DELEGATIONS`, `COWORKER_TASK_CAP`, `COWORKER_RESULT_CAP`,
-  `COWORKER_HEALTH_INTERVAL`, `COWORKER_PROBE_TIMEOUT`, `COWORKER_SYSTEM_PROMPT`
+  `COWORKER_FILES_CAP`, `COWORKER_HEALTH_INTERVAL`, `COWORKER_PROBE_TIMEOUT`,
+  `COWORKER_SYSTEM_PROMPT`
 
 ## Quickstart
 

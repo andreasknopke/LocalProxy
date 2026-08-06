@@ -270,6 +270,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "max_delegations_per_request": 2,
             "task_cap_chars": 8000,
             "result_cap_chars": 12000,
+            "files_cap_chars": 60000,
             "health_interval_seconds": 60,
             "probe_timeout_seconds": 5,
             "system_prompt": "You are a co-worker coding model acting as a subagent for planning, code review, brainstorming and parallel implementation tasks. You receive a self-contained task and optional context. Answer with concrete, actionable output: for planning give a step-by-step plan; for review list issues with file/line references and concrete fixes; for coding give complete, idiomatic code. You have NO access to tools, the conversation history or the workspace — work only from what is given to you.",
@@ -730,6 +731,11 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
           <div class="form-group">
             <label>Result-Cap (Zeichen)</label>
             <input type="number" id="coworker_result_cap" min="100" max="100000">
+          </div>
+          <div class="form-group">
+            <label>Datei-Kontext-Cap (Zeichen)</label>
+            <input type="number" id="coworker_files_cap" min="0" max="500000">
+            <div class="hint">Automatisch angehängte Dateiinhalte (Attachments + Tool-Ergebnisse) aus dem Chat — 0 = deaktiviert.</div>
           </div>
         </div>
         <div class="row">
@@ -1488,6 +1494,8 @@ async function loadConfig() {
     if (cwTaskEl) cwTaskEl.value = cw.task_cap_chars != null ? cw.task_cap_chars : 8000;
     const cwResultEl = document.getElementById('coworker_result_cap');
     if (cwResultEl) cwResultEl.value = cw.result_cap_chars != null ? cw.result_cap_chars : 12000;
+    const cwFilesEl = document.getElementById('coworker_files_cap');
+    if (cwFilesEl) cwFilesEl.value = cw.files_cap_chars != null ? cw.files_cap_chars : 60000;
     const cwHIntEl = document.getElementById('coworker_health_interval');
     if (cwHIntEl) cwHIntEl.value = cw.health_interval_seconds != null ? cw.health_interval_seconds : 60;
     const cwPTOEl = document.getElementById('coworker_probe_timeout');
@@ -1578,6 +1586,7 @@ async function saveConfig() {
       max_delegations_per_request: parseInt(document.getElementById('coworker_max_delegations')?.value) || 2,
       task_cap_chars: parseInt(document.getElementById('coworker_task_cap')?.value) || 8000,
       result_cap_chars: parseInt(document.getElementById('coworker_result_cap')?.value) || 12000,
+      files_cap_chars: parseInt(document.getElementById('coworker_files_cap')?.value) ?? 60000,
       health_interval_seconds: parseFloat(document.getElementById('coworker_health_interval')?.value) || 60,
       probe_timeout_seconds: parseFloat(document.getElementById('coworker_probe_timeout')?.value) || 5,
       system_prompt: document.getElementById('coworker_system_prompt')?.value || '',
