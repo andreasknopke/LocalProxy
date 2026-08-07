@@ -3002,6 +3002,18 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
         for r in results:
             r.pop("reasoning_content", None)
         msgs.extend(results)
+
+        # Erinnerung injizieren: bei langem Context vergisst das Modell,
+        # dass es ask_coworker hat. Kurze System-Message als Reminder.
+        if rounds > 1:
+            reminder = (
+                "[Proxy-Erinnerung] Du hast Zugriff auf das Tool 'ask_coworker' — "
+                "ein Co-Worker-Coding-Modell auf separater Hardware. Nutze es für "
+                "selbstständige Teilaufgaben (Planung, Code-Review, Parallelisierung), "
+                "die nicht direkt VS-Code-Tools benötigen."
+            )
+            msgs.append({"role": "system", "content": reminder})
+
         _log(f"Co-Worker-Delegation Runde {rounds}: {len(coworker_calls_norm)} Call(s) abgearbeitet")
 
 
