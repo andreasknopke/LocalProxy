@@ -2626,12 +2626,14 @@ _COWORKER_TOOL_DEF: Dict[str, Any] = {
         "name": _COWORKER_TOOL_NAME,
         "description": (
             "Delegate a self-contained sub-task (planning, code review, "
-            "brainstorming, or parallel implementation) to a co-worker coding "
-            "model running on separate hardware. The proxy AUTOMATICALLY "
-            "appends the file contents from this conversation (attached files "
-            "and read/search tool results) to the co-worker's context — "
-            "task/context can stay concise and does NOT need to repeat the "
-            "files. Returns the co-worker's text answer."
+            "brainstorming, or parallel implementation) to the co-worker: a "
+            "DIFFERENT coding model on a DIFFERENT server (separate base URL, "
+            "separate hardware) that you can ONLY reach through this function "
+            "call. Do NOT delegate to yourself or emulate a sub-agent. The "
+            "proxy AUTOMATICALLY appends the file contents from this "
+            "conversation (attached files and read/search tool results) to the "
+            "co-worker's context — task/context can stay concise and does NOT "
+            "need to repeat the files. Returns the co-worker's text answer."
         ),
         "parameters": {
             "type": "object",
@@ -3004,15 +3006,22 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
         msgs.extend(results)
 
         # Erinnerung injizieren: bei langem Context vergisst das Modell,
-        # dass es ask_coworker hat. Kurze System-Message als Reminder.
+        # dass es ask_coworker hat. Als user-Message (NICHT system — lokale
+        # Modelle erwarten system nur am Anfang der Konversation und geraten
+        # bei system mitten im Tool-Loop in Rollen-Verwirrung).
         if rounds > 1:
             reminder = (
-                "[Proxy-Erinnerung] Du hast Zugriff auf das Tool 'ask_coworker' — "
-                "ein Co-Worker-Coding-Modell auf separater Hardware. Nutze es für "
-                "selbstständige Teilaufgaben (Planung, Code-Review, Parallelisierung), "
-                "die nicht direkt VS-Code-Tools benötigen."
+                "[Proxy-Hinweis] Erinnerung: Du (das Hauptmodell) hast Zugriff auf "
+                "das Tool 'ask_coworker'. Der Co-Worker ist ein VÖLLIG ANDERES "
+                "Modell auf einem ANDEREN Server (eigene Base-URL, separate "
+                "Hardware) — er ist ausschließlich über den Funktionsaufruf "
+                "ask_coworker erreichbar. Wenn du eine Teilaufgabe an einen "
+                "Subagenten delegieren willst (Planung, Code-Review, "
+                "Parallelisierung), rufe IMMER ask_coworker mit task/context auf. "
+                "Simuliere keinen Subagenten selbst und beantworte delegierbare "
+                "Teilaufgaben nicht als imaginären Subagenten in deinem Text."
             )
-            msgs.append({"role": "system", "content": reminder})
+            msgs.append({"role": "user", "content": reminder})
 
         _log(f"Co-Worker-Delegation Runde {rounds}: {len(coworker_calls_norm)} Call(s) abgearbeitet")
 
