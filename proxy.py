@@ -2668,7 +2668,15 @@ def _coworker_configured() -> bool:
 async def _probe_coworker() -> bool:
     """Minimaler Ping ans Co-Worker-Modell. Erreichbar = HTTP < 500 (auch 4xx:
     die Maschine lebt; ein 4xx liefert spaeter einen nutzbaren Fehlertext im
-    tool-result). Timeout/ConnectError = Maschine aus → unreachable."""
+    tool-result). Timeout/ConnectError = Maschine aus → unreachable.
+    Wird nur aufgerufen, wenn COWORKER_ENABLED aktiv ist."""
+    if not COWORKER_ENABLED:
+        _COWORKER_HEALTH_CACHE.update({
+            "reachable": False,
+            "checked_at": time.time(),
+            "last_error": "Co-Worker deaktiviert",
+        })
+        return False
     defs = _model_defs("coworker")
     if not defs:
         _COWORKER_HEALTH_CACHE.update({
@@ -2707,7 +2715,12 @@ async def _probe_coworker() -> bool:
 
 
 async def _coworker_health_loop() -> None:
-    """Periodischer Health-Check fuer den Co-Worker (Startup-Probe + Intervall)."""
+    """Periodischer Health-Check fuer den Co-Worker (Startup-Probe + Intervall).
+    Laeuft NUR wenn COWORKER_ENABLED aktiv ist — bei deaktiviertem Co-Worker
+    wird kein Ping ans andere System geschickt."""
+    if not COWORKER_ENABLED:
+        _COWORKER_HEALTH_CACHE.update({"reachable": False, "last_error": "Co-Worker deaktiviert"})
+        return
     try:
         if _coworker_configured():
             await _probe_coworker()
@@ -2721,6 +2734,10 @@ async def _coworker_health_loop() -> None:
     while True:
         try:
             await asyncio.sleep(COWORKER_HEALTH_INTERVAL)
+            if not COWORKER_ENABLED:
+                # Co-Worker wurde waehrend der Laufzeit deaktiviert → stoppen
+                _COWORKER_HEALTH_CACHE.update({"reachable": False, "last_error": "Co-Worker deaktiviert"})
+                return
             if not _coworker_configured():
                 _COWORKER_HEALTH_CACHE.update({"reachable": False, "last_error": "nicht konfiguriert"})
                 continue
