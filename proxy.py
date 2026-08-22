@@ -448,6 +448,17 @@ COWORKER_FILES_CAP: int = int(os.getenv("COWORKER_FILES_CAP", "60000"))
 # Health-Check: wie oft der Co-Worker geprobt wird / wie lange ein Probe-Timeout dauern darf
 COWORKER_HEALTH_INTERVAL: float = float(os.getenv("COWORKER_HEALTH_INTERVAL", "60"))
 COWORKER_PROBE_TIMEOUT: float = float(os.getenv("COWORKER_PROBE_TIMEOUT", "5"))
+# Fork-Join Fabric (v3.2): dispatch_coworker/collect_coworker Hintergrund-Tasks.
+# Der Co-Worker (gleiche Modell-Familie, separate Hardware) rechnet parallel
+# im Hintergrund weiter, waehrend das Hauptmodell eigene Arbeit erledigt.
+COWORKER_FORK_JOIN: bool = os.getenv("COWORKER_FORK_JOIN", "true").lower() in {"1", "true", "yes", "y", "on"}
+# Wie viele Hintergrund-Tasks GLEICHZEITIG auf dem Co-Worker laufen duerfen
+COWORKER_MAX_PARALLEL: int = int(os.getenv("COWORKER_MAX_PARALLEL", "8"))
+# Obergrenze dispatch_coworker-Calls pro Request (Schutz gegen Dispatch-Loops)
+COWORKER_DISPATCH_CAP: int = int(os.getenv("COWORKER_DISPATCH_CAP", "12"))
+# TTL der Hintergrund-Tasks in Sekunden (0 = unbegrenzt); laufende Tasks werden
+# bei Ablauf abgebrochen (Status=expired), abgelieferte nach 60s entfernt.
+COWORKER_BG_TTL: float = float(os.getenv("COWORKER_BG_TTL", "1800"))
 COWORKER_SYSTEM_PROMPT: str = os.getenv(
     "COWORKER_SYSTEM_PROMPT",
     "You are a co-worker coding model acting as a subagent for planning, code "
@@ -654,6 +665,8 @@ def _apply_config_file() -> None:
     global COWORKER_TASK_CAP, COWORKER_RESULT_CAP
     global COWORKER_FILES_CAP
     global COWORKER_HEALTH_INTERVAL, COWORKER_PROBE_TIMEOUT
+    global COWORKER_FORK_JOIN, COWORKER_MAX_PARALLEL
+    global COWORKER_DISPATCH_CAP, COWORKER_BG_TTL
     global COWORKER_SYSTEM_PROMPT
     cw = tokens_cfg.get("coworker", {})
     if isinstance(cw, dict) and cw:
@@ -664,6 +677,10 @@ def _apply_config_file() -> None:
         COWORKER_FILES_CAP = int(cw.get("files_cap_chars", COWORKER_FILES_CAP))
         COWORKER_HEALTH_INTERVAL = float(cw.get("health_interval_seconds", COWORKER_HEALTH_INTERVAL))
         COWORKER_PROBE_TIMEOUT = float(cw.get("probe_timeout_seconds", COWORKER_PROBE_TIMEOUT))
+        COWORKER_FORK_JOIN = bool(cw.get("enable_fork_join", COWORKER_FORK_JOIN))
+        COWORKER_MAX_PARALLEL = int(cw.get("max_parallel", COWORKER_MAX_PARALLEL))
+        COWORKER_DISPATCH_CAP = int(cw.get("dispatch_cap_per_request", COWORKER_DISPATCH_CAP))
+        COWORKER_BG_TTL = float(cw.get("bg_ttl_seconds", COWORKER_BG_TTL))
         cw_prompt = cw.get("system_prompt", "")
         if cw_prompt:
             COWORKER_SYSTEM_PROMPT = str(cw_prompt)
@@ -2625,15 +2642,16 @@ _COWORKER_TOOL_DEF: Dict[str, Any] = {
     "function": {
         "name": _COWORKER_TOOL_NAME,
         "description": (
-            "Delegate a self-contained sub-task (planning, code review, "
-            "brainstorming, or parallel implementation) to the co-worker: a "
-            "DIFFERENT coding model on a DIFFERENT server (separate base URL, "
-            "separate hardware) that you can ONLY reach through this function "
-            "call. Do NOT delegate to yourself or emulate a sub-agent. The "
-            "proxy AUTOMATICALLY appends the file contents from this "
-            "conversation (attached files and read/search tool results) to the "
-            "co-worker's context — task/context can stay concise and does NOT "
-            "need to repeat the files. Returns the co-worker's text answer."
+            "Delegate a self-contained blocking sub-task (planning, code "
+            "review, brainstorming) to the co-worker model on a SEPARATE "
+            "server (DGX Spark, separate hardware, reached ONLY through this "
+            "function call). This call BLOCKS until the answer arrives — use "
+            "it when you need the result immediately. For fire-and-forget "
+            "parallelism use dispatch_coworker instead. The proxy "
+            "AUTOMATICALLY appends the file contents from this conversation "
+            "(attached files and read/search tool results) to the co-worker's "
+            "context — task/context can stay concise and does NOT need to "
+            "repeat the files. Returns the co-worker's text answer."
         ),
         "parameters": {
             "type": "object",
@@ -2648,6 +2666,77 @@ _COWORKER_TOOL_DEF: Dict[str, Any] = {
                 },
             },
             "required": ["task"],
+        },
+    },
+}
+
+# ── Fork-Join Fabric (v3.2): dispatch/collect ──────────────────────────────
+_COWORKER_DISPATCH_TOOL_NAME = "dispatch_coworker"
+_COWORKER_COLLECT_TOOL_NAME = "collect_coworker"
+
+_COWORKER_DISPATCH_TOOL_DEF: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": _COWORKER_DISPATCH_TOOL_NAME,
+        "description": (
+            "Fire-and-forget: dispatch a background task to the co-worker "
+            "model on the SEPARATE DGX Spark server. Returns IMMEDIATELY with "
+            "a task_id (e.g. \"cw_ab12cd\") — the co-worker keeps computing "
+            "in the background while you CONTINUE YOUR OWN WORK (call VS-Code "
+            "tools, edit files, think). The next client turn will remind you "
+            "of running/done tasks until you collect them. Fan-out scaling: "
+            "trivial sub-task → just do it yourself; one task per file for "
+            "multi-file work; 4-8 parallel tasks for large refactors. Pattern: "
+            "dispatch ALL independent sub-tasks in ONE turn (multiple "
+            "dispatch_coworker calls), do your own work, then collect_coworker. "
+            "The proxy AUTOMATICALLY appends conversation file contents to "
+            "each dispatched task. Task must be fully self-contained — the "
+            "co-worker has NO access to tools or this conversation."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The self-contained task for the background co-worker.",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Optional context: code snippets, file excerpts, constraints.",
+                },
+            },
+            "required": ["task"],
+        },
+    },
+}
+
+_COWORKER_COLLECT_TOOL_DEF: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": _COWORKER_COLLECT_TOOL_NAME,
+        "description": (
+            "Join point: collect the results of previously dispatched "
+            "background tasks. BLOCKS until the requested tasks are done (or "
+            "timeout). Call with no arguments to collect ALL "
+            "running/finished tasks. Returns a list of "
+            "{task_id, status, result} entries. Typical flow: "
+            "dispatch_coworker (several) → do your own work → "
+            "collect_coworker → integrate the results into your answer."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of task_ids (e.g. [\"cw_ab12cd\"]) to collect. Omit to collect ALL tasks.",
+                },
+                "timeout_seconds": {
+                    "type": "number",
+                    "description": "Optional max wait in seconds (default 600). Tasks still running after the timeout are reported with status=running.",
+                },
+            },
+            "required": [],
         },
     },
 }
@@ -2745,6 +2834,9 @@ async def _coworker_health_loop() -> None:
             state = ("erreichbar" if _COWORKER_HEALTH_CACHE.get("reachable")
                      else f"UNREACHABLE ({_COWORKER_HEALTH_CACHE.get('last_error', '?')})")
             _log(f"Co-Worker Health-Check: {state}")
+            # Fork-Join: TTL-Cleanup der Hintergrund-Tasks mit inline ziehen
+            if COWORKER_FORK_JOIN and _COWORKER_BG_TASKS:
+                _cleanup_bg_tasks()
         except asyncio.CancelledError:
             return
         except Exception:
@@ -2752,8 +2844,10 @@ async def _coworker_health_loop() -> None:
 
 
 def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
-    """Injiziert das ask_coworker-Tool in den Payload — NUR wenn aktiviert,
-    konfiguriert und laut Health-Check erreichbar. Returns True bei Injection."""
+    """Injiziert die Co-Worker-Tools (ask_coworker; bei aktivem Fork-Join
+    zusaetzlich dispatch_coworker + collect_coworker) in den Payload — NUR
+    wenn aktiviert, konfiguriert und laut Health-Check erreichbar.
+    Returns True bei Injection."""
     if not COWORKER_ENABLED:
         return False
     if not _coworker_configured():
@@ -2766,19 +2860,28 @@ def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
     if not isinstance(tools, list):
         tools = []
         payload["tools"] = tools
-    if any(isinstance(t, dict) and t.get("function", {}).get("name") == _COWORKER_TOOL_NAME
-           for t in tools):
+    existing = {str((t.get("function") or {}).get("name", "")) for t in tools if isinstance(t, dict)}
+    if _COWORKER_TOOL_NAME in existing:
         return True  # bereits vorhanden
     tools.append(copy.deepcopy(_COWORKER_TOOL_DEF))
+    if COWORKER_FORK_JOIN:
+        if _COWORKER_DISPATCH_TOOL_NAME not in existing:
+            tools.append(copy.deepcopy(_COWORKER_DISPATCH_TOOL_DEF))
+        if _COWORKER_COLLECT_TOOL_NAME not in existing:
+            tools.append(copy.deepcopy(_COWORKER_COLLECT_TOOL_DEF))
     if "tool_choice" not in payload:
         payload["tool_choice"] = "auto"
-    _log("Co-Worker-Tool 'ask_coworker' injiziert (Health-OK)")
+    _log(f"Co-Worker-Tools injiziert (Health-OK"
+         f"{', Fork-Join' if COWORKER_FORK_JOIN else ''})")
     return True
 
 
-def _partition_tool_calls(tool_calls: Optional[List[Dict[str, Any]]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Teilt tool_calls in (coworker_calls, other_calls)."""
-    coworker: List[Dict[str, Any]] = []
+def _partition_tool_calls(tool_calls: Optional[List[Dict[str, Any]]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Teilt tool_calls in 4 Buckets auf:
+    (dispatch_calls, collect_calls, ask_calls, other_calls)."""
+    dispatch: List[Dict[str, Any]] = []
+    collect: List[Dict[str, Any]] = []
+    ask: List[Dict[str, Any]] = []
     others: List[Dict[str, Any]] = []
     for tc in tool_calls or []:
         if not isinstance(tc, dict):
@@ -2786,10 +2889,14 @@ def _partition_tool_calls(tool_calls: Optional[List[Dict[str, Any]]]) -> Tuple[L
         func = tc.get("function") or {}
         name = str(func.get("name", "")).strip()
         if name == _COWORKER_TOOL_NAME:
-            coworker.append(tc)
+            ask.append(tc)
+        elif name == _COWORKER_DISPATCH_TOOL_NAME:
+            dispatch.append(tc)
+        elif name == _COWORKER_COLLECT_TOOL_NAME:
+            collect.append(tc)
         else:
             others.append(tc)
-    return coworker, others
+    return dispatch, collect, ask, others
 
 
 def _extract_conversation_files(messages: Optional[List[Dict[str, Any]]],
@@ -2941,9 +3048,250 @@ async def _run_coworker_call(tool_call: Dict[str, Any],
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Fork-Join Fabric (v3.2) ── Hintergrund-Task-Store + dispatch/collect
+# ═══════════════════════════════════════════════════════════════════════════
+# dispatch_coworker startet einen Hintergrund-Sub-Session auf dem Co-Worker
+# (DGX Spark) und kehrt SOFORT mit einer task_id zurueck. Das Hauptmodell
+# kann meanwhile eigene Arbeit erledigen (VS-Code-Tools, Thinking), bis es
+# per collect_coworker die Ergebnisse einsammelt (Join). Der Status offener
+# Tasks wird jedem neuen Request als kompakte user-Notiz Praefix-artig
+# mitgegeben, bis er abgeliefert wurden (delivered=True).
+
+@dataclass
+class CoworkerTask:
+    task_id: str
+    preview: str                       # 60-Zeichen-Task-Vorschau (Status-Zeile)
+    status: str = "running"            # running | done | error | expired
+    result: Optional[str] = None       # Co-Worker-Antwort (bei done)
+    error: Optional[str] = None        # Fehlertext (bei error/expired)
+    created_at: float = field(default_factory=time.time)
+    finished_at: Optional[float] = None
+    delivered: bool = False            # True sobald per collect abgeliefert
+    file_context: Optional[str] = None # Datei-Kontext zum Dispatch-Zeitpunkt
+    aio_task: Optional[asyncio.Task] = None  # der laufende Hintergrund-Task
+
+    def summary(self) -> Dict[str, Any]:
+        """Kompakte JSON-Repraesentation fuer tool-results / Status-Zeilen."""
+        d: Dict[str, Any] = {"task_id": self.task_id, "status": self.status}
+        if self.status == "done" and self.result is not None:
+            d["result"] = self.result
+        elif self.status in ("error", "expired"):
+            d["error"] = self.error or "unbekannter Fehler"
+        return d
+
+
+# Globaler Task-Store: task_id -> CoworkerTask. Prozess-global, ueberlebt
+# einzelne Requests (das ist der Sinn der Sache — Hintergrund-Arbeit ist
+# groesser als ein Chat-Turn).
+_COWORKER_BG_TASKS: Dict[str, CoworkerTask] = {}
+# Semaphore begrenzt die gleichzeitigen Co-Worker-Calls (Schutz der Spark-
+# Hardware). Lazy initialisiert, weil asyncio.Semaphore sich an das laufende
+# Event-Loop bindet.
+_COWORKER_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def _coworker_semaphore() -> asyncio.Semaphore:
+    global _COWORKER_SEMAPHORE
+    if _COWORKER_SEMAPHORE is None:
+        _COWORKER_SEMAPHORE = asyncio.Semaphore(max(1, COWORKER_MAX_PARALLEL))
+    return _COWORKER_SEMAPHORE
+
+
+def _coworker_bg_snapshot(undelivered_only: bool = True,
+                          max_entries: int = 12) -> List[Dict[str, Any]]:
+    """Kompakter Snapshot des Task-Stores fuer Status-Injection / collect."""
+    out: List[Dict[str, Any]] = []
+    for t in _COWORKER_BG_TASKS.values():
+        if undelivered_only and t.delivered:
+            continue
+        out.append(t.summary())
+        if len(out) >= max_entries:
+            break
+    return out
+
+
+def _coworker_fit(task: CoworkerTask, result: str) -> str:
+    """Kuerzt ein collect-Ergebnis auf COWORKER_RESULT_CAP."""
+    if COWORKER_RESULT_CAP > 0 and len(result) > COWORKER_RESULT_CAP:
+        return result[:COWORKER_RESULT_CAP] + "\n…[gekappt]"
+    return result
+
+
+async def _run_bg_coworker_task(task: CoworkerTask, tool_call_args: Dict[str, Any]) -> None:
+    """Coroutine eines Hintergrund-Tasks: baut die minimale Sub-Session und
+    ruft den Co-Worker NON-streaming auf (kein Client-Queue vorhanden — das
+    Live-Streaming der content entfaellt, Reasoning faellt weg). Ergebnis
+    landet in task.result; Fehler in task.error mit status=error."""
+    started = time.perf_counter()
+    task_text = str(tool_call_args.get("task", "") or "")
+    context_text = str(tool_call_args.get("context", "") or "")
+    try:
+        body = _build_coworker_body(task_text, context_text, extra_context=task.file_context)
+        # Begrenzung der parallelen Co-Worker-Calls passiert HIER, vor dem Call
+        async with _coworker_semaphore():
+            result = await _call_single_model(body, "coworker", 0, inject_hindsight=False)
+        duration = time.perf_counter() - started
+        if result.get("status") == "ok":
+            content = result.get("content", "") or ""
+            if COWORKER_RESULT_CAP > 0 and len(content) > COWORKER_RESULT_CAP:
+                content = content[:COWORKER_RESULT_CAP] + "\n…[gekappt]"
+            task.result = content
+            task.status = "done"
+            _log(f"BG-Task {task.task_id} OK duration={duration:.1f}s len={len(content)}")
+        else:
+            err = result.get("content") or "unbekannter Fehler"
+            task.error = _safe_str(err)
+            task.status = "error"
+            _COWORKER_HEALTH_CACHE["reachable"] = False
+            _log(f"BG-Task {task.task_id} FEHLER duration={duration:.1f}s: {task.error[:200]}")
+    except asyncio.CancelledError:
+        task.status = "expired"
+        task.error = "abgebrochen (TTL/Shutdown)"
+        raise
+    except Exception as exc:
+        task.error = _safe_str(exc)
+        task.status = "error"
+        _log(f"BG-Task {task.task_id} EXCEPTION: {task.error[:200]}")
+
+
+def _task_preview_from_args(args: Dict[str, Any], max_chars: int = 60) -> str:
+    task_text = str(args.get("task", "") or "").strip()
+    if len(task_text) <= max_chars:
+        return task_text
+    return task_text[:max_chars] + "…"
+
+
+def _register_bg_dispatch(tool_call: Dict[str, Any],
+                          files_context: str) -> CoworkerTask:
+    """Legt einen neuen Hintergrund-Task an und startet die Coroutine
+    (fire-and-forget, non-blocking). Caller prueft cap/limits VOR dem Aufruf."""
+    tool_call_id = tool_call.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+    args_raw = (tool_call.get("function") or {}).get("arguments", "{}")
+    try:
+        args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+        if not isinstance(args, dict):
+            args = {}
+    except (json.JSONDecodeError, ValueError, TypeError):
+        args = {}
+    task_id = f"cw_{uuid.uuid4().hex[:8]}"
+    ct = CoworkerTask(
+        task_id=task_id,
+        preview=_task_preview_from_args(args),
+        file_context=files_context or None,
+    )
+    aio = asyncio.ensure_future(_run_bg_coworker_task(ct, args))
+    ct.aio_task = aio
+    _COWORKER_BG_TASKS[task_id] = ct
+    _log(f"BG-Dispatch {task_id} (tool_call={tool_call_id}): {ct.preview}")
+    return ct
+
+
+async def _await_bg_tasks(task_ids: Optional[List[str]],
+                          timeout_seconds: float = 600.0) -> List[Dict[str, Any]]:
+    """Join: wartet (max. timeout) auf die angegebenen Tasks (oder alle
+    undelivered), liefert deren summaries. Laeuft-after-timeout wird als
+    status=running gemeldet — kein Hard-Abort."""
+    # Cleanup zuerst: abgelaufene/abgelieferte raus (auch async gesteuert)
+    _cleanup_bg_tasks()
+    if task_ids:
+        wanted = [str(t).strip() for t in task_ids if str(t).strip()]
+        selected: List[CoworkerTask] = []
+        missing: List[str] = []
+        for tid in wanted:
+            ct = _COWORKER_BG_TASKS.get(tid)
+            if ct is not None:
+                selected.append(ct)
+            else:
+                missing.append(tid)
+    else:
+        selected = [t for t in _COWORKER_BG_TASKS.values() if not t.delivered]
+        missing = []
+
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    pending: List[CoworkerTask] = []
+    for t in selected:
+        if t.status == "running" and t.aio_task is not None and not t.aio_task.done():
+            pending.append(t)
+
+    if pending:
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                await asyncio.wait(
+                    {t.aio_task for t in pending},   # type: ignore[arg-type]
+                    timeout=remaining,
+                )
+        except Exception as exc:
+            _log(f"collect_coworker wait-Fehler: {_safe_str(exc)[:120]}")
+
+    out: List[Dict[str, Any]] = []
+    for tid in missing:
+        out.append({"task_id": tid, "status": "unknown",
+                    "error": "Task-ID nicht gefunden (bereits abgeliefert oder abgelaufen)"})
+    for t in selected:
+        out.append(t.summary())
+        if t.status in ("done", "error", "expired"):
+            t.delivered = True
+            t.finished_at = t.finished_at or time.time()
+        # running Tasks bleiben undelivered → Status-Injection erinnert daran
+    return out
+
+
+def _cleanup_bg_tasks() -> None:
+    """Raumt den Task-Store auf:
+    - laufende Tasks aelter als COWORKER_BG_TTL → canceln (Status=expired)
+    - abgelieferte Tasks mit finished_at aelter als 60s → entfernen
+    - Store auf MAX_PARALLEL*4 Einheiten begrenzen (aeltete zuerst raus)"""
+    now = time.time()
+    if COWORKER_BG_TTL > 0:
+        for t in list(_COWORKER_BG_TASKS.values()):
+            if t.status == "running" and (now - t.created_at) > COWORKER_BG_TTL:
+                _log(f"BG-Task {t.task_id} TTL abgelaufen → cancel")
+                t.status = "expired"
+                t.error = f"Task nach {int(now - t.created_at)}s abgelaufen (TTL)"
+                t.finished_at = now
+                if t.aio_task is not None and not t.aio_task.done():
+                    t.aio_task.cancel()
+    # Abgelieferte nach 60s entfernen
+    for t in list(_COWORKER_BG_TASKS.values()):
+        if t.delivered and t.finished_at is not None and (now - t.finished_at) > 60:
+            del _COWORKER_BG_TASKS[t.task_id]
+    # Harte Grenze: aelteste raus
+    max_entries = max(8, COWORKER_MAX_PARALLEL * 4)
+    if len(_COWORKER_BG_TASKS) > max_entries:
+        by_age = sorted(_COWORKER_BG_TASKS.values(), key=lambda t: t.created_at)
+        for t in by_age[: len(_COWORKER_BG_TASKS) - max_entries]:
+            if t.status != "running":
+                _COWORKER_BG_TASKS.pop(t.task_id, None)
+
+
+def _coworker_status_line() -> Optional[str]:
+    """Baut die kompakte Status-Notiz fuer undelivered Tasks ( None = keine
+    offenen Tasks). Format:
+    [Proxy] 2 Co-Worker Hintergrund-Tasks offen:
+    - ✅ cw_ab12cd: review proxy.py lines 100-200…
+    - ⏳ cw_ef34gh: refactor tools/auth.py…
+    """
+    entries = [t for t in _COWORKER_BG_TASKS.values() if not t.delivered]
+    if not entries:
+        return None
+    lines = [f"[Proxy] {len(entries)} Co-Worker Hintergrund-Task(s) aktiv:"]
+    for t in entries[:8]:
+        icon = {"done": "✅", "error": "❌", "expired": "⏱️"}.get(t.status, "⏳")
+        detail = ""
+        if t.status in ("error", "expired"):
+            detail = f" — {t.error[:80]}" if t.error else ""
+        lines.append(f"- {icon} {t.task_id}: {t.preview}{detail}")
+    if len(entries) > 8:
+        lines.append(f"- … und {len(entries) - 8} weitere")
+    lines.append("Rufe collect_coworker auf, um Ergebnisse abzuholen.")
+    return "\n".join(lines)
+
+
 async def _delegation_loop(body: Dict[str, Any], category: str,
                            force_start_idx: Optional[int] = None) -> Dict[str, Any]:
-    """Hauptmodell aufrufen, ask_coworker-Calls intern abarbeiten, erneut
+    """Hauptmodell aufrufen, Co-Worker-Calls intern abarbeiten, erneut
     aufrufen — bis keine Delegation mehr gewuenscht wird oder das
     max_delegations-Limit erreicht ist. Returns das finale outcome (Format
     wie _call_model_with_fallbacks).
@@ -2952,8 +3300,14 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
     Tool-Typ im Turn ist. Gemischte Turns (ask_coworker + VS-Code-Tools) werden
     mit einem Hinweis beantwortet und neu aufgerufen — die History-
     Rekonstruktion fuer gemischte Turns ist zu fragil.
-    """
+
+    Fork-Join (v3.2): dispatch_coworker ist NON-blocking — der Call kehrt
+    sofort mit einer task_id zurueck und darf auch gemischt mit VS-Code-Tools
+    auftreten (das Ergebnis ist history-unabhaengig, der Store ist die
+    Truth). collect_coworker ist der Join und blockt, bis die Ergebnisse
+    da sind (oder Timeout)."""
     rounds = 0
+    dispatch_count = 0
     # Datei-Kontext aus der Chat-History einmalig extrahieren — der Co-Worker
     # bekommt IMMER die relevanten Dateiinhalte, auch wenn das Hauptmodell sie
     # nicht in task/context uebernommen hat.
@@ -2967,9 +3321,70 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
         tool_calls = result.get("tool_calls")
         if not tool_calls:
             return outcome  # fertig: keine Tool-Calls
-        coworker_calls, other_calls = _partition_tool_calls(tool_calls)
-        if not coworker_calls:
+        dispatch_calls, collect_calls, ask_calls, other_calls = _partition_tool_calls(tool_calls)
+        coworker_calls = ask_calls
+        if not coworker_calls and not dispatch_calls and not collect_calls:
             return outcome  # nur VS-Code-Tools → normal durchreichen
+
+        # ── Fork: dispatches ausfuehren (non-blocking), mini-results sofort ──
+        if dispatch_calls:
+            if dispatch_count + len(dispatch_calls) > COWORKER_DISPATCH_CAP:
+                _log(f"Dispatch-Cap erreicht ({COWORKER_DISPATCH_CAP}/Request) — "
+                     f"weitere dispatches blockt")
+                msgs = body.get("messages", [])
+                msgs.append({"role": "user", "content":
+                    f"[Proxy] Dispatch-Limit erreicht ({COWORKER_DISPATCH_CAP} pro Request). "
+                    "Sammle zuerst mit collect_coworker oder arbeite selbst weiter."})
+                outcome = await _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
+                result = outcome.get("result", {})
+                dispatch_calls, collect_calls, ask_calls, other_calls = _partition_tool_calls(
+                    result.get("tool_calls") or [])
+                coworker_calls = ask_calls
+                if not dispatch_calls and not collect_calls and not coworker_calls:
+                    # Keine Co-Worker-Aktion mehr → Payload normal zurueck
+                    return outcome
+                if dispatch_calls:
+                    # will trotzdem weiter dispatchen → hart stoppen, Rest durch
+                    final_tcs = [tc for tc in (result.get("tool_calls") or [])
+                                 if (tc.get("function") or {}).get("name") not in
+                                 (_COWORKER_TOOL_NAME, _COWORKER_DISPATCH_TOOL_NAME,
+                                  _COWORKER_COLLECT_TOOL_NAME)]
+                    result["tool_calls"] = final_tcs or None
+                    if not final_tcs:
+                        result["content"] = ((result.get("content") or "") +
+                                             "\n\n[Proxy] Dispatch-Limit erreicht.")
+                    return outcome
+                dispatch_count = COWORKER_DISPATCH_CAP  # Limit hart erreicht
+            else:
+                dispatch_count += len(dispatch_calls)
+                msgs = body.get("messages", [])
+                dispatch_norm = _normalize_tool_calls(dispatch_calls) or dispatch_calls
+                msgs.append({"role": "assistant", "content": None,
+                             "tool_calls": dispatch_norm})
+                mini_results: List[Dict[str, Any]] = []
+                for tc in dispatch_norm:
+                    ct = _register_bg_dispatch(tc, files_context)
+                    mini_results.append({
+                        "role": "tool",
+                        "tool_call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                        "name": _COWORKER_DISPATCH_TOOL_NAME,
+                        "content": json.dumps(
+                            {"task_id": ct.task_id, "status": "dispatched"},
+                            ensure_ascii=False),
+                    })
+                msgs.extend(mini_results)
+                # Dispatch ist non-blocking: VS-Code-Tools im selben Turn
+                # werden JETZT durchgereicht (mixed-turn unlock) — nur die
+                # dispatches sind intern beantwortet. collect_coworker wird
+                # NIE durchgereicht (Client kennt das Tool nicht) — es faellt
+                # in den Join-Block unten.
+                if other_calls:
+                    result["tool_calls"] = other_calls
+                    return outcome
+                if collect_calls:
+                    pass  # Join-Block unten uebernimmt (nach dem Fork)
+                else:
+                    continue  # nur dispatches → nächste Runde
 
         rounds += 1
         if rounds > COWORKER_MAX_DELEGATIONS:
@@ -2982,21 +3397,59 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
             final_result = final_outcome.get("result", {})
             final_tcs = final_result.get("tool_calls")
             if final_tcs:
-                cw2, other2 = _partition_tool_calls(final_tcs)
-                if cw2 and not other2:
-                    # Modell will trotzdem weiter delegieren → hart stoppen
+                d2, c2, cw2, other2 = _partition_tool_calls(final_tcs)
+                if (cw2 or c2) and not other2:
+                    # Modell will trotzdem weiter delegieren/sammeln → hart stoppen
                     final_result["tool_calls"] = None
                     final_result["content"] = (
                         (final_result.get("content") or "") + "\n\n[Proxy] "
                         "Co-Worker-Delegation-Limit erreicht — Aufgabe ohne "
                         "Co-Worker-Unterstuetzung beantwortet."
                     )
-                elif cw2 and other2:
+                elif (cw2 or c2) and other2:
                     # Nur coworker-Calls entfernen, VS-Code-Tools durchreichen
                     final_result["tool_calls"] = other2
             return final_outcome
 
-        if other_calls:
+        # ── Join: collect_coworker blockt bis Ergebnisse da sind ──
+        if collect_calls:
+            msgs = body.get("messages", [])
+            msgs.append({"role": "assistant", "content": None,
+                         "tool_calls": _normalize_tool_calls(collect_calls) or collect_calls})
+            collect_results: List[Dict[str, Any]] = []
+            for tc in collect_calls:
+                args_raw = (tc.get("function") or {}).get("arguments", "{}")
+                try:
+                    cargs = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+                    if not isinstance(cargs, dict):
+                        cargs = {}
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    cargs = {}
+                summaries = await _await_bg_tasks(
+                    cargs.get("task_ids"),
+                    timeout_seconds=float(cargs.get("timeout_seconds", 600) or 600),
+                )
+                collect_results.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                    "name": _COWORKER_COLLECT_TOOL_NAME,
+                    "content": json.dumps(summaries, ensure_ascii=False, indent=2),
+                })
+            msgs.extend(collect_results)
+            if ask_calls and not other_calls:
+                # ask + collect im selben Turn: erst sammeln, dann asks parallel —
+                # pragmatisch: asks ebenfalls abarbeiten (intern) und zusammen-
+                # fassen. History bleibt konsistent (assistant mit beiden calls).
+                msgs.append({"role": "user", "content":
+                    "[Proxy-Hinweis] ask_coworker und collect_coworker im selben Turn "
+                    "werden sequenziell abgearbeitet (erst collect, dann ask)."})
+                # Achtung: assistant-turn für ask_calls fehlt hier bewusst NICHT —
+                # der folgende Code hängt ihn an (siehe unten, gemeinsamer Pfad).
+                pass
+            else:
+                continue  # collect done → nächste Runde (Modell verarbeitet)
+
+        if other_calls and (coworker_calls or collect_calls):
             # Gemischter Turn: Hinweis injizieren + neu aufrufen. Die bisherigen
             # assistant-tool_calls bleiben in der History ohne Ergebnisse — das
             # Modell formuliert den naechsten Schritt neu (gleiches Muster wie
@@ -3011,16 +3464,18 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
             continue
 
         # Reiner Co-Worker-Turn: intern abarbeiten (parallel, Hardware getrennt)
-        coworker_calls_norm = _normalize_tool_calls(coworker_calls) or coworker_calls
-        msgs = body.get("messages", [])
-        msgs.append({"role": "assistant", "content": None, "tool_calls": coworker_calls_norm})
-        results = await asyncio.gather(
-            *[_run_coworker_call(tc, extra_context=files_context)
-              for tc in coworker_calls_norm])
-        # reasoning_content nicht an das Hauptmodell schicken (nur Reporting)
-        for r in results:
-            r.pop("reasoning_content", None)
-        msgs.extend(results)
+        if coworker_calls:
+            coworker_calls_norm = _normalize_tool_calls(coworker_calls) or coworker_calls
+            msgs = body.get("messages", [])
+            msgs.append({"role": "assistant", "content": None, "tool_calls": coworker_calls_norm})
+            results = await asyncio.gather(
+                *[_run_coworker_call(tc, extra_context=files_context)
+                  for tc in coworker_calls_norm])
+            # reasoning_content nicht an das Hauptmodell schicken (nur Reporting)
+            for r in results:
+                r.pop("reasoning_content", None)
+            msgs.extend(results)
+            _log(f"Co-Worker-Delegation Runde {rounds}: {len(coworker_calls_norm)} Call(s) abgearbeitet")
 
         # Erinnerung injizieren: bei langem Context vergisst das Modell,
         # dass es ask_coworker hat. Als user-Message (NICHT system — lokale
@@ -3039,8 +3494,6 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
                 "Teilaufgaben nicht als imaginären Subagenten in deinem Text."
             )
             msgs.append({"role": "user", "content": reminder})
-
-        _log(f"Co-Worker-Delegation Runde {rounds}: {len(coworker_calls_norm)} Call(s) abgearbeitet")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3703,6 +4156,16 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     if category == "local" and COWORKER_ENABLED and _coworker_configured():
         if time.time() - float(_COWORKER_HEALTH_CACHE.get("checked_at", 0.0)) > COWORKER_HEALTH_INTERVAL:
             asyncio.ensure_future(_probe_coworker())
+
+    # Fork-Join: Status offener Hintergrund-Tasks als kompakte user-Notiz
+    # ans Ende der History haengen (nach Kategorie-Detection — beeinflusst
+    # weder Flag-Extraktion noch Tool-Continuation-Erkennung).
+    if (category == "local" and COWORKER_ENABLED and COWORKER_FORK_JOIN
+            and _COWORKER_BG_TASKS):
+        status = _coworker_status_line()
+        if status:
+            msgs.append({"role": "user", "content": status})
+            _log("Fork-Join: Status-Notiz fuer offene BG-Tasks injiziert")
 
     _log(f"Kategorie: {category} (Flag={'--'+category if flag_category else 'default'}"
          f"{' Slot='+str(flag_slot) if flag_slot else ''}), "
@@ -4544,6 +5007,13 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
              "[Proxy] Co-Worker-Antwort:"-Header)
           4. danach streamt das Hauptmodell live weiter — der User sieht,
              was es mit der Antwort macht.
+      * dispatch_coworker (Fork-Join v3.2): non-blocking — Task im Store
+        registrieren, mini-result task_id in die History, sichtbarer
+        "[Proxy] Co-Worker dispatched"-Chunk, dann direkt weiter (gemischt
+        mit VS-Code-Tools erlaubt — die werden durchgereicht).
+      * collect_coworker (Join): blockt bis Ergebnisse da sind oder Timeout;
+        Ergebnisse als tool-Message in die History, sichtbarer
+        "[Proxy] Sammle Co-Worker-Ergebnisse"-Chunk.
       * VS-Code-Tools (read_file etc.) werden unveraendert an Copilot
         durchgereicht.
     """
@@ -4557,6 +5027,7 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
         _log(f"Co-Worker-Stream: {len(files_context)} chars Datei-Kontext "
              f"automatisch angehaengt")
     rounds = 0
+    dispatch_count = 0
     hard_limit = False
 
     while True:
@@ -4595,10 +5066,11 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
                 asyncio.ensure_future(_hindsight.retain_async(body, content))
             return
 
-        coworker_calls, other_calls = _partition_tool_calls(tool_calls)
+        dispatch_calls, collect_calls, ask_calls, other_calls = _partition_tool_calls(tool_calls)
+        coworker_calls = ask_calls
 
         # ── Delegations-Limit: hart stoppen falls weiter delegiert wird ──
-        if hard_limit and coworker_calls:
+        if hard_limit and (coworker_calls or collect_calls):
             if not other_calls:
                 _log("Co-Worker-Delegation-Limit: hart gestoppt (Modell wollte weiter delegieren)")
                 yield _format_openai_stream_chunk(
@@ -4616,12 +5088,63 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
             return
 
         # ── Nur VS-Code-Tools: an Copilot durchreichen ──
-        if not coworker_calls:
+        if not coworker_calls and not dispatch_calls and not collect_calls:
             yield _format_openai_stream_chunk(
                 model, include_role=True,
                 tool_calls=_build_forward_tool_calls(tool_calls), chunk_id=stream_id)
             yield _format_openai_stream_chunk(model, finish_reason="tool_calls", chunk_id=stream_id)
             return
+
+        # ── Fork: dispatches registrieren (non-blocking, Store = Truth) ──
+        if dispatch_calls:
+            if dispatch_count + len(dispatch_calls) > COWORKER_DISPATCH_CAP:
+                _log(f"Dispatch-Cap erreicht ({COWORKER_DISPATCH_CAP}/Request) — Hinweis")
+                msgs = body.get("messages", [])
+                msgs.append({"role": "user", "content":
+                    f"[Proxy] Dispatch-Limit erreicht ({COWORKER_DISPATCH_CAP} pro Request). "
+                    "Sammle zuerst mit collect_coworker oder arbeite selbst weiter."})
+                yield _format_openai_stream_chunk(
+                    model,
+                    content=f"\n\n[Proxy] Dispatch-Limit erreicht ({COWORKER_DISPATCH_CAP} pro Request) — "
+                            "sammle zuerst mit collect_coworker.",
+                    include_role=not state.get("role_sent"), chunk_id=stream_id)
+                state["role_sent"] = True
+                rounds += 1  # Loop-Schutz: Cap-Zustand zaehlt als Runde
+                if rounds > COWORKER_MAX_DELEGATIONS:
+                    hard_limit = True
+                continue
+            dispatch_count += len(dispatch_calls)
+            msgs = body.get("messages", [])
+            dispatch_norm = _normalize_tool_calls(dispatch_calls) or dispatch_calls
+            msgs.append({"role": "assistant", "content": None,
+                         "tool_calls": dispatch_norm})
+            dispatched_note = ["\n\n[Proxy] Co-Worker dispatched:"]
+            for tc in dispatch_norm:
+                ct = _register_bg_dispatch(tc, files_context)
+                msgs.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                    "name": _COWORKER_DISPATCH_TOOL_NAME,
+                    "content": json.dumps(
+                        {"task_id": ct.task_id, "status": "dispatched"},
+                        ensure_ascii=False),
+                })
+                dispatched_note.append(f" {ct.task_id} ({ct.preview})")
+            # Live-Inject: User sieht sofort, was im Hintergrund laeuft
+            yield _format_openai_stream_chunk(
+                model,
+                content=" ".join(dispatched_note),
+                include_role=not state.get("role_sent"), chunk_id=stream_id)
+            state["role_sent"] = True
+            # VS-Code-Tools im selben Turn: JETZT durchreichen (mixed-turn
+            # unlock) — dispatches sind intern beantwortet, collect nie.
+            if other_calls:
+                yield _format_openai_stream_chunk(
+                    model, include_role=True,
+                    tool_calls=_build_forward_tool_calls(other_calls), chunk_id=stream_id)
+                yield _format_openai_stream_chunk(model, finish_reason="tool_calls", chunk_id=stream_id)
+                return
+            continue  # nur dispatches → nächste Runde (Modell arbeitet weiter)
 
         rounds += 1
 
@@ -4634,6 +5157,48 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
                 "jetzt direkt, ohne ask_coworker erneut aufzurufen."})
             hard_limit = True
             continue
+
+        # ── Join: collect_coworker blockt bis Ergebnisse da sind ──
+        if collect_calls:
+            collect_norm = _normalize_tool_calls(collect_calls) or collect_calls
+            msgs = body.get("messages", [])
+            msgs.append({"role": "assistant", "content": None,
+                         "tool_calls": collect_norm})
+            yield _format_openai_stream_chunk(
+                model,
+                content="\n\n[Proxy] Sammle Co-Worker-Ergebnisse …",
+                include_role=not state.get("role_sent"), chunk_id=stream_id)
+            state["role_sent"] = True
+            for tc in collect_norm:
+                args_raw = (tc.get("function") or {}).get("arguments", "{}")
+                try:
+                    cargs = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+                    if not isinstance(cargs, dict):
+                        cargs = {}
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    cargs = {}
+                summaries = await _await_bg_tasks(
+                    cargs.get("task_ids"),
+                    timeout_seconds=float(cargs.get("timeout_seconds", 600) or 600),
+                )
+                msgs.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                    "name": _COWORKER_COLLECT_TOOL_NAME,
+                    "content": json.dumps(summaries, ensure_ascii=False, indent=2),
+                })
+            if other_calls:
+                # Andere Tools im selben Turn wie collect: wurden NICHT
+                # ausgefuehrt — Modell muss sie naechste Runde erneut rufen.
+                msgs.append({"role": "user", "content":
+                    "[Proxy-Hinweis] Die anderen Tools in diesem Turn wurden nicht "
+                    "ausgefuehrt (collect_coworker blockt). Rufe sie jetzt erneut auf."})
+            if ask_calls and not other_calls:
+                # ask + collect im selben Turn: erst gesammelt, jetzt asks —
+                # faellt durch in den ask-Pfad unten (gemeinsame History).
+                pass
+            else:
+                continue  # collect done → nächste Runde (Modell verarbeitet)
 
         # ── Gemischter Turn: Hinweis injizieren + neu aufrufen ──
         if other_calls:

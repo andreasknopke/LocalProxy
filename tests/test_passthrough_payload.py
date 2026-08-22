@@ -1357,9 +1357,12 @@ def _coworker_def(api_url: str = "http://localhost:9999/v1/chat/completions",
 
 
 def _setup_coworker_configured(monkeypatch, reachable: bool = True,
-                               api_url: str = "http://localhost:9999/v1/chat/completions"):
-    """Monkeypatch: coworker konfiguriert + Health-Cache gesetzt."""
+                               api_url: str = "http://localhost:9999/v1/chat/completions",
+                               fork_join: bool = False):
+    """Monkeypatch: coworker konfiguriert + Health-Cache gesetzt.
+    fork_join steuert explizit die Zahl der injizierten Tools (1 oder 3)."""
     monkeypatch.setattr(proxy, "COWORKER_ENABLED", True)
+    monkeypatch.setattr(proxy, "COWORKER_FORK_JOIN", fork_join)
     monkeypatch.setattr(proxy, "_MODEL_CATEGORIES", {
         **proxy._MODEL_CATEGORIES,
         "coworker": _coworker_def(api_url=api_url),
@@ -1448,21 +1451,41 @@ def test_inject_coworker_tool_ok(monkeypatch):
     assert payload.get("tool_choice") == "auto"
 
 
+def test_inject_coworker_tool_fork_join(monkeypatch):
+    """Fork-Join an -> ask + dispatch + collect werden injiziert."""
+    _setup_coworker_configured(monkeypatch, fork_join=True)
+    payload = {"messages": []}
+    assert proxy._inject_coworker_tool(payload) is True
+    tools = payload["tools"]
+    names = [t["function"]["name"] for t in tools]
+    assert names == ["ask_coworker", "dispatch_coworker", "collect_coworker"]
+    # dispatch: task required, task_ids optional
+    d_fn = tools[1]["function"]
+    assert d_fn["parameters"]["required"] == ["task"]
+    assert "task_ids" not in d_fn["parameters"].get("required", [])
+    # collect: alles optional
+    c_fn = tools[2]["function"]
+    assert c_fn["parameters"].get("required", []) in ([], None)
+    assert "task_ids" in c_fn["parameters"]["properties"]
+    assert "timeout_seconds" in c_fn["parameters"]["properties"]
+
+
 def test_inject_coworker_tool_no_override_choice(monkeypatch):
     """Bestehendes tool_choice wird nicht ueberschrieben."""
-    _setup_coworker_configured(monkeypatch)
+    _setup_coworker_configured(monkeypatch, fork_join=True)
     payload = {"messages": [], "tool_choice": "none"}
     proxy._inject_coworker_tool(payload)
     assert payload["tool_choice"] == "none"
 
 
 def test_inject_coworker_tool_idempotent(monkeypatch):
-    """Doppelter Aufruf injiziert das Tool nur einmal."""
-    _setup_coworker_configured(monkeypatch)
+    """Doppelter Aufruf injiziert die Tools nur je einmal."""
+    _setup_coworker_configured(monkeypatch, fork_join=True)
     payload = {"messages": []}
     proxy._inject_coworker_tool(payload)
     proxy._inject_coworker_tool(payload)
-    assert len(payload["tools"]) == 1
+    names = [t["function"]["name"] for t in payload["tools"]]
+    assert names == ["ask_coworker", "dispatch_coworker", "collect_coworker"]
 
 
 def test_partition_tool_calls_mixed():
@@ -1471,15 +1494,33 @@ def test_partition_tool_calls_mixed():
         {"id": "b", "function": {"name": "read_file", "arguments": "{}"}},
         {"id": "c", "function": {"name": "ask_coworker", "arguments": "{}"}},
     ]
-    cw, other = proxy._partition_tool_calls(calls)
-    assert len(cw) == 2
+    dispatch, collect, ask, other = proxy._partition_tool_calls(calls)
+    assert len(ask) == 2
     assert len(other) == 1
     assert other[0]["function"]["name"] == "read_file"
+    assert dispatch == []
+    assert collect == []
+
+
+def test_partition_tool_calls_fork_join():
+    calls = [
+        {"id": "a", "function": {"name": "dispatch_coworker", "arguments": "{}"}},
+        {"id": "b", "function": {"name": "collect_coworker", "arguments": "{}"}},
+        {"id": "c", "function": {"name": "ask_coworker", "arguments": "{}"}},
+        {"id": "d", "function": {"name": "read_file", "arguments": "{}"}},
+    ]
+    dispatch, collect, ask, other = proxy._partition_tool_calls(calls)
+    assert [tc["id"] for tc in dispatch] == ["a"]
+    assert [tc["id"] for tc in collect] == ["b"]
+    assert [tc["id"] for tc in ask] == ["c"]
+    assert [tc["id"] for tc in other] == ["d"]
 
 
 def test_partition_tool_calls_empty():
-    cw, other = proxy._partition_tool_calls(None)
-    assert cw == []
+    dispatch, collect, ask, other = proxy._partition_tool_calls(None)
+    assert dispatch == []
+    assert collect == []
+    assert ask == []
     assert other == []
 
 

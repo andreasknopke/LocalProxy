@@ -273,6 +273,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "files_cap_chars": 60000,
             "health_interval_seconds": 60,
             "probe_timeout_seconds": 5,
+            "enable_fork_join": True,
+            "max_parallel": 8,
+            "dispatch_cap_per_request": 12,
+            "bg_ttl_seconds": 1800,
             "system_prompt": "You are a co-worker coding model acting as a subagent for planning, code review, brainstorming and parallel implementation tasks. You receive a self-contained task and optional context. Answer with concrete, actionable output: for planning give a step-by-step plan; for review list issues with file/line references and concrete fixes; for coding give complete, idiomatic code. You have NO access to tools, the conversation history or the workspace — work only from what is given to you.",
         },
         "local_sampling": {
@@ -746,6 +750,28 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
           <div class="form-group">
             <label>Probe-Timeout (s)</label>
             <input type="number" id="coworker_probe_timeout" min="1" max="60">
+          </div>
+        </div>
+        <h4 style="margin:16px 0 8px;color:#58a6ff;font-size:0.85rem;text-transform:uppercase;letter-spacing:0.5px">Fork-Join (dispatch/collect)</h4>
+        <div class="toggle-row">
+          <span>Fork-Join aktiviert (dispatch_coworker + collect_coworker)</span>
+          <label class="toggle"><input type="checkbox" id="coworker_fork_join" checked><span class="slider"></span></label>
+        </div>
+        <div class="row">
+          <div class="form-group">
+            <label>Max. parallele BG-Tasks (Semaphore)</label>
+            <input type="number" id="coworker_max_parallel" min="1" max="32">
+            <div class="hint">Gleichzeitige Co-Worker-Calls im Hintergrund (DGX Spark: 8 = Sweet Spot).</div>
+          </div>
+          <div class="form-group">
+            <label>Dispatch-Cap pro Request</label>
+            <input type="number" id="coworker_dispatch_cap" min="1" max="50">
+            <div class="hint">Schutz gegen Dispatch-Flooding (12 = Standard).</div>
+          </div>
+          <div class="form-group">
+            <label>BG-TTL (s)</label>
+            <input type="number" id="coworker_bg_ttl" min="60" max="86400">
+            <div class="hint">Hintergrund-Tasks laufen maximal so lange, dann Ablauf (1800 = 30 min).</div>
           </div>
         </div>
         <div class="form-group">
@@ -1500,6 +1526,14 @@ async function loadConfig() {
     if (cwHIntEl) cwHIntEl.value = cw.health_interval_seconds != null ? cw.health_interval_seconds : 60;
     const cwPTOEl = document.getElementById('coworker_probe_timeout');
     if (cwPTOEl) cwPTOEl.value = cw.probe_timeout_seconds != null ? cw.probe_timeout_seconds : 5;
+    const cwFJEl = document.getElementById('coworker_fork_join');
+    if (cwFJEl) cwFJEl.checked = cw.enable_fork_join !== false;
+    const cwMPEl = document.getElementById('coworker_max_parallel');
+    if (cwMPEl) cwMPEl.value = cw.max_parallel != null ? cw.max_parallel : 8;
+    const cwDCEl = document.getElementById('coworker_dispatch_cap');
+    if (cwDCEl) cwDCEl.value = cw.dispatch_cap_per_request != null ? cw.dispatch_cap_per_request : 12;
+    const cwTTLEl = document.getElementById('coworker_bg_ttl');
+    if (cwTTLEl) cwTTLEl.value = cw.bg_ttl_seconds != null ? cw.bg_ttl_seconds : 1800;
     const cwSPEl = document.getElementById('coworker_system_prompt');
     if (cwSPEl) cwSPEl.value = cw.system_prompt || '';
 
@@ -1589,6 +1623,10 @@ async function saveConfig() {
       files_cap_chars: parseInt(document.getElementById('coworker_files_cap')?.value) ?? 60000,
       health_interval_seconds: parseFloat(document.getElementById('coworker_health_interval')?.value) || 60,
       probe_timeout_seconds: parseFloat(document.getElementById('coworker_probe_timeout')?.value) || 5,
+      enable_fork_join: document.getElementById('coworker_fork_join')?.checked ?? true,
+      max_parallel: parseInt(document.getElementById('coworker_max_parallel')?.value) || 8,
+      dispatch_cap_per_request: parseInt(document.getElementById('coworker_dispatch_cap')?.value) || 12,
+      bg_ttl_seconds: parseFloat(document.getElementById('coworker_bg_ttl')?.value) || 1800,
       system_prompt: document.getElementById('coworker_system_prompt')?.value || '',
     },
     local_sampling: {

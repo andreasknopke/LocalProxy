@@ -47,8 +47,9 @@ Jede Kategorie ist vollstandig konfigurierbar:
 
 Bei aktiver Kategorie `--local` injiziert der Proxy ein synthetisches Tool
 `ask_coworker(task, context)` in den Payload — **nur wenn** der Health-Check
-das Co-Worker-Modell als erreichbar meldet (Hauptrechner an). Ruft das
-Hauptmodell das Tool auf, arbeitet der Proxy den Call intern an das
+das Co-Worker-Modell als erreichbar meldet (Hauptrechner an). Mit aktivem
+Fork-Join (siehe unten) kommen `dispatch_coworker` / `collect_coworker` hinzu.
+Ruft das Hauptmodell das Tool auf, arbeitet der Proxy den Call intern an das
 Co-Worker-Modell ab (frische, minimale Session — keine VS-Code-History, kein
 Thinking-Leak, keine VS-Code-Tools) und ruft das Hauptmodell mit dem Ergebnis
 erneut auf.
@@ -82,7 +83,7 @@ streamt der Proxy bei `--local` das Backend live mit `stream=True`:
 - Konfiguration: Kategorie `coworker` (single-dict, wie `local`) in der WebUI
 - Einstellungen unter `tokens.coworker`: `enabled`, `max_delegations_per_request`,
   `task_cap_chars`, `result_cap_chars`, `files_cap_chars`, `health_interval_seconds`,
-  `probe_timeout_seconds`, `system_prompt`
+  `probe_timeout_seconds`, `system_prompt` (Fork-Join-Keys siehe unten)
 - **Automatischer Datei-Kontext**: Bei jedem `ask_coworker`-Call haengt der Proxy
   die Dateiinhalte aus dem Chat automatisch an die Co-Worker-Session an
   (VS-Code-Attachments + `read_file`/Search-Tool-Ergebnisse, dedupliziert nach
@@ -99,6 +100,64 @@ Hinweis an das Modell zurueckgegeben (keine fragile History-Rekonstruktion)
   `COWORKER_MAX_DELEGATIONS`, `COWORKER_TASK_CAP`, `COWORKER_RESULT_CAP`,
   `COWORKER_FILES_CAP`, `COWORKER_HEALTH_INTERVAL`, `COWORKER_PROBE_TIMEOUT`,
   `COWORKER_SYSTEM_PROMPT`
+
+### Fork-Join Fabric (v3.2): `dispatch_coworker` / `collect_coworker`
+
+Zusaetzlich zum blockierenden `ask_coworker` stehen drei Tools fuer parallele
+Hintergrundarbeit zur Verfuegung — **Fork-Join** statt sequenzieller Delegation:
+
+```mermaid
+flowchart LR
+    U[User fragt Hauptmodell] --> M["Hauptmodell (--local)"]
+    M -->|dispatch_coworker task| P[Proxy: Task-Store]
+    P -->|task_id sofort| M
+    P -->|asyncio + Semaphore| CW[Co-Worker auf DGX Spark]
+    M -->|weiterarbeiten oder VS-Code-Tools] M
+    M -->|collect_coworker task_ids| J[Proxy: Join]
+    J -->|Ergebnisse als tool-result| M
+    M --> F[Finale Antwort]
+```
+
+**Tool-Semantik:**
+
+| Tool | Verhalten |
+|------|-----------|
+| `ask_coworker(task, context)` | **Blockierend** (wie bisher): Ergebnis als tool-result, danach Hauptmodell-Weiterverarbeitung |
+| `dispatch_coworker(task)` | **Fork**: registriert Hintergrund-Task im Store, liefert sofort `{"task_id": "cw_…", "status": "dispatched"}` als mini tool-result. Hauptmodell arbeitet sofort weiter (oder ruft VS-Code-Tools im selben Turn auf — mixed-turn-safe) |
+| `collect_coworker(task_ids?, timeout_seconds?=600)` | **Join**: blockt bis Ergebnisse fertig sind oder Timeout, liefert alle summaries als JSON tool-result. Unbekannte/abgelaufene IDs werden als `unknown`/`expired` gemeldet |
+
+**Status-Injection:** Sind undone Hintergrund-Tasks im Store, startet der
+Proxy die Folgekonversation mit einem Status-Block:
+
+```
+[Proxy] 2 Co-Worker Hintergrund-Task(s) aktiv:
+- ⏳ cw_abc12345: Implement parser tests
+- ✅ cw_def67890: Review config.json — Rufe collect_coworker auf, um Ergebnisse abzuholen.
+```
+
+Der Co-Worker-Worker-Pool laeuft unter einem globalen Semaphore
+(`max_parallel`, default 8) — weitere dispatches queuedn automatisch, bis ein
+Slot frei wird.
+
+**Konfiguration** (`tokens.coworker` in `data/config.json` bzw. WebUI):
+
+| Key | Default | Bedeutung |
+|-----|---------|-----------|
+| `enable_fork_join` | `true` | Schalter fuer dispatch/collect (false = nur `ask_coworker`) |
+| `max_parallel` | `8` | Gleichzeitige Hintergrund-Tasks (Semaphore) |
+| `dispatch_cap_per_request` | `12` | Max. dispatches pro User-Request (Kreislaufschutz) |
+| `bg_ttl_seconds` | `1800` | Task-Lebensdauer; laufende Tasks > TTL werden expired + gecancelt |
+
+- Env-Vars: `COWORKER_FORK_JOIN`, `COWORKER_MAX_PARALLEL`, `COWORKER_DISPATCH_CAP`, `COWORKER_BG_TTL` (zu den bestehenden Co-Worker-Vars hinzu)
+
+**Voraussetzung:** `coworker`-Kategorie (single-dict wie `local`) muss auf den
+DGX-Spark-Endpoint zeigen (`api_url` + `model_name` setzen) — ohne Konfiguration
+bleibt das Feature deaktiviert (Health-Check greift nicht) und das Tool wird
+nicht injiziert.
+
+**Tests:** `tests/test_bg_store.py` (Store, TTL, Semaphore, Status-Zeile,
+Delegation-Loop) + Fork-Join-Faelle in `tests/test_stream_inject.py`
+(dispatch/collect-Streaming, mixed-turn).
 
 ## Quickstart
 
@@ -150,6 +209,10 @@ Refactore die Architektur --strong
   und `READ_LOOP_INTERVENTION` (Env oder WebUI).
 - **WebUI**: Login-gesichertes Dashboard, 4 Modell-Karten mit Test-Endpunkt,
   Live-Config-Reload via `_apply_config_file()`.
+- **Fork-Join Fabric** (v3.2): `dispatch_coworker` / `collect_coworker` fuer
+  nicht-blockierende, parallele Co-Worker-Hintergrund-Tasks mit globalem
+  Task-Store (Semaphore, TTL, Dispatch-Cap, Status-Injection) — Details im
+  Abschnitt Fork-Join Fabric.
 - **Debug-Endpoints**: `/debug/files`, `/debug/file/{id}`, `/debug/ring`,
   `/debug/active`, `/debug/cleanup` fur Payload-Inspection und
   Diagnose hangender Calls.

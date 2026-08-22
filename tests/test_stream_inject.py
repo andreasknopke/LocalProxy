@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import pytest
+import time
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -564,3 +565,227 @@ def test_local_events_mid_stream_error(monkeypatch):
     joined = "\n".join(sse)
     assert "[Proxy: Stream abgebrochen]" in joined
     assert "Connection reset" in joined
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6. _stream_local_events — Fork-Join: dispatch / collect (v3.2)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _bg_state_defaults() -> Dict[str, Any]:
+    """Gueltiger Default-Status fuer _stream_backend_turn-Mocks."""
+    return {
+        "content": "", "reasoning": "", "tool_calls": {}, "finish_reason": None,
+        "all_failed": False, "mid_stream_error": None, "error_content": None,
+        "def_idx": 0, "model": "local-model",
+    }
+
+
+def test_local_events_dispatch_streams_note_and_history(monkeypatch):
+    """Turn 1: dispatch_coworker → dispatched-Chunk + tool-result(task_id);
+    Turn 2: finale Antwort."""
+    calls = {"call_count": 0}
+
+    async def fake_backend_turn(body, category, force_start_idx, state):
+        calls["call_count"] += 1
+        state.update(_bg_state_defaults())
+        if calls["call_count"] == 1:
+            state["tool_calls"] = {
+                0: {"id": "call_d1", "type": "function",
+                    "function": {"name": "dispatch_coworker",
+                                 "arguments": '{"task": "Review file X"}'}},
+            }
+            state["finish_reason"] = "tool_calls"
+            yield proxy._format_openai_stream_chunk(
+                "local-model", content="Dispatch im Hintergrund", include_role=True,
+                chunk_id="test")
+        else:
+            state["content"] = "Endergebnis nach Fork"
+            state["finish_reason"] = "stop"
+            yield proxy._format_openai_stream_chunk(
+                "local-model", content="Endergebnis nach Fork", include_role=True,
+                chunk_id="test")
+
+    async def fake_bg(task, args):
+        task.status = "done"
+        task.result = "bg-result"
+        task.finished_at = time.time()
+
+    monkeypatch.setattr(proxy, "_stream_backend_turn", fake_backend_turn)
+    monkeypatch.setattr(proxy, "_run_bg_coworker_task", fake_bg)
+    monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", {})
+    monkeypatch.setattr(proxy, "COWORKER_FORK_JOIN", True)
+    monkeypatch.setattr(proxy, "COWORKER_ENABLED", True)
+    monkeypatch.setattr(proxy, "COWORKER_DISPATCH_CAP", 12)
+    monkeypatch.setattr(proxy, "COWORKER_MAX_DELEGATIONS", 2)
+
+    body: Dict[str, Any] = {"messages": [{"role": "user", "content": "dispatch\n--local"}]}
+    sse = _collect_sse(proxy._stream_local_events(body, "local", None))
+    joined = "\n".join(sse)
+
+    # 1) Live-Hinweis mit task_id + preview
+    assert "[Proxy] Co-Worker dispatched:" in joined
+    assert "Review file X" in joined
+    assert "cw_" in joined
+    # 2) Nächste Runde: finale Antwort
+    assert "Endergebnis nach Fork" in joined
+    assert '"finish_reason": "stop"' in joined
+    # 3) History: assistant tool_calls + tool-mini-result mit task_id
+    msgs = body["messages"]
+    tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert payload_status_ok(tool_msgs[0])
+
+
+def payload_status_ok(tool_msg):
+    data = json.loads(tool_msg["content"])
+    return (data.get("status") == "dispatched"
+            and str(data.get("task_id", "")).startswith("cw_")
+            and tool_msg.get("name") == "dispatch_coworker")
+
+
+def test_local_events_collect_streams_summary(monkeypatch):
+    """Turn 1: collect_coworker → Sammel-Chunk + JSON-summary tool-result;
+    Turn 2: finale Antwort."""
+    calls = {"call_count": 0}
+
+    async def fake_backend_turn(body, category, force_start_idx, state):
+        calls["call_count"] += 1
+        state.update(_bg_state_defaults())
+        if calls["call_count"] == 1:
+            state["tool_calls"] = {
+                0: {"id": "call_c1", "type": "function",
+                    "function": {"name": "collect_coworker",
+                                 "arguments": '{"task_ids": ["cw_1"]}'}},
+            }
+            state["finish_reason"] = "tool_calls"
+            yield proxy._format_openai_stream_chunk(
+                "local-model", content="Sammle", include_role=True, chunk_id="test")
+        else:
+            state["content"] = "alles gesammelt"
+            state["finish_reason"] = "stop"
+            yield proxy._format_openai_stream_chunk(
+                "local-model", content="alles gesammelt", include_role=True,
+                chunk_id="test")
+
+    async def fake_await(task_ids, timeout_seconds=600.0):
+        assert task_ids == ["cw_1"]
+        return [{"task_id": "cw_1", "status": "done", "result": "ergebnis-1"}]
+
+    monkeypatch.setattr(proxy, "_stream_backend_turn", fake_backend_turn)
+    monkeypatch.setattr(proxy, "_await_bg_tasks", fake_await)
+    monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", {})
+    monkeypatch.setattr(proxy, "COWORKER_FORK_JOIN", True)
+    monkeypatch.setattr(proxy, "COWORKER_ENABLED", True)
+    monkeypatch.setattr(proxy, "COWORKER_MAX_DELEGATIONS", 2)
+
+    body: Dict[str, Any] = {"messages": [{"role": "user", "content": "sammle\n--local"}]}
+    sse = _collect_sse(proxy._stream_local_events(body, "local", None))
+    joined = "\n".join(sse)
+
+    # 1) Live-Sammel-Hinweis
+    assert "[Proxy] Sammle Co-Worker-Ergebnisse" in joined
+    # 2) Nächste Runde: finale Antwort
+    assert "alles gesammelt" in joined
+    assert '"finish_reason": "stop"' in joined
+    # 3) History: assistant tool_calls + tool-result mit summaries
+    msgs = body["messages"]
+    tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0]["name"] == "collect_coworker"
+    summaries = json.loads(tool_msgs[0]["content"])
+    assert summaries[0]["task_id"] == "cw_1"
+    assert summaries[0]["result"] == "ergebnis-1"
+
+
+def test_local_events_dispatch_with_vstool_forwards(monkeypatch):
+    """dispatch + read_file im selben Turn: read_file wird an Client
+    durchgereicht (finish_reason=tool_calls), dispatch intern."""
+    async def fake_backend_turn(body, category, force_start_idx, state):
+        state.update(_bg_state_defaults())
+        state["tool_calls"] = {
+            0: {"id": "call_d1", "type": "function",
+                "function": {"name": "dispatch_coworker",
+                             "arguments": '{"task": "Hintergrundjob"}'}},
+            1: {"id": "call_r1", "type": "function",
+                "function": {"name": "read_file",
+                             "arguments": '{"filePath": "a.py"}'}},
+        }
+        state["finish_reason"] = "tool_calls"
+        yield ": keepalive\n\n"
+
+    async def fake_bg(task, args):
+        task.status = "done"
+        task.result = "ok"
+        task.finished_at = time.time()
+
+    monkeypatch.setattr(proxy, "_stream_backend_turn", fake_backend_turn)
+    monkeypatch.setattr(proxy, "_run_bg_coworker_task", fake_bg)
+    monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", {})
+    monkeypatch.setattr(proxy, "COWORKER_FORK_JOIN", True)
+    monkeypatch.setattr(proxy, "COWORKER_ENABLED", True)
+    monkeypatch.setattr(proxy, "COWORKER_DISPATCH_CAP", 12)
+    monkeypatch.setattr(proxy, "COWORKER_MAX_DELEGATIONS", 2)
+
+    body: Dict[str, Any] = {"messages": [{"role": "user", "content": "dispatch+lies\n--local"}]}
+    sse = _collect_sse(proxy._stream_local_events(body, "local", None))
+    joined = "\n".join(sse)
+
+    assert "[Proxy] Co-Worker dispatched:" in joined
+    # read_file raus, dispatch intern beantwortet
+    assert "read_file" in joined
+    assert '"finish_reason": "tool_calls"' in joined
+    # History enthält dispatch-mini-result
+    tool_msgs = [m for m in body["messages"] if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0]["name"] == "dispatch_coworker"
+
+
+def test_local_events_collect_with_vstools_hint(monkeypatch):
+    """collect + read_file: read_file wird NICHT ausgeführt, Hinweis-Message
+    + nächste Runde."""
+    calls = {"call_count": 0}
+
+    async def fake_backend_turn(body, category, force_start_idx, state):
+        calls["call_count"] += 1
+        state.update(_bg_state_defaults())
+        if calls["call_count"] == 1:
+            state["tool_calls"] = {
+                0: {"id": "call_c1", "type": "function",
+                    "function": {"name": "collect_coworker", "arguments": '{}'}},
+                1: {"id": "call_r1", "type": "function",
+                    "function": {"name": "read_file",
+                                 "arguments": '{"filePath": "a.py"}'}},
+            }
+            state["finish_reason"] = "tool_calls"
+            yield ": keepalive\n\n"
+        else:
+            state["content"] = "fertig nach hinweis"
+            state["finish_reason"] = "stop"
+            yield proxy._format_openai_stream_chunk(
+                "local-model", content="fertig nach hinweis", include_role=True,
+                chunk_id="test")
+
+    async def fake_await(task_ids, timeout_seconds=600.0):
+        return [{"task_id": "cw_1", "status": "done", "result": "r"}]
+
+    monkeypatch.setattr(proxy, "_stream_backend_turn", fake_backend_turn)
+    monkeypatch.setattr(proxy, "_await_bg_tasks", fake_await)
+    monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", {})
+    monkeypatch.setattr(proxy, "COWORKER_FORK_JOIN", True)
+    monkeypatch.setattr(proxy, "COWORKER_ENABLED", True)
+    monkeypatch.setattr(proxy, "COWORKER_MAX_DELEGATIONS", 3)
+
+    body: Dict[str, Any] = {"messages": [{"role": "user", "content": "sammel+lies\n--local"}]}
+    sse = _collect_sse(proxy._stream_local_events(body, "local", None))
+    joined = "\n".join(sse)
+
+    assert "[Proxy] Sammle Co-Worker-Ergebnisse" in joined
+    assert "fertig nach hinweis" in joined
+    # Hinweis-Message in der History (andere Tools nicht ausgefuehrt)
+    hint = [m for m in body["messages"] if m.get("role") == "user"
+            and "nicht ausgefuehrt" in m.get("content", "")]
+    assert len(hint) == 1
+    # tool-result der collect-Abfrage
+    tool_msgs = [m for m in body["messages"] if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0]["name"] == "collect_coworker"
