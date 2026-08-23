@@ -5362,6 +5362,19 @@ async def healthz(request: Request):
             }.items() if defs
         },
         "proxy_auth_enabled": PROXY_AUTH_ENABLED,
+        "coworker": {
+            "enabled": COWORKER_ENABLED,
+            "configured": _coworker_configured(),
+            "fork_join": COWORKER_FORK_JOIN,
+            "reachable": bool(_COWORKER_HEALTH_CACHE.get("reachable", False)),
+            "last_error": str(_COWORKER_HEALTH_CACHE.get("last_error", "") or ""),
+            "last_check": (
+                time.strftime("%Y-%m-%d %H:%M:%S",
+                              time.localtime(float(_COWORKER_HEALTH_CACHE.get("checked_at", 0.0))))
+                if _COWORKER_HEALTH_CACHE.get("checked_at") else None
+            ),
+            "tools_injected_when": "category=local & enabled & configured & reachable",
+        },
         "hindsight_enabled": HINDSIGHT_ENABLED,
         "hindsight_backend": "qdrant" if _hindsight._use_qdrant else "jsonl",
         "debug_enabled": DEBUG_ENABLED,
