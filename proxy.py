@@ -5305,6 +5305,8 @@ PREFILL_PROGRESS_ENABLED: bool = os.getenv(
 PREFILL_POLL_INTERVAL: float = float(os.getenv("PREFILL_POLL_INTERVAL", "1.0"))
 PREFILL_POLL_TIMEOUT: float = float(os.getenv("PREFILL_POLL_TIMEOUT", "2.0"))
 PREFILL_PROGRESS_STEP: int = int(os.getenv("PREFILL_PROGRESS_STEP", "10"))
+# Ohne bekannte Gesamt-Tokens (neues /slots-Schema): alle N Tokens emittieren
+PREFILL_TOKEN_EMIT_STEP: int = int(os.getenv("PREFILL_TOKEN_EMIT_STEP", "2000"))
 _LLAMA_CPP_PORTS: Set[int] = {
     int(p) for p in os.getenv("PREFILL_PROGRESS_PORTS", "8082").split(",")
     if p.strip().isdigit()
@@ -5350,8 +5352,17 @@ def _is_llama_cpp(cat: Dict[str, Any]) -> bool:
 def _parse_llama_slot_progress(slots: Any) -> Optional[Dict[str, Any]]:
     """Extrahiert den Prefill-Fortschritt aus einer llama.cpp /slots-Antwort.
 
-    Returns {"percent": int(0..100), "n": int, "total": int} oder None, wenn
-    kein Slot gerade am Prefill arbeitet (bzw. keine Infos vorliegen).
+    Unterstuetzung fuer BEIDE Schemata:
+      * NEU (llama.cpp >= ~2025): `is_processing` (bool), `n_prompt_tokens`
+        (= prompt.tokens.size(), wachsend = cache + processed),
+        `n_prompt_tokens_processed`, `n_prompt_tokens_cache`. KEINE Gesamt-
+        Tokens (die liefert nur der print_timing-Log, nicht die API) →
+        percent bleibt None.
+      * ALT: `state` (int), `prompt.progress`, `prompt.n_processed`,
+        `prompt.tokens` → percent kann direkt bestimmt werden.
+
+    Returns {"active": bool, "n": int, "percent": Optional[int], "total": int}
+    oder None, wenn kein Slot gerade am Prefill arbeitet (bzw. keine Infos).
     """
     if not isinstance(slots, list):
         return None
@@ -5359,41 +5370,113 @@ def _parse_llama_slot_progress(slots: Any) -> Optional[Dict[str, Any]]:
     for s in slots:
         if not isinstance(s, dict):
             continue
-        if s.get("state", 0) == 0:  # 0 = IDLE
+        # Aktiv-Erkennung: neues Schema (is_processing) vs. altes (state != 0)
+        is_proc = s.get("is_processing")
+        state = s.get("state")
+        if is_proc is not None:
+            active = bool(is_proc)
+        elif state is not None:
+            active = int(state) != 0
+        else:
             continue
+        if not active:
+            continue
+
+        n: Optional[int] = None
+        percent: Optional[int] = None
+        total: int = 0
+
         prompt = s.get("prompt")
-        if not isinstance(prompt, dict):
-            continue
-        progress = prompt.get("progress")
-        n = prompt.get("n_processed")
-        tokens = prompt.get("tokens")
-        total = len(tokens) if isinstance(tokens, list) else 0
-        if progress is None and total > 0 and isinstance(n, (int, float)):
-            progress = n / total
-        if progress is None:
-            continue
-        try:
-            progress = float(progress)
-        except (TypeError, ValueError):
-            continue
-        if progress >= 1.0:
-            continue  # Prefill fertig — es laeuft bereits die Generierung
-        pct = int(progress * 100)
-        nn = int(n) if isinstance(n, (int, float)) else 0
-        if best is None or pct > best["percent"]:
-            best = {"percent": pct, "n": nn, "total": total}
+        if isinstance(prompt, dict):
+            # ── Altes Schema ──
+            progress = prompt.get("progress")
+            n_processed = prompt.get("n_processed")
+            tokens = prompt.get("tokens")
+            total = len(tokens) if isinstance(tokens, list) else 0
+            if progress is not None:
+                try:
+                    progress = float(progress)
+                except (TypeError, ValueError):
+                    progress = None
+            if progress is None and total > 0 and isinstance(n_processed, (int, float)):
+                progress = float(n_processed) / total
+            if progress is not None:
+                if progress >= 1.0:
+                    continue  # Prefill fertig — Generierung laeuft bereits
+                percent = int(progress * 100)
+                n = int(n_processed) if isinstance(n_processed, (int, float)) else int(progress * total)
+        else:
+            # ── Neues Schema ──
+            n_tokens = s.get("n_prompt_tokens")
+            n_proc = s.get("n_prompt_tokens_processed")
+            n_cache = s.get("n_prompt_tokens_cache")
+            if isinstance(n_tokens, (int, float)) and n_tokens > 0:
+                n = int(n_tokens)  # = cache + processed (wachsend)
+            elif isinstance(n_proc, (int, float)):
+                cache = int(n_cache) if isinstance(n_cache, (int, float)) else 0
+                n = int(n_proc) + cache
+            # Gesamt-Tokens nicht in /slots → percent bleibt None
+
+        if n is None:
+            n = 0
+        if best is None or n > best.get("n", -1):
+            best = {"active": True, "n": n, "percent": percent, "total": total}
     return best
 
 
-def _prefill_progress_line(pct: int, n: int, total: int, elapsed: float) -> str:
-    parts = [f"Prefill {pct}%"]
-    if total > 0:
-        parts.append(f"{n}/{total} Tokens")
-    if pct > 0 and elapsed > 0:
-        eta = elapsed / pct * (100 - pct)
-        if eta >= 0.5:
-            parts.append(f"~{eta:.0f}s verbleibend")
+def _prefill_progress_line(n: int, total_est: Optional[int], rate: float, elapsed: float) -> str:
+    """Baut die Fortschritts-Zeile. Mit total_est → Prozent + ETA; sonst nur
+    absolute Tokens + Rate + Laufzeit."""
+    parts: List[str] = []
+    if total_est and total_est > 0:
+        pct = max(0, min(99, int(n / total_est * 100))) if n >= 0 else 0
+        parts.append(f"Prefill {pct}%")
+        parts.append(f"{n}/{total_est} Tokens")
+        if rate > 0 and n < total_est:
+            eta = (total_est - n) / rate
+            if eta >= 0.5:
+                parts.append(f"~{eta:.0f}s verbleibend")
+    else:
+        parts.append(f"Prefill: {n} Tokens")
+    if rate > 0:
+        parts.append(f"{rate:.0f} t/s")
+    parts.append(f"{elapsed:.0f}s")
     return "⏳ " + " · ".join(parts) + "\n"
+
+
+async def _estimate_prompt_tokens(payload: Dict[str, Any], client: httpx.AsyncClient,
+                                  base_url: Optional[str]) -> Optional[int]:
+    """Schaetzt die Gesamt-Prompt-Tokens ueber POST /tokenize (llama.cpp).
+
+    Tokenisiert Messages + Tools als repräsentativen Text. Das Ergebnis ist
+    eine Schaetzung (Chat-Template-Special-Tokens fehlen) — reicht fuer die
+    Prozent-Anzeige; die absolute Token-Zahl aus /slots ist exakt.
+    Returns int oder None (Endpoint nicht verfuegbar / Fehler).
+    """
+    if not base_url:
+        return None
+    parts: List[str] = []
+    msgs = payload.get("messages")
+    tools = payload.get("tools")
+    if isinstance(msgs, list):
+        parts.append(json.dumps(msgs, ensure_ascii=False))
+    if isinstance(tools, list) and tools:
+        parts.append(json.dumps(tools, ensure_ascii=False))
+    if not parts:
+        return None
+    text = "\n".join(parts)
+    try:
+        r = await client.post(base_url + "/tokenize", json={"content": text},
+                              timeout=PREFILL_POLL_TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+            tokens = data.get("tokens") if isinstance(data, dict) else None
+            if isinstance(tokens, list):
+                # kleiner Puffer fuer Chat-Template-Special-Tokens
+                return int(len(tokens) * 1.05) + 20
+    except (httpx.HTTPError, OSError, ValueError, asyncio.TimeoutError):
+        pass
+    return None
 
 
 async def _read_sse_with_prefill(
@@ -5403,6 +5486,7 @@ async def _read_sse_with_prefill(
     poll_interval: float,
     progress_step: int,
     poll_timeout: float,
+    estimated_total: Optional[int] = None,
 ) -> AsyncIterator[Tuple[str, Any]]:
     """Liest die SSE-Zeilen eines Backend-Streams und pollt parallel den
     llama.cpp /slots-Endpoint fuer den Live-Prefill-Fortschritt.
@@ -5431,7 +5515,11 @@ async def _read_sse_with_prefill(
 
     async def poller() -> None:
         last_pct = -1
-        emitted = False
+        last_n = -1
+        last_emitted_n = -1
+        last_t = started
+        rate = 0.0
+        emitted_running = False
         while not stop.is_set():
             try:
                 r = await client.get(slots_url, timeout=poll_timeout)
@@ -5442,17 +5530,40 @@ async def _read_sse_with_prefill(
                         payload = None
                     info = _parse_llama_slot_progress(payload)
                     if info:
-                        pct = info["percent"]
-                        do_emit = (pct <= 0 and not emitted) or (pct >= last_pct + progress_step)
+                        n = int(info.get("n", 0) or 0)
+                        now = time.perf_counter()
+                        dt = now - last_t
+                        if dt > 0 and last_n >= 0 and n > last_n:
+                            inst = (n - last_n) / dt
+                            rate = inst if rate <= 0 else 0.6 * rate + 0.4 * inst
+                        last_n = n
+                        last_t = now
+
+                        # Prozent: direkt aus /slots (altes Schema) ODER aus der
+                        # /tokenize-Schaetzung (neues Schema). total_known wird
+                        # fuer Anzeige + ETA genutzt.
+                        total_known = (info.get("total") or estimated_total) or None
+                        pct = info.get("percent")
+                        if pct is None and total_known and total_known > 0 and n >= 0:
+                            pct = max(0, min(99, int(n / total_known * 100)))
+
+                        do_emit = False
+                        if n <= 0 and not emitted_running:
+                            do_emit = True
+                        elif pct is not None:
+                            do_emit = pct >= last_pct + progress_step
+                        else:
+                            do_emit = (last_emitted_n < 0 or
+                                       n - last_emitted_n >= PREFILL_TOKEN_EMIT_STEP)
                         if do_emit:
-                            emitted = True
-                            last_pct = pct
-                            if pct <= 0:
+                            last_emitted_n = n
+                            last_pct = pct if pct is not None else last_pct
+                            if n <= 0:
+                                emitted_running = True
                                 text = "⏳ Prefill läuft…\n"
                             else:
                                 text = _prefill_progress_line(
-                                    pct, info["n"], info["total"],
-                                    time.perf_counter() - started)
+                                    n, total_known, rate, now - started)
                             await q.put(("progress", {"percent": pct, "content": text}))
             except (httpx.HTTPError, OSError, asyncio.TimeoutError):
                 pass
@@ -5536,6 +5647,8 @@ async def _stream_single_model_events(body: Dict[str, Any], category: str, def_i
     model = cat["model_name"]
     api_url = cat["api_url"].rstrip("/")
     api_key = cat.get("api_key", "")
+    is_llama = _is_llama_cpp(cat)
+    llama_base = _slots_base_url(api_url) if is_llama else None
     timeout = float(cat.get("timeout_seconds", 300))
     read_timeout = float(cat.get("read_timeout_seconds", timeout))
     # Streaming: Read-Timeout grosszuegig ansetzen — langsame lokale Modelle
@@ -5578,6 +5691,14 @@ async def _stream_single_model_events(body: Dict[str, Any], category: str, def_i
 
     try:
         async with httpx.AsyncClient(timeout=_http_timeout) as client:
+            # Gesamt-Prompt-Tokens schaetzen (llama.cpp /tokenize) — fuer die
+            # Prozent-Anzeige waehrend des Prefills (neues /slots-Schema hat
+            # keine Gesamt-Tokens). Einmal pro Request, non-blocking-kurz.
+            estimated_total: Optional[int] = None
+            if llama_base:
+                estimated_total = await _estimate_prompt_tokens(payload, client, llama_base)
+                if estimated_total:
+                    _log(f"Prefill-Total geschaetzt: ~{estimated_total} Tokens")
             # ── Stream oeffnen (Connect/Timeout-Retry wie non-streaming) ──
             stream_ctx = None
             entered = False
@@ -5664,13 +5785,13 @@ async def _stream_single_model_events(body: Dict[str, Any], category: str, def_i
                 # Bei llama.cpp (Port 8082): waehrend des Prefills (bevor das
                 # erste Token kommt) den /slots-Endpoint pollen und den
                 # Fortschritt als progress-Event an VS Code streamen.
-                is_llama = _is_llama_cpp(cat)
-                slots_url = (_slots_base_url(api_url) + "/slots") if is_llama else None
+                slots_url = (llama_base + "/slots") if llama_base else None
                 if slots_url:
                     _log(f"Prefill-Progress aktiv cat={category}[{def_idx}] slots={slots_url}")
                 async for kind, val in _read_sse_with_prefill(
                         response, client, slots_url,
-                        PREFILL_POLL_INTERVAL, PREFILL_PROGRESS_STEP, PREFILL_POLL_TIMEOUT):
+                        PREFILL_POLL_INTERVAL, PREFILL_PROGRESS_STEP, PREFILL_POLL_TIMEOUT,
+                        estimated_total=estimated_total):
                     if kind == "progress":
                         yield {"type": "progress",
                                "percent": val.get("percent"),

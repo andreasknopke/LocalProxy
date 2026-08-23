@@ -80,7 +80,7 @@ def _slot(state=1, progress=None, n_processed=None, tokens=None):
 
 def test_parse_slot_progress_active_with_progress_field():
     info = proxy._parse_llama_slot_progress([_slot(progress=0.5, n_processed=50, tokens=list(range(100)))])
-    assert info == {"percent": 50, "n": 50, "total": 100}
+    assert info == {"active": True, "percent": 50, "n": 50, "total": 100}
 
 
 def test_parse_slot_progress_fallback_from_n_processed():
@@ -107,6 +107,7 @@ def test_parse_slot_progress_picks_most_advanced():
     ]
     info = proxy._parse_llama_slot_progress(slots)
     assert info["percent"] == 70
+    assert info["n"] == 70
 
 
 def test_parse_slot_progress_non_list():
@@ -114,12 +115,49 @@ def test_parse_slot_progress_non_list():
     assert proxy._parse_llama_slot_progress(None) is None
 
 
+# ── 3b. _parse_llama_slot_progress — neues Schema ──────────────────────────
+
+def _slot_new(is_processing=True, n_prompt_tokens=0, n_processed=0, n_cache=0):
+    return {"id": 0, "is_processing": is_processing,
+            "n_prompt_tokens": n_prompt_tokens,
+            "n_prompt_tokens_processed": n_processed,
+            "n_prompt_tokens_cache": n_cache}
+
+
+def test_parse_slot_progress_new_schema():
+    info = proxy._parse_llama_slot_progress([_slot_new(n_prompt_tokens=57369)])
+    assert info["active"] is True
+    assert info["n"] == 57369
+    assert info["percent"] is None  # Gesamt-Tokens nicht in /slots
+    assert info["total"] == 0
+
+
+def test_parse_slot_progress_new_schema_idle():
+    assert proxy._parse_llama_slot_progress([_slot_new(is_processing=False, n_prompt_tokens=74265)]) is None
+
+
+def test_parse_slot_progress_new_schema_fallback_to_processed():
+    # n_prompt_tokens fehlt → aus processed + cache ableiten
+    info = proxy._parse_llama_slot_progress([_slot_new(n_prompt_tokens=0, n_processed=500, n_cache=100)])
+    assert info["n"] == 600
+
+
 # ── 4. _prefill_progress_line ──────────────────────────────────────────────
 
-def test_prefill_progress_line():
-    line = proxy._prefill_progress_line(40, 1234, 3080, 8.0)
+def test_prefill_progress_line_with_total():
+    # n=1234, total=3080 → 40%, rate 462 t/s
+    line = proxy._prefill_progress_line(1234, 3080, 462.0, 8.0)
     assert "Prefill 40%" in line
     assert "1234/3080" in line
+    assert "462 t/s" in line
+    assert line.endswith("\n")
+
+
+def test_prefill_progress_line_without_total():
+    line = proxy._prefill_progress_line(57369, None, 462.0, 124.0)
+    assert "57369 Tokens" in line
+    assert "462 t/s" in line
+    assert "Prefill" in line
     assert line.endswith("\n")
 
 
@@ -165,6 +203,13 @@ def _slot_payload(progress):
     }}]
 
 
+def _slot_payload_new(n_tokens):
+    return [{"id": 0, "is_processing": True,
+             "n_prompt_tokens": n_tokens,
+             "n_prompt_tokens_processed": n_tokens,
+             "n_prompt_tokens_cache": 0}]
+
+
 def test_read_sse_with_prefill_emits_progress():
     async def run():
         resp = _FakeResponse([
@@ -192,6 +237,32 @@ def test_read_sse_with_prefill_emits_progress():
     assert progress[-1].get("percent") == 100
     assert "Prefill" in progress[-1].get("content", "")
     assert any(l.startswith("data:") for l in lines)
+
+
+def test_read_sse_with_prefill_new_schema_percent():
+    async def run():
+        resp = _FakeResponse([
+            'data: {"choices":[{"delta":{"content":"hi"},"index":0}],"id":"c1"}',
+            'data: [DONE]',
+        ], delay=0.05)
+        client = _FakeClient([
+            _slot_payload_new(0),
+            _slot_payload_new(2000),
+            _slot_payload_new(5000),
+            _slot_payload_new(9000),
+        ])
+        out = []
+        async for kind, val in proxy._read_sse_with_prefill(
+                resp, client, "http://localhost:8082/slots", 0.01, 10, 1.0,
+                estimated_total=10000):
+            out.append((kind, val))
+        return out
+
+    out = asyncio.run(run())
+    progress = [v for k, v in out if k == "progress"]
+    assert progress, "erwartet Fortschritts-Events (neues Schema)"
+    assert any("90%" in v.get("content", "") for v in progress)
+    assert progress[-1].get("percent") == 100
 
 
 def test_read_sse_with_prefill_no_poll_when_slots_none():

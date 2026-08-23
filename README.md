@@ -121,10 +121,18 @@ als `reasoning_content` an VS Code (sichtbar im "Reasoning"-Panel):
 - **Mechanik**: paralleler Poller neben dem SSE-Stream; stoppt automatisch,
   sobald das erste Token eintrifft (= Prefill fertig). Kein Einfluss auf den
   Antwort-/Reasoning-Inhalt (Progress zaehlt nicht gegen das Reasoning-Cap).
+- **Neues /slots-Schema**: moderne llama.cpp-Builds liefern in `/slots` keine
+  `state`/`prompt.progress`-Felder mehr, sondern `is_processing` +
+  `n_prompt_tokens(_processed/_cache)`. Der Proxy unterstuetzt BEIDE Schemata.
+  Da das neue Schema die **Gesamt-Tokens nicht** enthaelt, wird das Total
+  einmalig per `POST /tokenize` (Messages + Tools) geschaetzt — fuer die
+  Prozent-Anzeige. Die absolute Token-Zahl aus `/slots` ist exakt und wird
+  immer mit angezeigt (bei fehlender Schaetzung: `Prefill: 57369 Tokens · 462 t/s`).
 - **Env-Vars**: `PREFILL_PROGRESS_ENABLED` (default `true`),
   `PREFILL_PROGRESS_PORTS` (default `8082`, kommasepariert),
   `PREFILL_POLL_INTERVAL` (default `1.0`s), `PREFILL_POLL_TIMEOUT` (default
-  `2.0`s), `PREFILL_PROGRESS_STEP` (default `10`%).
+  `2.0`s), `PREFILL_PROGRESS_STEP` (default `10`%), `PREFILL_TOKEN_EMIT_STEP`
+  (default `2000` Tokens, Fallback-Raster ohne bekannte Gesamt-Tokens).
 - Hinweis: `/slots` korreliert bei mehreren gleichzeitigen Requests nicht
   eindeutig mit dem eigenen Slot — fuer den typischen Ein-Nutzer-Betrieb
   (ein Request zur Zeit) reicht die Heuristik "aktivster Prefill-Slot".
