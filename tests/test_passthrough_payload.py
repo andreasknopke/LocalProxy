@@ -1500,6 +1500,43 @@ def test_inject_coworker_guidance_idempotent(monkeypatch):
     assert n == 1
 
 
+def test_inject_coworker_guidance_marker_in_tool_result_ignored(monkeypatch):
+    """REGRESSION (Turn 20260823_111957): Der Guidance-Marker in role=tool-
+    Messages (z.B. gelesener proxy.py-Quellcode mit dem Literal im String)
+    darf die Injection NICHT blockieren — der Check zaehlt nur system-Messages.
+    Vorher: has_guidance=True (False Positive) -> Guidance nie gemergt."""
+    _setup_coworker_configured(monkeypatch, fork_join=True)
+    payload = {"messages": [
+        {"role": "system", "content": "You are GitHub Copilot."},
+        {"role": "user", "content": "lies proxy.py"},
+        {"role": "tool", "tool_call_id": "t1",
+         "content": "... _COWORKER_GUIDANCE_SYSTEM (\"[PROXY DELEGATION GUIDANCE]\") ..."},
+    ]}
+    assert proxy._inject_coworker_tool(payload) is True
+    sys_msg = payload["messages"][0]["content"]
+    assert "[PROXY DELEGATION GUIDANCE]" in sys_msg  # Guidance WURDE gemergt
+    assert len(payload["messages"]) == 3  # keine zusaetzliche Message
+
+
+def test_inject_coworker_tools_present_but_no_guidance_still_merges(monkeypatch):
+    """REGRESSION: ask_coworker bereits in tools (z.B. frueherer Turn) ->
+    frueher Early-Return VOR der Guidance. Jetzt: Guidance wird trotzdem
+    gemergt, Tools werden nicht dupliziert."""
+    _setup_coworker_configured(monkeypatch, fork_join=True)
+    payload = {"messages": [
+        {"role": "system", "content": "You are GitHub Copilot."},
+        {"role": "user", "content": "hi"},
+    ], "tools": [
+        {"type": "function", "function": {"name": "read_file", "parameters": {}}},
+        {"type": "function", "function": {"name": "ask_coworker",
+                                          "parameters": {"properties": {}, "required": []}}},
+    ]}
+    assert proxy._inject_coworker_tool(payload) is True
+    names = [t["function"]["name"] for t in payload["tools"]]
+    assert names.count("ask_coworker") == 1  # kein Duplikat
+    assert "[PROXY DELEGATION GUIDANCE]" in payload["messages"][0]["content"]
+
+
 def test_inject_coworker_tool_fork_join(monkeypatch):
     """Fork-Join an -> ask + dispatch + collect werden injiziert."""
     _setup_coworker_configured(monkeypatch, fork_join=True)

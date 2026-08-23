@@ -2933,16 +2933,15 @@ def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
         tools = []
         payload["tools"] = tools
     existing = {str((t.get("function") or {}).get("name", "")) for t in tools if isinstance(t, dict)}
-    if _COWORKER_TOOL_NAME in existing:
-        return True  # bereits vorhanden
-    tools.append(copy.deepcopy(_COWORKER_TOOL_DEF))
-    if COWORKER_FORK_JOIN:
-        if _COWORKER_DISPATCH_TOOL_NAME not in existing:
-            tools.append(copy.deepcopy(_COWORKER_DISPATCH_TOOL_DEF))
-        if _COWORKER_COLLECT_TOOL_NAME not in existing:
-            tools.append(copy.deepcopy(_COWORKER_COLLECT_TOOL_DEF))
-    if "tool_choice" not in payload:
-        payload["tool_choice"] = "auto"
+    if _COWORKER_TOOL_NAME not in existing:
+        tools.append(copy.deepcopy(_COWORKER_TOOL_DEF))
+        if COWORKER_FORK_JOIN:
+            if _COWORKER_DISPATCH_TOOL_NAME not in existing:
+                tools.append(copy.deepcopy(_COWORKER_DISPATCH_TOOL_DEF))
+            if _COWORKER_COLLECT_TOOL_NAME not in existing:
+                tools.append(copy.deepcopy(_COWORKER_COLLECT_TOOL_DEF))
+        if "tool_choice" not in payload:
+            payload["tool_choice"] = "auto"
     # Bootstrap-Guidance: an die BESTEHENDE System-Message anhaengen (merge),
     # NICHT als zusaetzliche system-Message einfuegen — Qwen-/Jinja-Challenge-
     # Templates erlauben system NUR als allererste Message ("System message
@@ -2953,6 +2952,7 @@ def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
         if isinstance(messages, list):
             has_guidance = any(
                 isinstance(m, dict)
+                and m.get("role") == "system"
                 and "[PROXY DELEGATION GUIDANCE]" in str(m.get("content", ""))
                 for m in messages)
             if not has_guidance:
