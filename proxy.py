@@ -5441,7 +5441,7 @@ def _prefill_progress_line(n: int, total_est: Optional[int], rate: float, elapse
     if rate > 0:
         parts.append(f"{rate:.0f} t/s")
     parts.append(f"{elapsed:.0f}s")
-    return "⏳ " + " · ".join(parts) + "\n"
+    return "⏳ " + " · ".join(parts) + "\n\n"
 
 
 async def _estimate_prompt_tokens(payload: Dict[str, Any], client: httpx.AsyncClient,
@@ -5560,7 +5560,7 @@ async def _read_sse_with_prefill(
                             last_pct = pct if pct is not None else last_pct
                             if n <= 0:
                                 emitted_running = True
-                                text = "⏳ Prefill läuft…\n"
+                                text = "⏳ Prefill läuft…\n\n"
                             else:
                                 text = _prefill_progress_line(
                                     n, total_known, rate, now - started)
@@ -5594,7 +5594,7 @@ async def _read_sse_with_prefill(
                 if shown_any:
                     yield ("progress", {
                         "percent": 100,
-                        "content": f"⏳ Prefill 100% · {time.perf_counter() - started:.1f}s\n",
+                        "content": f"⏳ Prefill 100% · {time.perf_counter() - started:.1f}s\n\n",
                     })
             yield (kind, val)
     finally:
