@@ -223,6 +223,9 @@ Refactore die Architektur --strong
 | `GET /healthz` | Proxy-Status |
 | `GET /logs`, `GET /v1/logs` | Letzte Log-Zeilen |
 | `GET /debug/*` | Payload-Dumps + Diagnostics |
+| `GET /debug/streams` | I/O-Trace-Index: alle Turns mit Live-Analyse (s. unten) |
+| `GET /debug/streams/{turn_id}` | Vollständiges I/O eines Client-Turns (meta + events) |
+| `DELETE /debug/streams` | Alle Trace-Turns löschen (Rotation erzwingen) |
 | `/webui/` | Konfigurations-Dashboard |
 
 ## Migration von v2.x
@@ -243,6 +246,48 @@ Alle 4 Kategorien konnen via Env-Vars konfiguriert werden (Prefix je Kategorie):
 - `DEFAULT_CATEGORY` — `light` (default)
 - `PROXY_PORT`, `PROXY_AUTH_ENABLED`, `PROXY_API_KEY`
 - `HINDSIGHT_ENABLED`, `QDRANT_URL`, ...
+
+### I/O-Stream-Tracing (`data/io_traces/`)
+
+Vollständiges Full-Duplex-Logging pro Client-Turn — die empirische Basis für
+ die Frage *„Sieht das Modell die Co-Worker-Tools überhaupt / ruft es sie
+auf?“*. Pro Turn ein Verzeichnis:
+
+```
+data/io_traces/turn_<ts>_<uuid>/
+  meta.json     Turn-Metadaten + Analyse (coworker_tools_on_wire,
+                guidance_in_system, coworker_calls_seen, backend_error, ...)
+  events.jsonl  Append-Only: inbound → outbound → backend_resp →
+                client_sse → final → bg_result (komplette Bodies, ungekürzt)
+```
+
+- Via `ContextVar` bleiben auch BG-Co-Worker-Tasks dem Client-Turn zugeordnet.
+- Fail-still: Tracing darf den Proxy-Betrieb nie beeinflussen.
+- Env-Vars: `IO_TRACE_DIR` (default ./data/io_traces), `IO_TRACE_ENABLED`
+  (1), `IO_TRACE_TTL_HOURS` (24), `IO_TRACE_MAX_BYTES` (209715200),
+  `IO_TRACE_MAX_TURNS` (500), `IO_TRACE_SECONDS` (0 = unbegrenzt).
+
+**Diagnose-Workflow** (rein per HTTP-API gegen das deployed Proxy — kein SSH nötig):
+
+```powershell
+# 0. Einmalig: API-Key lokal ablegen (gitignored, nie im Repo)
+#    .env.proxy-status.local:
+#      PROXY_STATUS_API_KEY=<PROXY_API_KEY aus den Coolify-Env-Vars>
+#      PROXY_STATUS_HOST=192.168.188.134
+#      PROXY_STATUS_PORT=9001
+# 1. Statusübersicht: pro Turn Tools-on-Wire / Calls / Guidance / Errors
+.\proxy-status.ps1 -Streams 10
+# 2. Verdächtigen Turn komplett ziehen (in inbound stehen die ungekürzten
+#    Tool-Defs, die VS Code geschickt hat)
+.\proxy-status.ps1 -Turn turn_20250101_120000_000001_ab12cd
+# 3. Trace-Turns aufräumen (Rotation erzwingen)
+.\proxy-status.ps1 -ClearStreams
+```
+
+Ist `TOOLS-am-Backend` ✅ aber `CALLS=0` über viele Turns, sieht das Modell die
+Tools und ruft sie trotzdem nicht — dann liegt es am Prompt/Guidance, nicht
+am Proxy-Transport. Fehlt `TOOLS-am-Backend`, wurde die Injection nie
+ausgelöst (Kategorie/Flag-Fehler).
 
 ## Lizenz
 

@@ -19,15 +19,19 @@ Komponenten:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import copy
 import hashlib
+import itertools
 import json
 import logging
 import logging.handlers
 import os
 import re
 import secrets
+import shutil
 import sys
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -2437,6 +2441,7 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
         "category": category, "def_idx": def_idx, "model": model,
         "timeout": timeout, "messages_count": msg_count,
     })
+    io_log_outbound(payload, category, model, req_id)
     _register_debug_request(req_id, {
         "type": "model_call_start",
         "category": category, "def_idx": def_idx, "model": model,
@@ -2491,6 +2496,10 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
         duration = time.perf_counter() - started
         exc_type = type(last_exc).__name__
         exc_msg = _safe_str(last_exc)
+        io_log_backend_response(req_id, model, {
+            "error": {"type": exc_type, "message": exc_msg,
+                      "note": f"backend_error: timeout/connect nach {1+max_retries} Versuchen"}},
+            http_status=0)
         _finish_active_call(req_id, "error", {"duration_seconds": duration, "error": exc_msg,
                                                "attempts": 1 + max_retries})
         _log(f"Model ERROR cat={category}[{def_idx}] duration={duration:.1f}s type={exc_type}: {exc_msg} "
@@ -2509,6 +2518,7 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
 
         if response.status_code == 200:
             result = response.json()
+            io_log_backend_response(req_id, model, result, http_status=200)
             message = _extract_choice_message(result)
             content, reasoning_content, tool_calls = _extract_message_parts(result)
             if tool_calls:
@@ -2534,6 +2544,10 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
                 err_detail = _safe_str(err_body["error"])
         except Exception:
             err_detail = f"HTTP {response.status_code}"
+        io_log_backend_response(req_id, model, {
+            "error": {"http_status": response.status_code, "message": err_detail,
+                      "note": f"backend_error: HTTP {response.status_code}"}},
+            http_status=response.status_code)
         _log(f"Model STATUS {response.status_code} cat={category}[{def_idx}] "
              f"duration={duration:.1f}s: {err_detail}")
 
@@ -2629,6 +2643,10 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
         duration = time.perf_counter() - started
         exc_type = type(exc).__name__
         exc_msg = _safe_str(exc)
+        io_log_backend_response(req_id, model, {
+            "error": {"type": exc_type, "message": exc_msg,
+                      "note": f"backend_error: {exc_type}"}},
+            http_status=0)
         _finish_active_call(req_id, "error", {"duration_seconds": duration, "error": exc_msg})
         _log(f"Model ERROR cat={category}[{def_idx}] duration={duration:.1f}s type={exc_type}: {exc_msg}")
         return {
@@ -2637,6 +2655,9 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
             "duration_seconds": duration, "usage": None,
             "trigger_fallback": True,
         }
+
+
+# (io-trace: _call_single_model instrumentiert)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2720,6 +2741,10 @@ _COWORKER_TOOL_DEF: Dict[str, Any] = {
 # ── Fork-Join Fabric (v3.2): dispatch/collect ──────────────────────────────
 _COWORKER_DISPATCH_TOOL_NAME = "dispatch_coworker"
 _COWORKER_COLLECT_TOOL_NAME = "collect_coworker"
+
+# Für io_trace_analyze: alle Co-Worker-Tool-Namen (nach Definition gesetzt)
+_COWORKER_TOOL_NAMES = (_COWORKER_TOOL_NAME, _COWORKER_DISPATCH_TOOL_NAME,
+                        _COWORKER_COLLECT_TOOL_NAME)
 
 _COWORKER_DISPATCH_TOOL_DEF: Dict[str, Any] = {
     "type": "function",
@@ -3210,20 +3235,24 @@ async def _run_bg_coworker_task(task: CoworkerTask, tool_call_args: Dict[str, An
                 content = content[:COWORKER_RESULT_CAP] + "\n…[gekappt]"
             task.result = content
             task.status = "done"
+            io_log_bg_result(task.task_id, "done", content)
             _log(f"BG-Task {task.task_id} OK duration={duration:.1f}s len={len(content)}")
         else:
             err = result.get("content") or "unbekannter Fehler"
             task.error = _safe_str(err)
             task.status = "error"
+            io_log_bg_result(task.task_id, "error", task.error)
             _COWORKER_HEALTH_CACHE["reachable"] = False
             _log(f"BG-Task {task.task_id} FEHLER duration={duration:.1f}s: {task.error[:200]}")
     except asyncio.CancelledError:
         task.status = "expired"
         task.error = "abgebrochen (TTL/Shutdown)"
+        io_log_bg_result(task.task_id, "expired", task.error)
         raise
     except Exception as exc:
         task.error = _safe_str(exc)
         task.status = "error"
+        io_log_bg_result(task.task_id, "error", task.error)
         _log(f"BG-Task {task.task_id} EXCEPTION: {task.error[:200]}")
 
 
@@ -3872,6 +3901,403 @@ def _register_debug_request(req_id: str, info: Dict[str, Any]) -> None:
         _DEBUG_RING = _DEBUG_RING[-_DEBUG_RING_MAX:]
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# I/O-Stream-Tracing — vollständiges Full-Duplex-Logging pro Client-Turn
+# ═══════════════════════════════════════════════════════════════════════════
+# Zweck: Die alte Debug-Infrastruktur (_dump_debug_payload) schreibt nur
+# 2000-Zeichen-Previews — für die Frage "KANN das Modell die Co-Worker-Tools
+# überhaupt sehen?" unbrauchbar (Tool-Defs & Guidance wurden weggekürzt).
+# Dieses Modul schreibt stattdessen die KOMPLETTEN I/O-Streams pro Client-Turn:
+#
+#   data/io_traces/<turn_id>/meta.json     Turn-Metadaten + Live-Analyse
+#   data/io_traces/<turn_id>/events.jsonl  Append-Only Event-Stream:
+#     {"kind":"inbound",      "body":{...}}                Roher Request von VS Code (VOR jeder Mutation)
+#     {"kind":"outbound",     "model":..., "payload":{...}} Payload an Backend NACH Injection
+#     {"kind":"backend_resp", "model":..., "response":{...)|"sse":[...]}}
+#     {"kind":"client_sse",   "line":"data: ..."}          SSE, die wirklich an VS Code ging
+#     {"kind":"final",        "response":{...}}            Non-Stream-Final-Response
+#     {"kind":"bg_result",    "task_id":..., "content":...}
+#     {"kind":"note",         "text":"..."}
+#
+# - turn_id via ContextVar → _spawn()-Tasks (BG-Co-Worker) bleiben dem
+#   Client-Turn zugeordnet (ensure_future kopiert den Kontext).
+# - Append-Only JSONL + Lock: kein Read-Modify-Write, keine Korruption.
+# - io_trace_analyze() beantwortet aus dem Event-Stream die Kernfragen:
+#     coworker_tools_on_wire / guidance_in_system / coworker_calls_seen /
+#     client_tool_names / backend_error.
+# - Zeitgesteuerte Abschaltung via IO_TRACE_SECONDS (0 = dauerhaft aktiv).
+
+IO_TRACE_DIR: Path = Path(os.getenv("IO_TRACE_DIR", "./data/io_traces"))
+IO_TRACE_ENABLED: bool = os.getenv("IO_TRACE_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
+IO_TRACE_TTL_HOURS: float = float(os.getenv("IO_TRACE_TTL_HOURS", "24") or 24)
+IO_TRACE_MAX_BYTES: int = int(os.getenv("IO_TRACE_MAX_BYTES", str(200 * 1024 * 1024)))
+IO_TRACE_MAX_TURNS: int = int(os.getenv("IO_TRACE_MAX_TURNS", "500"))
+try:
+    IO_TRACE_SECONDS: float = float(os.getenv("IO_TRACE_SECONDS", "") or 0)
+except ValueError:
+    IO_TRACE_SECONDS = 0.0
+IO_TRACE_STARTED_AT: float = time.time()
+
+# ContextVar für turn_id: pro Client-Turn eine fixe Korrelations-ID
+_ctx_turn_id: contextvars.ContextVar[str] = contextvars.ContextVar("_proxy_turn_id", default="")
+
+_IO_LOCK: threading.Lock = threading.Lock()
+_IO_LAST_ROTATE: float = 0.0
+
+def io_trace_active() -> bool:
+    """True wenn I/O-Tracing aktiv ist (Env-Gate + optionales Zeitfenster)."""
+    if not IO_TRACE_ENABLED:
+        return False
+    if IO_TRACE_SECONDS > 0 and (time.time() - IO_TRACE_STARTED_AT) > IO_TRACE_SECONDS:
+        return False
+    return True
+
+
+def io_trace_get_turn() -> str:
+    return _ctx_turn_id.get()
+
+
+def io_trace_bind_turn(turn_id: str) -> None:
+    """turn_id im aktuellen Kontext setzen (für nachträglich gespawnte Tasks)."""
+    _ctx_turn_id.set(turn_id)
+
+
+def io_start_turn(category_hint: str = "") -> str:
+    """Neuen Trace-Turn öffnen: turn_id erzeugen, ContextVar setzen, meta.json
+    anlegen. Returns turn_id ('' wenn Tracing inaktiv)."""
+    if not io_trace_active():
+        _ctx_turn_id.set("")
+        return ""
+    # %f (Mikrosekunden) damit Name-Sortierung = Erzeugungs-Reihenfolge,
+    # auch wenn mehrere Turns in derselben Sekunde starten.
+    turn_id = f"turn_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:6]}"
+    _ctx_turn_id.set(turn_id)
+    try:
+        tf = IO_TRACE_DIR / turn_id
+        tf.mkdir(parents=True, exist_ok=True)
+        (tf / "meta.json").write_text(json.dumps({
+            "turn_id": turn_id,
+            "started_at": _dt.datetime.now().isoformat(),
+            "category_hint": category_hint,
+            "pid": os.getpid(),
+        }, ensure_ascii=False, indent=1), encoding="utf-8")
+        (tf / "events.jsonl").write_text("", encoding="utf-8")
+    except Exception as exc:
+        _log(f"[io-trace] FEHLER beim Anlegen des Turns: {_safe_str(exc)}")
+        _ctx_turn_id.set("")
+        return ""
+    _log(f"[io-trace] Turn {turn_id} gestartet (cat={category_hint or '?'})")
+    _io_maybe_rotate()
+    return turn_id
+
+
+def io_end_turn(extra: Optional[Dict[str, Any]] = None) -> None:
+    """Turn abschließen: finale Analyse in meta.json schreiben, ContextVar
+    zurücksetzen."""
+    turn_id = _ctx_turn_id.get()
+    if not turn_id:
+        return
+    try:
+        tf = IO_TRACE_DIR / turn_id
+        meta: Dict[str, Any] = {}
+        try:
+            meta = json.loads((tf / "meta.json").read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        if extra:
+            meta.update(extra)
+        meta["finished_at"] = _dt.datetime.now().isoformat()
+        meta["analysis"] = io_trace_analyze(turn_id)
+        (tf / "meta.json").write_text(
+            json.dumps(meta, default=str, ensure_ascii=False, indent=1),
+            encoding="utf-8")
+    except Exception as exc:
+        _log(f"[io-trace] io_end_turn Fehler: {_safe_str(exc)}")
+    finally:
+        _ctx_turn_id.set("")
+
+
+def io_log_event(**kw) -> None:
+    """Ein Event in den Turn-Event-Stream schreiben (append-only JSONL).
+    Fail-still — Tracing darf den Proxy-Betrieb NIE beeinflussen."""
+    turn_id = _ctx_turn_id.get()
+    if not turn_id or not io_trace_active() or not kw:
+        return
+    try:
+        evt = {"ts": _dt.datetime.now().isoformat(), "turn_id": turn_id}
+        evt.update(kw)
+        line = json.dumps(evt, default=str, ensure_ascii=False)
+        with _IO_LOCK:
+            with open(IO_TRACE_DIR / turn_id / "events.jsonl", "a",
+                      encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _io_body_snapshot(body: Any) -> Any:
+    """Deepcopy-Snapshot eines Bodies (best-effort; bei Fehler der Referenz)."""
+    try:
+        return copy.deepcopy(body)
+    except Exception:
+        return str(body)
+
+
+def _io_tool_names(payload: Any) -> List[str]:
+    names: List[str] = []
+    if not isinstance(payload, dict):
+        return names
+    for t in payload.get("tools") or []:
+        if isinstance(t, dict):
+            n = (t.get("function") or {}).get("name")
+            if n:
+                names.append(str(n))
+    return names
+
+
+def io_log_inbound(body: Any) -> None:
+    io_log_event(kind="inbound", body=_io_body_snapshot(body))
+
+
+def io_log_outbound(payload: Dict[str, Any], category: str, model: str,
+                    req_id: str) -> None:
+    io_log_event(kind="outbound", category=category, model=model, req_id=req_id,
+                 tool_names=_io_tool_names(payload),
+                 payload=_io_body_snapshot(payload))
+
+
+def io_log_backend_response(req_id: str, model: str, response: Any,
+                            http_status: Optional[int] = None) -> None:
+    io_log_event(kind="backend_resp", req_id=req_id, model=model,
+                 http_status=http_status, response=response)
+
+
+def io_log_client_sse(line: str) -> None:
+    io_log_event(kind="client_sse", line=line)
+
+
+def io_log_final(response_json: Any) -> None:
+    io_log_event(kind="final", response=response_json)
+
+
+def io_log_bg_result(task_id: str, status: str, content: Any) -> None:
+    io_log_event(kind="bg_result", task_id=task_id, status=status,
+                 content=content if isinstance(content, str) else str(content))
+
+
+def _io_turn_events(turn_id: str) -> List[Dict[str, Any]]:
+    """events.jsonl eines Turns lesen (parse-fehlerzeilen überspringen)."""
+    events: List[Dict[str, Any]] = []
+    try:
+        with open(IO_TRACE_DIR / turn_id / "events.jsonl", "r",
+                  encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    ev = json.loads(raw)
+                    if isinstance(ev, dict):
+                        events.append(ev)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+    except Exception:
+        pass
+    return events
+
+
+def io_trace_analyze(turn_id: str) -> Dict[str, Any]:
+    """Beantwortet aus dem Event-Stream die Kernfragen des Co-Worker-Debugs:
+
+      coworker_tools_on_wire  — waren die Co-Worker-Tools im Backend-Payload?
+      guidance_in_system      — war [PROXY DELEGATION GUIDANCE] in einer system-Message?
+      client_tool_names       — welche VS-Code-Tools waren definiert?
+      coworker_calls_seen     — hat das Modell Co-Worker-Tool-Calls emittiert?
+      backend_error           — erster Backend-Fehler (z.B. connection refused)
+    """
+    cw_names = set(_COWORKER_TOOL_NAMES) or {
+        "ask_coworker", "dispatch_coworker", "collect_coworker"}
+    analysis: Dict[str, Any] = {
+        "turn_id": turn_id,
+        "event_count": 0,
+        "coworker_tools_on_wire": False,
+        "coworker_tool_names_found": [],
+        "guidance_in_system": False,
+        "client_tool_names": [],
+        "coworker_calls_seen": 0,
+        "coworker_call_names": [],
+        "outbound_models": [],
+        "backend_error": None,
+        "finish_reasons": [],
+    }
+    seen_client_tools: Set[str] = set()
+    seen_wire_cw: Set[str] = set()
+    seen_models: List[str] = []
+    seen_cw_calls: Set[str] = set()
+    for ev in _io_turn_events(turn_id):
+        analysis["event_count"] += 1
+        kind = ev.get("kind")
+        if kind == "outbound":
+            model = str(ev.get("model") or "?")
+            if model not in seen_models:
+                seen_models.append(model)
+            for n in ev.get("tool_names") or []:
+                if n in cw_names:
+                    seen_wire_cw.add(n)
+                else:
+                    seen_client_tools.add(n)
+            payload = ev.get("payload")
+            msgs = payload.get("messages") if isinstance(payload, dict) else None
+            for m in msgs or []:
+                if isinstance(m, dict) and m.get("role") == "system" \
+                        and "[PROXY DELEGATION GUIDANCE]" in str(m.get("content", "")):
+                    analysis["guidance_in_system"] = True
+        elif kind == "backend_resp":
+            resp = ev.get("response")
+            stacks: List[Any] = []
+            if isinstance(resp, dict):
+                choices = resp.get("choices")
+                if isinstance(choices, list) and choices:
+                    msg = (choices[0] or {}).get("message") if isinstance(choices[0], dict) else None
+                    if isinstance(msg, dict) and isinstance(msg.get("tool_calls"), list):
+                        stacks.append(msg["tool_calls"])
+                if isinstance(resp.get("sse_chunks"), list):
+                    for ch in resp["sse_chunks"]:
+                        if not isinstance(ch, dict):
+                            continue
+                        # non-stream: message.tool_calls | stream: delta.tool_calls
+                        stacks.append(((ch.get("choices") or [{}])[0].get("message")
+                                       if isinstance((ch.get("choices") or [None])[0], dict)
+                                       else None) or {})
+                        d = ((ch.get("choices") or [{}])[0].get("delta")
+                             if isinstance((ch.get("choices") or [None])[0], dict) else None)
+                        if isinstance(d, dict) and isinstance(d.get("tool_calls"), list):
+                            stacks.append(d["tool_calls"])
+            for stack in stacks:
+                for tc in stack if isinstance(stack, list) else []:
+                    fn = tc.get("function") if isinstance(tc, dict) else None
+                    n = (fn or {}).get("name")
+                    if n and n in cw_names:
+                        seen_cw_calls.add(str(n))
+            if analysis["backend_error"] is None and isinstance(resp, dict) \
+                    and isinstance(resp.get("error"), dict):
+                parts = [p for p in (str(resp["error"].get(k) or "")
+                                     for k in ("message", "note")) if p]
+                analysis["backend_error"] = " | ".join(parts)[:300]
+        elif kind == "note":
+            txt = str(ev.get("text", ""))
+            if analysis["backend_error"] is None and txt.startswith("backend_error:"):
+                analysis["backend_error"] = txt[len("backend_error:"):].strip()[:300]
+    analysis["coworker_tools_on_wire"] = bool(seen_wire_cw)
+    analysis["coworker_tool_names_found"] = sorted(seen_wire_cw)
+    analysis["client_tool_names"] = sorted(seen_client_tools)
+    analysis["coworker_calls_seen"] = len(seen_cw_calls)
+    analysis["coworker_call_names"] = sorted(seen_cw_calls)
+    analysis["outbound_models"] = seen_models
+    return analysis
+
+
+def _io_maybe_rotate(force: bool = False) -> None:
+    """Rotation (TTL/Size/Turns) — throttled, max einmal pro 60s."""
+    global _IO_LAST_ROTATE
+    now = time.time()
+    if not force and (now - _IO_LAST_ROTATE) < 60:
+        return
+    _IO_LAST_ROTATE = now
+    try:
+        if not IO_TRACE_DIR.exists():
+            return
+        # 1) TTL
+        if IO_TRACE_TTL_HOURS > 0:
+            cutoff = now - IO_TRACE_TTL_HOURS * 3600
+            for entry in IO_TRACE_DIR.iterdir():
+                try:
+                    if entry.is_dir() and entry.name.startswith("turn_") \
+                            and entry.stat().st_mtime < cutoff:
+                        shutil.rmtree(entry, ignore_errors=True)
+                except Exception:
+                    pass
+        # 2) Turn-Anzahl + Gesamtgröße: älteste Turns zuerst entfernen
+        turns = sorted(
+            (e for e in IO_TRACE_DIR.iterdir()
+             if e.is_dir() and e.name.startswith("turn_")),
+            key=lambda e: e.name)  # turn_id beginnt mit Zeitstempel → Name=Alter
+        while len(turns) > IO_TRACE_MAX_TURNS:
+            oldest = turns.pop(0)
+            shutil.rmtree(oldest, ignore_errors=True)
+        if IO_TRACE_MAX_BYTES > 0:
+            def _dir_size(p: Path) -> int:
+                try:
+                    return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+                except Exception:
+                    return 0
+            total = sum(_dir_size(t) for t in turns)
+            idx = 0
+            while total > IO_TRACE_MAX_BYTES and idx < len(turns):
+                sz = _dir_size(turns[idx])
+                shutil.rmtree(turns[idx], ignore_errors=True)
+                total -= sz
+                idx += 1
+    except Exception:
+        pass
+
+
+def io_trace_turn_list() -> List[Dict[str, Any]]:
+    """Index aller Turns (neueste zuerst), angereichert mit der Meta-Analyse."""
+    out: List[Dict[str, Any]] = []
+    try:
+        if not IO_TRACE_DIR.exists():
+            return out
+        for entry in sorted(IO_TRACE_DIR.iterdir(),
+                            key=lambda e: e.name, reverse=True):
+            if not entry.is_dir() or not entry.name.startswith("turn_"):
+                continue
+            info: Dict[str, Any] = {"turn_id": entry.name}
+            try:
+                meta = json.loads((entry / "meta.json").read_text(encoding="utf-8"))
+                if isinstance(meta, dict):
+                    info = {"turn_id": entry.name, **{
+                        k: v for k, v in meta.items() if k != "analysis"}}
+            except Exception:
+                pass
+            analysis = info.get("analysis")
+            if not isinstance(analysis, dict):
+                analysis = io_trace_analyze(entry.name)
+            for k in ("coworker_tools_on_wire", "guidance_in_system",
+                      "coworker_calls_seen", "client_tool_names",
+                      "coworker_tool_names_found", "outbound_models",
+                      "backend_error", "event_count"):
+                info[k] = analysis.get(k)
+            out.append(info)
+    except Exception:
+        pass
+    return out
+
+
+async def _io_tee(gen: AsyncIterator[str],
+                  end_extra: Optional[Dict[str, Any]] = None) -> AsyncIterator[str]:
+    """Tee für SSE-Generatoren: jede an VS Code gesendete Zeile loggen und
+    am Stream-Ende den Trace-Turn abschliessen (auch bei Abbruch)."""
+    try:
+        async for sse in gen:
+            io_log_client_sse(sse)
+            yield sse
+    except asyncio.CancelledError:
+        io_log_event(kind="note", text="client_sse_cancelled")
+        io_end_turn(end_extra)
+        raise
+    except Exception as exc:
+        io_log_event(kind="note", text=f"client_sse_error: {_safe_str(exc)[:300]}")
+        io_end_turn(end_extra)
+        raise
+    finally:
+        # GeneratorExit (Client-Disconnect) landet nicht in except Exception
+        if io_trace_get_turn():
+            io_end_turn(end_extra)
+
+
 # Maximale Lebensdauer eines aktiven Calls (Sekunden). Darueber wird der
 # Call als 'stale' (verwaist) markiert und automatisch bereinigt.
 # Default: 15 Minuten — praeventiert, dass abgebrochene Tasks (Client-Disconnect)
@@ -4151,6 +4577,10 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     if "messages" not in body:
         raise HTTPException(status_code=400, detail="Invalid payload: 'messages' required.")
 
+    # I/O-Trace-Turn öffnen + Original-Inbound VOR jeder Mutation sichern
+    io_start_turn()
+    io_log_inbound(body)
+
     msgs = body.get("messages", [])
     _log(f"Request: {len(msgs)} messages, stream={body.get('stream')}, "
          f"tool_cont={_is_tool_continuation(msgs)}")
@@ -4160,6 +4590,7 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     # --reset Flag abfangen
     if _detect_reset_flag(last_user):
         _do_reset()
+        io_end_turn({"status": "reset_flag", "stream": False})
         return JSONResponse(content={
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
@@ -4247,7 +4678,8 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
 
     if body.get("stream"):
         return StreamingResponse(
-            _stream_events(body, category, force_start_idx),
+            _io_tee(_stream_events(body, category, force_start_idx),
+                    end_extra={"category": category, "stream": True, "status": "ok"}),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
                      "X-Accel-Buffering": "no"},
@@ -4276,6 +4708,9 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
 
     response_payload = _build_response_payload(body, content, [result])
     _spawn(_hindsight.retain_async(body, content))
+    io_log_final(response_payload)
+    io_end_turn({"category": category, "stream": False,
+                 "status": "ok" if not outcome.get("all_failed") else "all_failed"})
     return JSONResponse(content=response_payload)
 
 
@@ -4570,6 +5005,14 @@ async def _stream_single_model_events(body: Dict[str, Any], category: str, def_i
         "category": category, "def_idx": def_idx, "model": model,
         "timeout": timeout, "messages_count": msg_count, "streaming": True,
     })
+    io_log_outbound(payload, category, model, req_id)
+    # Gesammelte SSE-Chunks (nur wenn ein Trace-Turn aktiv ist) — wird beim
+    # done/error ins Trace geschrieben, damit tool_calls im Stream sichtbar sind.
+    _io_chunks: List[Dict[str, Any]] = []
+
+    def _io_collect(chunk: Dict[str, Any]) -> None:
+        if io_trace_active() and len(_io_chunks) < 4000:
+            _io_chunks.append(_io_body_snapshot(chunk))
     _register_debug_request(req_id, {
         "type": "model_call_start", "streaming": True,
         "category": category, "def_idx": def_idx, "model": model,
@@ -4624,6 +5067,10 @@ async def _stream_single_model_events(body: Dict[str, Any], category: str, def_i
                 duration = time.perf_counter() - started
                 exc_type = type(last_exc).__name__
                 exc_msg = _safe_str(last_exc)
+                io_log_backend_response(req_id, model, {
+                    "error": {"type": exc_type, "message": exc_msg,
+                              "note": f"backend_error: stream open failed nach {1+max_retries} Versuchen"}},
+                    http_status=0)
                 _finish_active_call(req_id, "error", {"duration_seconds": duration, "error": exc_msg,
                                                        "attempts": 1 + max_retries})
                 _log(f"Stream ERROR cat={category}[{def_idx}] duration={duration:.1f}s type={exc_type}: {exc_msg} "
@@ -4637,6 +5084,12 @@ async def _stream_single_model_events(body: Dict[str, Any], category: str, def_i
             try:
                 if response.status_code != 200:
                     err_detail = await _read_stream_error(response)
+                    duration = time.perf_counter() - started
+                    io_log_backend_response(req_id, model, {
+                        "error": {"http_status": response.status_code,
+                                  "message": err_detail,
+                                  "note": f"backend_error: HTTP {response.status_code} (stream open)"}},
+                        http_status=response.status_code)
                     duration = time.perf_counter() - started
                     _finish_active_call(req_id, "error", {"duration_seconds": duration, "error": err_detail})
                     _log(f"Stream STATUS {response.status_code} cat={category}[{def_idx}] "
@@ -4674,9 +5127,12 @@ async def _stream_single_model_events(body: Dict[str, Any], category: str, def_i
                     choices = chunk.get("choices")
                     if not isinstance(choices, list) or not choices:
                         continue
+                    _io_collect(chunk)
                     yield {"type": "chunk", "choice": choices[0]}
 
                 duration = time.perf_counter() - started
+                io_log_backend_response(req_id, model,
+                                        {"sse_chunks": _io_chunks}, http_status=200)
                 _finish_active_call(req_id, "done", {"duration_seconds": duration})
                 _log(f"Stream OK cat={category}[{def_idx}] duration={duration:.1f}s")
                 yield {"type": "done"}
@@ -4684,6 +5140,11 @@ async def _stream_single_model_events(body: Dict[str, Any], category: str, def_i
                 # Mid-Stream-Abbruch (nachdem ggf. schon Chunks geliefert wurden)
                 duration = time.perf_counter() - started
                 exc_type = type(exc).__name__
+                io_log_backend_response(req_id, model, {
+                    "sse_chunks": _io_chunks,
+                    "error": {"type": exc_type, "message": _safe_str(exc),
+                              "note": f"backend_error: mid-stream {exc_type}"}},
+                    http_status=0)
                 _finish_active_call(req_id, "error", {"duration_seconds": duration, "error": _safe_str(exc)})
                 _log(f"Stream ABBRUCH cat={category}[{def_idx}] duration={duration:.1f}s "
                      f"type={exc_type}: {_safe_str(exc)}")
@@ -5475,6 +5936,49 @@ async def debug_cleanup(request: Request):
         count = len(list(DEBUG_DIR.glob("*.json")))
     return JSONResponse(content={"status": "ok", "remaining_files": count,
                                   "max": DEBUG_MAX_FILES})
+
+
+# ── I/O-Trace-Endpoints: Beweis-Spuren pro Turn ────────────────────────────
+@app.get("/debug/streams")
+async def debug_streams(request: Request, limit: int = 50, all: bool = False):
+    """Index aller gespeicherten Turns (neueste zuerst) inkl. Analyse."""
+    await _auth_or_raise(request)
+    turns = io_trace_turn_list()
+    if not all:
+        turns = turns[:max(0, limit)]
+    return JSONResponse(content={"count": len(turns), "turns": turns})
+
+
+@app.get("/debug/streams/{turn_id}")
+async def debug_stream_detail(request: Request, turn_id: str):
+    """Voller I/O-Trace eines Turns: meta + alle Events (events.jsonl)."""
+    await _auth_or_raise(request)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", turn_id):
+        return JSONResponse(content={"error": "invalid turn_id"},
+                            status_code=400)
+    turn_dir = IO_TRACE_DIR / turn_id
+    meta: Optional[Dict[str, Any]] = None
+    try:
+        meta = json.loads((turn_dir / "meta.json").read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    events = _io_turn_events(turn_id)
+    if meta is None and not events:
+        return JSONResponse(content={"error": "turn not found"},
+                            status_code=404)
+    if isinstance(meta, dict) and "analysis" not in meta:
+        meta["analysis"] = io_trace_analyze(turn_id)
+    return JSONResponse(content={"turn_id": turn_id, "meta": meta,
+                                 "events": events})
+
+
+@app.delete("/debug/streams")
+async def debug_streams_cleanup(request: Request):
+    """Rotation erzwingen: alte Turns loeschen (TTL/Turns/Bytes-Caps)."""
+    await _auth_or_raise(request)
+    _io_maybe_rotate(force=True)
+    return JSONResponse(content={"status": "ok",
+                                 "remaining_turns": len(io_trace_turn_list())})
 
 
 # ── Webinterface mounten ───────────────────────────────────────────────────
