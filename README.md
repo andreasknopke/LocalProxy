@@ -100,6 +100,35 @@ Hinweis an das Modell zurueckgegeben (keine fragile History-Rekonstruktion)
   `COWORKER_FILES_CAP`, `COWORKER_HEALTH_INTERVAL`, `COWORKER_PROBE_TIMEOUT`,
   `COWORKER_SYSTEM_PROMPT`
 
+### Prefill-Progress-Polling (llama.cpp)
+
+Waehrend ein llama.cpp-Server den Prompt verarbeitet (Prefill) sendet er
+**keine** Tokens — ein OpenAI-Client wie VS Code zeigt in dieser Phase nur
+"Reasoning" und man weiss nicht, wie lange der Prefill noch dauert. Der Proxy
+pollt deshalb den `/slots`-Endpoint des Servers und streamt den Fortschritt
+als `reasoning_content` an VS Code (sichtbar im "Reasoning"-Panel):
+
+```
+⏳ Prefill läuft…
+⏳ Prefill 10% · 1234/12340 Tokens · ~18s verbleibend
+⏳ Prefill 40% · 4936/12340 Tokens · ~12s verbleibend
+⏳ Prefill 100% · 8.1s
+```
+
+- **Erkennung**: standardmaessig ueber **Port 8082** in der `api_url`
+  (`http://host:8082/...`) — das Erkennungsmerkmal des lokalen llama.cpp.
+  Ueberschreibbar per Modell-Flag `prefill_progress` (bool) in `config.json`.
+- **Mechanik**: paralleler Poller neben dem SSE-Stream; stoppt automatisch,
+  sobald das erste Token eintrifft (= Prefill fertig). Kein Einfluss auf den
+  Antwort-/Reasoning-Inhalt (Progress zaehlt nicht gegen das Reasoning-Cap).
+- **Env-Vars**: `PREFILL_PROGRESS_ENABLED` (default `true`),
+  `PREFILL_PROGRESS_PORTS` (default `8082`, kommasepariert),
+  `PREFILL_POLL_INTERVAL` (default `1.0`s), `PREFILL_POLL_TIMEOUT` (default
+  `2.0`s), `PREFILL_PROGRESS_STEP` (default `10`%).
+- Hinweis: `/slots` korreliert bei mehreren gleichzeitigen Requests nicht
+  eindeutig mit dem eigenen Slot — fuer den typischen Ein-Nutzer-Betrieb
+  (ein Request zur Zeit) reicht die Heuristik "aktivster Prefill-Slot".
+
 ### Fork-Join Fabric (v3.2): `dispatch_coworker` / `collect_coworker`
 
 Zusaetzlich zum blockierenden `ask_coworker` stehen drei Tools fuer parallele

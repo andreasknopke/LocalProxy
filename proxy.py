@@ -607,7 +607,8 @@ def _apply_config_file() -> None:
                     merged: Dict[str, Any] = {}
                     for field in ("label", "api_url", "api_key", "model_name", "max_tokens",
                                    "use_max_completion_tokens", "is_vision", "timeout_seconds",
-                                   "read_timeout_seconds", "retry_on_timeout", "retry_delay_seconds"):
+                                   "read_timeout_seconds", "retry_on_timeout", "retry_delay_seconds",
+                                   "prefill_progress"):
                         if field in sc:
                             val = sc[field]
                             if field in ("api_url", "api_key") and isinstance(val, str) and val.strip() == "":
@@ -618,6 +619,9 @@ def _apply_config_file() -> None:
                                 val = bool(val) if not isinstance(val, str) else \
                                     str(val).lower() in {"1", "true", "yes", "y", "on"}
                             elif field == "is_vision":
+                                val = bool(val) if not isinstance(val, str) else \
+                                    str(val).lower() in {"1", "true", "yes", "y", "on"}
+                            elif field == "prefill_progress":
                                 val = bool(val) if not isinstance(val, str) else \
                                     str(val).lower() in {"1", "true", "yes", "y", "on"}
                             elif field in ("timeout_seconds", "read_timeout_seconds", "retry_delay_seconds"):
@@ -631,7 +635,8 @@ def _apply_config_file() -> None:
                     cat = _MODEL_CATEGORIES.setdefault(key, {})
                     for field in ("label", "api_url", "api_key", "model_name", "max_tokens",
                                    "use_max_completion_tokens", "is_vision", "timeout_seconds",
-                                   "read_timeout_seconds", "retry_on_timeout", "retry_delay_seconds"):
+                                   "read_timeout_seconds", "retry_on_timeout", "retry_delay_seconds",
+                                   "prefill_progress"):
                         if field in sc:
                             val = sc[field]
                             if field in ("api_url", "api_key") and isinstance(val, str) and val.strip() == "":
@@ -642,6 +647,9 @@ def _apply_config_file() -> None:
                                 val = bool(val) if not isinstance(val, str) else \
                                     str(val).lower() in {"1", "true", "yes", "y", "on"}
                             elif field == "is_vision":
+                                val = bool(val) if not isinstance(val, str) else \
+                                    str(val).lower() in {"1", "true", "yes", "y", "on"}
+                            elif field == "prefill_progress":
                                 val = bool(val) if not isinstance(val, str) else \
                                     str(val).lower() in {"1", "true", "yes", "y", "on"}
                             elif field in ("timeout_seconds", "read_timeout_seconds", "retry_delay_seconds"):
@@ -658,7 +666,8 @@ def _apply_config_file() -> None:
                         continue
                     element: Dict[str, Any] = {}
                     for field in ("label", "api_url", "api_key", "model_name", "max_tokens",
-                                   "use_max_completion_tokens", "is_vision", "timeout_seconds"):
+                                   "use_max_completion_tokens", "is_vision", "timeout_seconds",
+                                   "prefill_progress"):
                         if field in d:
                             val = d[field]
                             if field in ("api_url", "api_key") and isinstance(val, str) and val.strip() == "":
@@ -669,6 +678,9 @@ def _apply_config_file() -> None:
                                 val = (bool(val) if not isinstance(val, str) else
                                        str(val).lower() in {"1", "true", "yes", "y", "on"})
                             elif field == "is_vision":
+                                val = (bool(val) if not isinstance(val, str) else
+                                       str(val).lower() in {"1", "true", "yes", "y", "on"})
+                            elif field == "prefill_progress":
                                 val = (bool(val) if not isinstance(val, str) else
                                        str(val).lower() in {"1", "true", "yes", "y", "on"})
                             elif field == "timeout_seconds":
@@ -5280,6 +5292,210 @@ async def _read_stream_error(response: httpx.Response) -> str:
         return f"HTTP {response.status_code}"
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# llama.cpp Prefill-Progress-Polling
+# ═══════════════════════════════════════════════════════════════════════════
+# Waehrend das lokale Modell den Prompt verarbeitet (Prefill) sendet ein
+# llama.cpp-Server KEINE Tokens — der Client sieht nur "Reasoning" und weiss
+# nicht, wie lange der Prefill noch dauert. Der Proxy pollt in dieser Phase
+# den /slots-Endpoint des Servers und streamt den Fortschritt als
+# reasoning_content an VS Code (z.B. "⏳ Prefill 40% · 1234/3080 Tokens").
+PREFILL_PROGRESS_ENABLED: bool = os.getenv(
+    "PREFILL_PROGRESS_ENABLED", "true").lower() in {"1", "true", "yes", "y", "on"}
+PREFILL_POLL_INTERVAL: float = float(os.getenv("PREFILL_POLL_INTERVAL", "1.0"))
+PREFILL_POLL_TIMEOUT: float = float(os.getenv("PREFILL_POLL_TIMEOUT", "2.0"))
+PREFILL_PROGRESS_STEP: int = int(os.getenv("PREFILL_PROGRESS_STEP", "10"))
+_LLAMA_CPP_PORTS: Set[int] = {
+    int(p) for p in os.getenv("PREFILL_PROGRESS_PORTS", "8082").split(",")
+    if p.strip().isdigit()
+}
+
+
+def _url_port(url: str) -> Optional[int]:
+    """Extrahiert den Port aus einer URL (z.B. 'http://localhost:8082/v1/...' → 8082)."""
+    m = re.search(r":(\d+)(?=/|$)", str(url))
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _slots_base_url(api_url: str) -> Optional[str]:
+    """Leitet 'http://host:port' aus einer chat/completions-URL ab."""
+    m = re.match(r"^(https?://[^/]+)", str(api_url).strip())
+    return m.group(1).rstrip("/") if m else None
+
+
+def _is_llama_cpp(cat: Dict[str, Any]) -> bool:
+    """True, wenn die Modell-Def auf einen llama.cpp-Server zeigt, dessen
+    /slots-Endpoint fuer Live-Prefill-Progress gepollt werden kann.
+
+    Prioritaet:
+      1. explizites Flag `prefill_progress` (bool) in der Def → wird respektiert
+      2. sonst Auto-Detect: api_url enthaelt einen Port aus _LLAMA_CPP_PORTS
+         (default 8082 — das Erkennungsmerkmal des lokalen llama.cpp).
+    """
+    if not PREFILL_PROGRESS_ENABLED:
+        return False
+    flag = cat.get("prefill_progress")
+    if flag is not None:
+        if isinstance(flag, bool):
+            return flag
+        return str(flag).lower() in {"1", "true", "yes", "y", "on"}
+    return _url_port(str(cat.get("api_url", ""))) in _LLAMA_CPP_PORTS
+
+
+def _parse_llama_slot_progress(slots: Any) -> Optional[Dict[str, Any]]:
+    """Extrahiert den Prefill-Fortschritt aus einer llama.cpp /slots-Antwort.
+
+    Returns {"percent": int(0..100), "n": int, "total": int} oder None, wenn
+    kein Slot gerade am Prefill arbeitet (bzw. keine Infos vorliegen).
+    """
+    if not isinstance(slots, list):
+        return None
+    best: Optional[Dict[str, Any]] = None
+    for s in slots:
+        if not isinstance(s, dict):
+            continue
+        if s.get("state", 0) == 0:  # 0 = IDLE
+            continue
+        prompt = s.get("prompt")
+        if not isinstance(prompt, dict):
+            continue
+        progress = prompt.get("progress")
+        n = prompt.get("n_processed")
+        tokens = prompt.get("tokens")
+        total = len(tokens) if isinstance(tokens, list) else 0
+        if progress is None and total > 0 and isinstance(n, (int, float)):
+            progress = n / total
+        if progress is None:
+            continue
+        try:
+            progress = float(progress)
+        except (TypeError, ValueError):
+            continue
+        if progress >= 1.0:
+            continue  # Prefill fertig — es laeuft bereits die Generierung
+        pct = int(progress * 100)
+        nn = int(n) if isinstance(n, (int, float)) else 0
+        if best is None or pct > best["percent"]:
+            best = {"percent": pct, "n": nn, "total": total}
+    return best
+
+
+def _prefill_progress_line(pct: int, n: int, total: int, elapsed: float) -> str:
+    parts = [f"Prefill {pct}%"]
+    if total > 0:
+        parts.append(f"{n}/{total} Tokens")
+    if pct > 0 and elapsed > 0:
+        eta = elapsed / pct * (100 - pct)
+        if eta >= 0.5:
+            parts.append(f"~{eta:.0f}s verbleibend")
+    return "⏳ " + " · ".join(parts) + "\n"
+
+
+async def _read_sse_with_prefill(
+    response: httpx.Response,
+    client: httpx.AsyncClient,
+    slots_url: Optional[str],
+    poll_interval: float,
+    progress_step: int,
+    poll_timeout: float,
+) -> AsyncIterator[Tuple[str, Any]]:
+    """Liest die SSE-Zeilen eines Backend-Streams und pollt parallel den
+    llama.cpp /slots-Endpoint fuer den Live-Prefill-Fortschritt.
+
+    Yields Tupel:
+      ("line", str)                       — eine Roh-Zeile des Backend-Streams
+      ("progress", {"percent", "content"}) — ein Fortschritts-Update
+
+    Das Polling stoppt, sobald die erste data:-Zeile eintrifft (= Prefill
+    fertig, Generierung beginnt); dann wird — falls zuvor Fortschritt gezeigt
+    wurde — ein finaler 100%-Event nachgereicht.
+    """
+    q: asyncio.Queue = asyncio.Queue()
+    stop: asyncio.Event = asyncio.Event()
+    started = time.perf_counter()
+
+    async def reader() -> None:
+        try:
+            async for line in response.aiter_lines():
+                await q.put(("line", line))
+            await q.put(("eof", None))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # Stream-Read-Fehler (Timeout/Connect)
+            await q.put(("error", exc))
+
+    async def poller() -> None:
+        last_pct = -1
+        emitted = False
+        while not stop.is_set():
+            try:
+                r = await client.get(slots_url, timeout=poll_timeout)
+                if r.status_code == 200:
+                    try:
+                        payload = r.json()
+                    except ValueError:
+                        payload = None
+                    info = _parse_llama_slot_progress(payload)
+                    if info:
+                        pct = info["percent"]
+                        do_emit = (pct <= 0 and not emitted) or (pct >= last_pct + progress_step)
+                        if do_emit:
+                            emitted = True
+                            last_pct = pct
+                            if pct <= 0:
+                                text = "⏳ Prefill läuft…\n"
+                            else:
+                                text = _prefill_progress_line(
+                                    pct, info["n"], info["total"],
+                                    time.perf_counter() - started)
+                            await q.put(("progress", {"percent": pct, "content": text}))
+            except (httpx.HTTPError, OSError, asyncio.TimeoutError):
+                pass
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=poll_interval)
+            except asyncio.TimeoutError:
+                pass
+
+    reader_task = asyncio.ensure_future(reader())
+    poller_task = asyncio.ensure_future(poller()) if slots_url else None
+    prefill_done = False
+    shown_any = False
+    try:
+        while True:
+            kind, val = await q.get()
+            if kind == "progress":
+                shown_any = True
+                yield (kind, val)
+                continue
+            if kind == "error":
+                raise val
+            if kind == "eof":
+                break
+            # kind == "line"
+            if poller_task is not None and not prefill_done and val.startswith("data:"):
+                prefill_done = True
+                stop.set()
+                if shown_any:
+                    yield ("progress", {
+                        "percent": 100,
+                        "content": f"⏳ Prefill 100% · {time.perf_counter() - started:.1f}s\n",
+                    })
+            yield (kind, val)
+    finally:
+        stop.set()
+        reader_task.cancel()
+        if poller_task is not None:
+            poller_task.cancel()
+            await asyncio.gather(reader_task, poller_task, return_exceptions=True)
+        else:
+            await asyncio.gather(reader_task, return_exceptions=True)
+
+
 async def _stream_single_model_events(body: Dict[str, Any], category: str, def_idx: int = 0,
                                       inject_hindsight: bool = True,
                                       force_no_thinking: bool = False) -> AsyncIterator[Dict[str, Any]]:
@@ -5445,8 +5661,23 @@ async def _stream_single_model_events(body: Dict[str, Any], category: str, def_i
                     return
 
                 # ── SSE-Stream lesen und Events weiterreichen ──
-                async for line in response.aiter_lines():
-                    line = line.strip()
+                # Bei llama.cpp (Port 8082): waehrend des Prefills (bevor das
+                # erste Token kommt) den /slots-Endpoint pollen und den
+                # Fortschritt als progress-Event an VS Code streamen.
+                is_llama = _is_llama_cpp(cat)
+                slots_url = (_slots_base_url(api_url) + "/slots") if is_llama else None
+                if slots_url:
+                    _log(f"Prefill-Progress aktiv cat={category}[{def_idx}] slots={slots_url}")
+                async for kind, val in _read_sse_with_prefill(
+                        response, client, slots_url,
+                        PREFILL_POLL_INTERVAL, PREFILL_PROGRESS_STEP, PREFILL_POLL_TIMEOUT):
+                    if kind == "progress":
+                        yield {"type": "progress",
+                               "percent": val.get("percent"),
+                               "content": val.get("content", "")}
+                        continue
+                    # kind == "line"
+                    line = val.strip()
                     if not line.startswith("data:"):
                         continue
                     data = line[len("data:"):].strip()
@@ -5580,6 +5811,8 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
                             await queue.put(ev)
                         elif ev_type == "usage":
                             await queue.put(ev)
+                        elif ev_type == "progress":
+                            await queue.put(ev)
                         elif ev_type == "done":
                             # Erfolg: aktiven Index merken (wie non-streaming Fallback)
                             _CATEGORY_ACTIVE_IDX[category] = idx
@@ -5621,6 +5854,15 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
                 if ev_type == "usage":
                     if isinstance(ev.get("usage"), dict):
                         state["usage"] = ev["usage"]
+                    continue
+                if ev_type == "progress":
+                    text = ev.get("content") or ""
+                    if text:
+                        yield _format_openai_stream_chunk(
+                            state.get("model", category), reasoning_content=text,
+                            include_role=not state.get("role_sent"),
+                            chunk_id=state.get("stream_id"))
+                        state["role_sent"] = True
                     continue
                 if ev_type != "chunk":
                     continue
