@@ -2406,7 +2406,8 @@ def _inject_local_anti_loop_system(messages: List[Dict[str, Any]]) -> None:
     _log("Local-Anti-Loop-System-Prompt injiziert")
 
 
-def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int = 0) -> Dict[str, Any]:
+def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int = 0,
+                               force_no_thinking: bool = False) -> Dict[str, Any]:
     defs = _model_defs(category)
     cat = defs[def_idx] if defs and def_idx < len(defs) else _model_defs("light")[0]
     payload = copy.deepcopy(body)
@@ -2435,6 +2436,16 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
 
     _patch_max_tokens_payload(payload, cat)
     _patch_reasoning_effort_payload(payload, cat)
+
+    # Reasoning-Restart: Thinking fuer den Folgeturn erzwingen AUS (Modell soll
+    # direkt antworten statt erneut endlos zu denken). Qwen3-/vLLM-Templates
+    # respektieren chat_template_kwargs.enable_thinking=false.
+    if force_no_thinking:
+        payload["chat_template_kwargs"] = {
+            "enable_thinking": False,
+            "preserve_thinking": False,
+        }
+        _log("Reasoning-Restart: enable_thinking=false fuer Folgeturn gesetzt")
 
     # Co-Worker-Delegation: ask_coworker-Tool nur bei Kategorie=local + Health-OK
     if category == "local":
@@ -5231,7 +5242,8 @@ async def _read_stream_error(response: httpx.Response) -> str:
 
 
 async def _stream_single_model_events(body: Dict[str, Any], category: str, def_idx: int = 0,
-                                      inject_hindsight: bool = True) -> AsyncIterator[Dict[str, Any]]:
+                                      inject_hindsight: bool = True,
+                                      force_no_thinking: bool = False) -> AsyncIterator[Dict[str, Any]]:
     """Streaming-Backend-Call (OpenAI-SSE) fuer EIN Modell. Yields Events:
       {"type": "chunk", "choice": <choices[0]>}   — pro SSE-Chunk
       {"type": "done"}                            — Stream sauber beendet
@@ -5251,7 +5263,8 @@ async def _stream_single_model_events(body: Dict[str, Any], category: str, def_i
     cat = defs[def_idx]
     started = time.perf_counter()
 
-    payload = _build_passthrough_payload(body, category, def_idx=def_idx)
+    payload = _build_passthrough_payload(body, category, def_idx=def_idx,
+                                         force_no_thinking=force_no_thinking)
     payload["stream"] = True
 
     messages = payload.get("messages", [])
@@ -5470,6 +5483,7 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
     reasoning_cap = max(0, REASONING_CAP_CHARS)
     cap_mode = REASONING_CAP_MODE if REASONING_CAP_MODE in ("note", "restart") else "note"
     restarts_left = REASONING_CAP_MAX_RESTARTS if cap_mode == "restart" else 0
+    is_restart_turn = False  # True ab dem 2. Anlauf (Thinking dann erzwungen AUS)
 
     while True:
         restart_requested = False
@@ -5504,7 +5518,8 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
                 state["model"] = defs[idx].get("model_name", "?")
                 state["def_idx"] = idx
                 try:
-                    async for ev in _stream_single_model_events(body, category, idx):
+                    async for ev in _stream_single_model_events(
+                            body, category, idx, force_no_thinking=is_restart_turn):
                         ev_type = ev.get("type") if isinstance(ev, dict) else None
                         if ev_type == "chunk":
                             forwarded = True
@@ -5651,9 +5666,22 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
             msgs = body.get("messages")
             if isinstance(msgs, list):
                 msgs.append({"role": "user", "content": REASONING_CAP_RESTART_HINT})
+            is_restart_turn = True  # ab jetzt Thinking erzwungen AUS
             _log(f"Reasoning-Restart: Backend-Stream abgebrochen, Folgeturn mit "
                  f"Anti-Loop-Hinweis (Restarts uebrig={restarts_left})")
             continue
+
+        # ── Restart erschoepft: kein leerer Turn ("sorry no response") ──
+        # Das Modell hat trotz Folgeturn wieder nur gedacht — wir liefern einen
+        # sauberen Abschluss statt einer leeren Antwort.
+        if restart_requested and not (state.get("content") or "").strip():
+            fallback = (
+                "\n\n[Proxy] Das Modell hat wiederholt nur nachgedacht, ohne "
+                "eine Antwort oder Tool-Calls zu liefern. Bitte stelle die "
+                "Anfrage konkreter oder versuche es erneut."
+            )
+            state["content"] = (state.get("content") or "") + fallback
+            _log("Reasoning-Restart erschoepft — Fallback-Antwort injiziert")
         break
 
 

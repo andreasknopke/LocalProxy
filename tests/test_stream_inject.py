@@ -156,7 +156,7 @@ def test_coworker_task_preview_fallback():
 # ═══════════════════════════════════════════════════════════════════════════
 
 def test_backend_turn_streams_reasoning_and_content(monkeypatch):
-    async def fake_single(body, category, def_idx, inject_hindsight=True):
+    async def fake_single(body, category, def_idx, inject_hindsight=True, force_no_thinking=False):
         yield {"type": "chunk", "choice": {"delta": {"role": "assistant", "reasoning_content": "Ich denke "}, "finish_reason": None}}
         yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "weiter"}, "finish_reason": None}}
         yield {"type": "chunk", "choice": {"delta": {"content": "Antwort"}, "finish_reason": None}}
@@ -179,7 +179,7 @@ def test_backend_turn_streams_reasoning_and_content(monkeypatch):
 
 
 def test_backend_turn_emits_keepalive_when_backend_slow(monkeypatch):
-    async def fake_single(body, category, def_idx, inject_hindsight=True):
+    async def fake_single(body, category, def_idx, inject_hindsight=True, force_no_thinking=False):
         await asyncio.sleep(0.25)  # laenger als der (gekuerzte) Keepalive-Intervall
         yield {"type": "chunk", "choice": {"delta": {"content": "A"}, "finish_reason": None}}
         await asyncio.sleep(0.25)
@@ -199,7 +199,7 @@ def test_backend_turn_reasoning_cap_stops_and_injects_note(monkeypatch):
     einmalig eine Abschluss-Aufforderung als content injiziert."""
     monkeypatch.setattr(proxy, "REASONING_CAP_CHARS", 10)
 
-    async def fake_single(body, category, def_idx, inject_hindsight=True):
+    async def fake_single(body, category, def_idx, inject_hindsight=True, force_no_thinking=False):
         yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "0123456789"}, "finish_reason": None}}
         yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "XX"}, "finish_reason": None}}
         yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "YY"}, "finish_reason": None}}
@@ -231,7 +231,7 @@ def test_backend_turn_reasoning_cap_disabled_by_default(monkeypatch):
     """REASONING_CAP_CHARS=0 (Default) -> kein Cap, alles fliesst durch."""
     monkeypatch.setattr(proxy, "REASONING_CAP_CHARS", 0)
 
-    async def fake_single(body, category, def_idx, inject_hindsight=True):
+    async def fake_single(body, category, def_idx, inject_hindsight=True, force_no_thinking=False):
         yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "0123456789"}, "finish_reason": None}}
         yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "XX"}, "finish_reason": None}}
         yield {"type": "chunk", "choice": {"delta": {"content": "A"}, "finish_reason": None}}
@@ -255,7 +255,7 @@ def test_backend_turn_reasoning_cap_restart_mode(monkeypatch):
 
     captured_messages = []
 
-    async def fake_single(body, category, def_idx, inject_hindsight=True):
+    async def fake_single(body, category, def_idx, inject_hindsight=True, force_no_thinking=False):
         captured_messages.append([dict(m) for m in (body.get("messages") or [])])
         if len(captured_messages) == 1:
             # Erste Runde: endlos Reasoning, ueber das Cap hinaus.
@@ -290,14 +290,15 @@ def test_backend_turn_reasoning_cap_restart_mode(monkeypatch):
 
 
 def test_backend_turn_reasoning_cap_restart_exhausted_aborts(monkeypatch):
-    """Restart-Mode mit 0 Restarts: Turn endet nach Abbruch (kein Neustart)."""
+    """Restart-Mode mit 0 Restarts: Turn endet nach Abbruch, aber mit
+    Graceful-Fallback statt leer ("sorry no response")."""
     monkeypatch.setattr(proxy, "REASONING_CAP_CHARS", 10)
     monkeypatch.setattr(proxy, "REASONING_CAP_MODE", "restart")
     monkeypatch.setattr(proxy, "REASONING_CAP_MAX_RESTARTS", 0)
 
     call_count = {"n": 0}
 
-    async def fake_single(body, category, def_idx, inject_hindsight=True):
+    async def fake_single(body, category, def_idx, inject_hindsight=True, force_no_thinking=False):
         call_count["n"] += 1
         for _ in range(3):
             yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "0123456789"}, "finish_reason": None}}
@@ -308,10 +309,58 @@ def test_backend_turn_reasoning_cap_restart_exhausted_aborts(monkeypatch):
     state: Dict[str, Any] = {"stream_id": "test-stream", "role_sent": False}
     sse = _collect_sse(proxy._stream_backend_turn({"messages": []}, "local", None, state))
 
-    joined = "\n".join(sse)
-    # Nur EIN Aufruf (kein Restart), kein finaler content.
+    # Nur EIN Aufruf (kein Restart).
     assert call_count["n"] == 1
-    assert "Endlich" not in joined
+    # Kein leerer Turn — Fallback-Antwort wurde injiziert.
+    assert "nur nachgedacht" in state["content"]
+
+
+def test_backend_turn_reasoning_cap_restart_forces_no_thinking(monkeypatch):
+    """Der Folgeturn (2. Anlauf) erzwingt Thinking=AUS (force_no_thinking=True)."""
+    monkeypatch.setattr(proxy, "REASONING_CAP_CHARS", 10)
+    monkeypatch.setattr(proxy, "REASONING_CAP_MODE", "restart")
+    monkeypatch.setattr(proxy, "REASONING_CAP_MAX_RESTARTS", 1)
+
+    seen_flags = []
+
+    async def fake_single(body, category, def_idx, inject_hindsight=True, force_no_thinking=False):
+        seen_flags.append(force_no_thinking)
+        if len(seen_flags) == 1:
+            for _ in range(3):
+                yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "0123456789"}, "finish_reason": None}}
+            await asyncio.Event().wait()
+            yield {"type": "done"}
+        else:
+            yield {"type": "chunk", "choice": {"delta": {"content": "Direkt geantwortet"}, "finish_reason": None}}
+            yield {"type": "chunk", "choice": {"delta": {}, "finish_reason": "stop"}}
+            yield {"type": "done"}
+
+    monkeypatch.setattr(proxy, "_stream_single_model_events", fake_single)
+    state: Dict[str, Any] = {"stream_id": "test-stream", "role_sent": False}
+    _collect_sse(proxy._stream_backend_turn({"messages": []}, "local", None, state))
+
+    # Erster Turn: Thinking normal (False). Folgeturn: Thinking erzwungen aus (True).
+    assert seen_flags == [False, True]
+    assert state["content"].endswith("Direkt geantwortet")
+
+
+def test_build_passthrough_payload_force_no_thinking_sets_chat_template(monkeypatch):
+    """_build_passthrough_payload setzt bei force_no_thinking chat_template_kwargs."""
+    monkeypatch.setattr(proxy, "_MODEL_CATEGORIES", {
+        **proxy._MODEL_CATEGORIES,
+        "local": {"api_url": "http://x/v1", "api_key": "", "model_name": "m",
+                  "max_tokens": 4096, "is_vision": False},
+    })
+    monkeypatch.setattr(proxy, "COWORKER_ENABLED", False)
+    p = proxy._build_passthrough_payload(
+        {"messages": [{"role": "user", "content": "hi"}]},
+        "local", 0, force_no_thinking=True)
+    assert p["chat_template_kwargs"] == {"enable_thinking": False, "preserve_thinking": False}
+
+    p2 = proxy._build_passthrough_payload(
+        {"messages": [{"role": "user", "content": "hi"}]},
+        "local", 0, force_no_thinking=False)
+    assert "chat_template_kwargs" not in p2
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -363,7 +412,7 @@ def test_split_think_chunk_across_boundaries():
 def test_backend_turn_maps_think_tags_to_reasoning(monkeypatch):
     """Qwen3/vLLM liefert Reasoning als <think>...</think> im content — der
     Proxy muss das als reasoning_content an VS Code mappen (Issue 2)."""
-    async def fake_single(body, category, def_idx, inject_hindsight=True):
+    async def fake_single(body, category, def_idx, inject_hindsight=True, force_no_thinking=False):
         yield {"type": "chunk", "choice": {"delta": {"content": "Start <thi"}, "finish_reason": None}}
         yield {"type": "chunk", "choice": {"delta": {"content": "nk>ueberleg"}, "finish_reason": None}}
         yield {"type": "chunk", "choice": {"delta": {"content": "en</think>Antwort"}, "finish_reason": None}}
@@ -388,7 +437,7 @@ def test_backend_turn_maps_think_tags_to_reasoning(monkeypatch):
 def test_backend_turn_prefers_explicit_reasoning_field(monkeypatch):
     """Wenn das Backend reasoning_content liefert, wird content NICHT nochmal
     als <think> geparst (kein Doppel-Reasoning)."""
-    async def fake_single(body, category, def_idx, inject_hindsight=True):
+    async def fake_single(body, category, def_idx, inject_hindsight=True, force_no_thinking=False):
         yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "explizit"}, "finish_reason": None}}
         yield {"type": "chunk", "choice": {"delta": {"content": "Antwort <think>fake</think>"}, "finish_reason": None}}
         yield {"type": "done"}
@@ -410,7 +459,7 @@ def test_backend_turn_prefers_explicit_reasoning_field(monkeypatch):
 def test_coworker_phase_streams_reasoning_live(monkeypatch):
     """Das reasoning_content des Co-Workers wird als eigener Reasoning-Context
     live an VS Code gestreamt; die Antwort landet in den tool results."""
-    async def fake_single(body, category, def_idx, inject_hindsight=True):
+    async def fake_single(body, category, def_idx, inject_hindsight=True, force_no_thinking=False):
         assert category == "coworker"
         assert inject_hindsight is False
         yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "Co-Worker denkt "}, "finish_reason": None}}
@@ -445,7 +494,7 @@ def test_coworker_phase_streams_reasoning_live(monkeypatch):
 def test_coworker_phase_streams_think_tags_live(monkeypatch):
     """Co-Worker mit <think>-Tags im content (vLLM Qwen3): Reasoning wird als
     reasoning_content gemappt und gestreamt, Antwort-Content streamt live."""
-    async def fake_single(body, category, def_idx, inject_hindsight=True):
+    async def fake_single(body, category, def_idx, inject_hindsight=True, force_no_thinking=False):
         yield {"type": "chunk", "choice": {"delta": {"content": "<think>ueberleg</think>Ergebnis"}, "finish_reason": None}}
         yield {"type": "done"}
 
@@ -469,7 +518,7 @@ def test_coworker_phase_streams_think_tags_live(monkeypatch):
 
 def test_coworker_phase_streams_error(monkeypatch):
     """Fehler beim Co-Worker werden ebenfalls live sichtbar gestreamt."""
-    async def fake_single(body, category, def_idx, inject_hindsight=True):
+    async def fake_single(body, category, def_idx, inject_hindsight=True, force_no_thinking=False):
         yield {"type": "error", "status_code": 500, "content": "Model kaputt",
                "trigger_fallback": True}
 
@@ -519,7 +568,7 @@ def test_local_events_strips_coworker_reasoning_from_history(monkeypatch):
             yield proxy._format_openai_stream_chunk("local-model", content="Endergebnis",
                                                     include_role=True, chunk_id="test")
 
-    async def fake_single(body, category, def_idx, inject_hindsight=True):
+    async def fake_single(body, category, def_idx, inject_hindsight=True, force_no_thinking=False):
         yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "denkt"}, "finish_reason": None}}
         yield {"type": "chunk", "choice": {"delta": {"content": "Antwort"}, "finish_reason": None}}
         yield {"type": "done"}
