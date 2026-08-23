@@ -517,6 +517,51 @@ AGENT_RUNNER_TOKEN: str = os.getenv("AGENT_RUNNER_TOKEN", "")
 # Wie lange ein offener Tool-Call im Queue auf Abholung/Antwort warten darf.
 AGENT_TOOL_TIMEOUT: float = float(os.getenv("AGENT_TOOL_TIMEOUT", "120"))
 
+# ── Reasoning-Cap (optional) ──────────────────────────────────────────────
+# Reasoning-Modelle (Qwen3 etc.) neigen zu Endlos-Denkschleifen: Sie denken
+# minutenlang, emittieren nie content/tool_calls und der Client bricht ab.
+# Das Cap begrenzt das reasoning_content pro Stream-Turn auf N Zeichen. Wird
+# es ueberschritten, stoppt der Proxy das Weiterleiten von Reasoning und
+# injiziert eine Aufforderung zum Abschluss — ab dann wird nur noch content
+# durchgereicht. 0 = deaktiviert (Default).
+REASONING_CAP_CHARS: int = int(os.getenv("REASONING_CAP_CHARS", "0"))
+REASONING_CAP_NOTE: str = (
+    "\n\n[Proxy] Reasoning-Limit erreicht — schließe dein Denken jetzt ab und "
+    "liefere die konkrete Antwort bzw. Tool-Calls.")
+# Modus des Reasoning-Caps:
+#   "note"    (Default) weiches Cap: Reasoning wird ab Limit nicht mehr
+#             geforwarded, einmalige Abschluss-Aufforderung als content, der
+#             laufende Backend-Stream läuft aber weiter.
+#   "restart" hartes Cap: der laufende Backend-Stream wird beim Limit
+#             ABGEBROCHEN und ein Folgeturn mit Anti-Loop-Hinweis gestartet —
+#             beendet das Denk-Looping wirklich, liefert aber trotzdem eine
+#             Antwort (kein leerer Turn).
+REASONING_CAP_MODE: str = os.getenv("REASONING_CAP_MODE", "note").strip().lower()
+REASONING_CAP_MAX_RESTARTS: int = int(os.getenv("REASONING_CAP_MAX_RESTARTS", "1"))
+REASONING_CAP_RESTART_HINT: str = (
+    "[Proxy] Du hast im vorherigen Anlauf zu lange nachgedacht, ohne eine "
+    "Antwort oder Tool-Calls zu liefern. Höre jetzt SOFORT mit dem Denken auf "
+    "(keine <think>-Blöcke mehr) und liefere direkt und konkret: entweder die "
+    "fertige Antwort oder die nötigen Tool-Calls.")
+
+
+def _reasoning_forward(accumulated_len: int, delta_len: int, cap: int) -> Tuple[Optional[int], bool]:
+    """Bestimmt fuer ein Reasoning-Delta, wie viele Zeichen noch an den Client
+    gehen duerfen (0 = komplett verwerfen) und ob jetzt die Abschluss-
+    Aufforderung injiziert werden muss. accumulated_len ist die LAENGE NACH
+    dem Anhaengen dieses Deltas (state['reasoning'])."""
+    if cap <= 0:
+        return delta_len, False
+    before = accumulated_len - delta_len
+    if before >= cap:
+        # Bereits am/ueber Limit — Delta komplett verwerfen, Note (einmal) feuern
+        return 0, True
+    room = cap - before
+    if delta_len > room:
+        # Dieses Delta ueberschreitet das Limit — kuerzen + Note feuern
+        return room, True
+    return delta_len, False
+
 
 # ── Laguna-S-2.1 Modell-Erkennung ─────────────────────────────────────────
 # Loop-Schutz (Read/Search/Generic/Response) und Sampling-Patches gelten
@@ -672,6 +717,12 @@ def _apply_config_file() -> None:
 
     global TOOL_RESULT_CAP
     TOOL_RESULT_CAP = int(cfg.get("tokens", {}).get("tool_result_cap", TOOL_RESULT_CAP))
+
+    global REASONING_CAP_CHARS, REASONING_CAP_MODE, REASONING_CAP_MAX_RESTARTS
+    REASONING_CAP_CHARS = int(cfg.get("tokens", {}).get("reasoning_cap_chars", REASONING_CAP_CHARS))
+    REASONING_CAP_MODE = str(cfg.get("tokens", {}).get("reasoning_cap_mode", REASONING_CAP_MODE)).strip().lower()
+    REASONING_CAP_MAX_RESTARTS = int(cfg.get("tokens", {}).get(
+        "reasoning_cap_max_restarts", REASONING_CAP_MAX_RESTARTS))
 
     global READ_LOOP_THRESHOLD, READ_LOOP_INTERVENTION
     global READ_LOOP_FILE_THRESHOLD, READ_LOOP_FILE_WINDOW, READ_LOOP_FILE_KEEP
@@ -5409,7 +5460,6 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
         "def_idx": 0, "model": category,
         "has_explicit_reasoning": False,
     })
-    think_state: Dict[str, Any] = {"in_think": False, "pending": ""}
 
     defs = _model_defs(category)
     if not defs:
@@ -5417,133 +5467,194 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
         state["error_content"] = f"Kategorie '{category}' hat keine konfigurierten Modelle"
         return
 
-    start_idx = force_start_idx if force_start_idx is not None else _CATEGORY_ACTIVE_IDX.get(category, 0)
-    if start_idx >= len(defs):
-        start_idx = 0
-    indices: List[int] = [start_idx] + [i for i in range(len(defs)) if i != start_idx]
+    reasoning_cap = max(0, REASONING_CAP_CHARS)
+    cap_mode = REASONING_CAP_MODE if REASONING_CAP_MODE in ("note", "restart") else "note"
+    restarts_left = REASONING_CAP_MAX_RESTARTS if cap_mode == "restart" else 0
 
-    queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+    while True:
+        restart_requested = False
+        # Transient-Reset je Turn — content bleibt ueber Restarts hinweg erhalten
+        # (die abgebrochene Reasoning-Phase hat typischerweise noch keinen content).
+        saved_content = state.get("content", "")
+        state.update({
+            "reasoning": "", "tool_calls": {},
+            "finish_reason": None, "all_failed": False,
+            "mid_stream_error": None, "error_content": None,
+            "has_explicit_reasoning": False,
+        })
+        state["content"] = saved_content
+        think_state: Dict[str, Any] = {"in_think": False, "pending": ""}
+        cap_triggered = False
 
-    async def worker() -> None:
-        """Liest Events vom Backend und legt sie in die Queue.
-        Fallback: Pre-Stream-Fehler → naechstes def probieren."""
-        last_err: Optional[Dict[str, Any]] = None
-        for idx in indices:
-            if idx != start_idx and _is_in_cooldown(category, idx):
-                continue
-            forwarded = False
-            state["model"] = defs[idx].get("model_name", "?")
-            state["def_idx"] = idx
-            try:
-                async for ev in _stream_single_model_events(body, category, idx):
-                    ev_type = ev.get("type") if isinstance(ev, dict) else None
-                    if ev_type == "chunk":
-                        forwarded = True
-                        await queue.put(ev)
-                    elif ev_type == "done":
-                        # Erfolg: aktiven Index merken (wie non-streaming Fallback)
-                        _CATEGORY_ACTIVE_IDX[category] = idx
-                        await queue.put(ev)
-                        return
-                    elif ev_type == "error":
-                        last_err = ev
-                        if forwarded:
-                            state["mid_stream_error"] = ev.get("content", "Stream-Fehler")
-                            await queue.put({"type": "__end__"})
+        start_idx = force_start_idx if force_start_idx is not None else _CATEGORY_ACTIVE_IDX.get(category, 0)
+        if start_idx >= len(defs):
+            start_idx = 0
+        indices: List[int] = [start_idx] + [i for i in range(len(defs)) if i != start_idx]
+
+        queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+
+        async def worker() -> None:
+            """Liest Events vom Backend und legt sie in die Queue.
+            Fallback: Pre-Stream-Fehler → naechstes def probieren."""
+            last_err: Optional[Dict[str, Any]] = None
+            for idx in indices:
+                if idx != start_idx and _is_in_cooldown(category, idx):
+                    continue
+                forwarded = False
+                state["model"] = defs[idx].get("model_name", "?")
+                state["def_idx"] = idx
+                try:
+                    async for ev in _stream_single_model_events(body, category, idx):
+                        ev_type = ev.get("type") if isinstance(ev, dict) else None
+                        if ev_type == "chunk":
+                            forwarded = True
+                            await queue.put(ev)
+                        elif ev_type == "done":
+                            # Erfolg: aktiven Index merken (wie non-streaming Fallback)
+                            _CATEGORY_ACTIVE_IDX[category] = idx
+                            await queue.put(ev)
                             return
-                        break  # Pre-Stream-Fehler → naechstes def
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                _log(f"Stream-Turn EXCEPTION cat={category} idx={idx}: {_safe_str(exc)}")
-                last_err = {"type": "error", "status_code": None,
-                            "content": _safe_str(exc), "trigger_fallback": True}
-                break
-        # Alle defs fehlgeschlagen (vor Stream-Beginn)
-        state["all_failed"] = True
-        state["error_content"] = (last_err or {}).get("content", "Unbekannter Stream-Fehler")
-        await queue.put({"type": "__end__"})
+                        elif ev_type == "error":
+                            last_err = ev
+                            if forwarded:
+                                state["mid_stream_error"] = ev.get("content", "Stream-Fehler")
+                                await queue.put({"type": "__end__"})
+                                return
+                            break  # Pre-Stream-Fehler → naechstes def
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    _log(f"Stream-Turn EXCEPTION cat={category} idx={idx}: {_safe_str(exc)}")
+                    last_err = {"type": "error", "status_code": None,
+                                "content": _safe_str(exc), "trigger_fallback": True}
+                    break
+            # Alle defs fehlgeschlagen (vor Stream-Beginn)
+            state["all_failed"] = True
+            state["error_content"] = (last_err or {}).get("content", "Unbekannter Stream-Fehler")
+            await queue.put({"type": "__end__"})
 
-    task = asyncio.ensure_future(worker())
-    try:
-        while True:
-            try:
-                ev = await asyncio.wait_for(queue.get(), timeout=_STREAM_KEEPALIVE_INTERVAL)
-            except asyncio.TimeoutError:
-                # Modell arbeitet noch, aber es kommt gerade kein Token —
-                # SSE-Kommentar haelt die VS-Code-Verbindung am Leben.
-                yield ": keepalive\n\n"
-                continue
-
-            ev_type = ev.get("type") if isinstance(ev, dict) else None
-            if ev_type in ("done", "__end__"):
-                break
-            if ev_type != "chunk":
-                continue
-
-            choice = ev.get("choice") or {}
-            delta = choice.get("delta") or {}
-            if choice.get("finish_reason"):
-                state["finish_reason"] = choice["finish_reason"]
-
-            rc = _extract_reasoning_from_delta(delta)
-            if rc:
-                state["has_explicit_reasoning"] = True
-                state["reasoning"] = (state.get("reasoning") or "") + rc
-                yield _format_openai_stream_chunk(
-                    state.get("model", category), reasoning_content=rc,
-                    include_role=not state.get("role_sent"),
-                    chunk_id=state.get("stream_id"))
-                state["role_sent"] = True
-
-            c = delta.get("content")
-            if isinstance(c, str) and c:
-                if state.get("has_explicit_reasoning"):
-                    # Backend liefert Reasoning in eigenem Feld → content unveraendert
-                    state["content"] = (state.get("content") or "") + c
-                    yield _format_openai_stream_chunk(
-                        state.get("model", category), content=c,
-                        include_role=not state.get("role_sent"),
-                        chunk_id=state.get("stream_id"))
-                    state["role_sent"] = True
-                else:
-                    # <think>...</think> im content (vLLM Qwen3 preserve_thinking)
-                    # → als eigenen Reasoning-Context mappen, Rest als content
-                    reasoning_part, content_part = _split_think_chunk(c, think_state)
-                    if reasoning_part:
-                        state["reasoning"] = (state.get("reasoning") or "") + reasoning_part
-                        yield _format_openai_stream_chunk(
-                            state.get("model", category), reasoning_content=reasoning_part,
-                            include_role=not state.get("role_sent"),
-                            chunk_id=state.get("stream_id"))
-                        state["role_sent"] = True
-                    if content_part:
-                        state["content"] = (state.get("content") or "") + content_part
-                        yield _format_openai_stream_chunk(
-                            state.get("model", category), content=content_part,
-                            include_role=not state.get("role_sent"),
-                            chunk_id=state.get("stream_id"))
-                        state["role_sent"] = True
-
-            tcs = delta.get("tool_calls")
-            if tcs:
-                _accumulate_stream_tool_calls(state, tcs)
-
-        # Angebrochene <think>-Tags am Turn-Ende flushen (Modell stoppt selten
-        # mitten in einem Tag, aber falls doch: in reasoning/content nachladen)
-        if think_state.get("pending"):
-            pending = think_state.pop("pending", "")
-            if think_state.get("in_think"):
-                state["reasoning"] = (state.get("reasoning") or "") + pending
-            else:
-                state["content"] = (state.get("content") or "") + pending
-    finally:
-        if not task.done():
-            task.cancel()
+        task = asyncio.ensure_future(worker())
         try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
+            while True:
+                try:
+                    ev = await asyncio.wait_for(queue.get(), timeout=_STREAM_KEEPALIVE_INTERVAL)
+                except asyncio.TimeoutError:
+                    # Modell arbeitet noch, aber es kommt gerade kein Token —
+                    # SSE-Kommentar haelt die VS-Code-Verbindung am Leben.
+                    yield ": keepalive\n\n"
+                    continue
+
+                ev_type = ev.get("type") if isinstance(ev, dict) else None
+                if ev_type in ("done", "__end__"):
+                    break
+                if ev_type != "chunk":
+                    continue
+
+                choice = ev.get("choice") or {}
+                delta = choice.get("delta") or {}
+                if choice.get("finish_reason"):
+                    state["finish_reason"] = choice["finish_reason"]
+
+                rc = _extract_reasoning_from_delta(delta)
+                if rc:
+                    state["has_explicit_reasoning"] = True
+                    state["reasoning"] = (state.get("reasoning") or "") + rc
+                    fwd, note_now = _reasoning_forward(
+                        len(state["reasoning"]), len(rc), reasoning_cap)
+                    if fwd:
+                        yield _format_openai_stream_chunk(
+                            state.get("model", category), reasoning_content=rc[:fwd],
+                            include_role=not state.get("role_sent"),
+                            chunk_id=state.get("stream_id"))
+                        state["role_sent"] = True
+                    if note_now and not cap_triggered:
+                        cap_triggered = True
+                        _log(f"Reasoning-Cap erreicht ({len(state['reasoning'])} >= "
+                             f"{reasoning_cap} chars) — Modus={cap_mode}")
+                        if cap_mode == "restart":
+                            restart_requested = True
+                            break
+                        yield _format_openai_stream_chunk(
+                            state.get("model", category), content=REASONING_CAP_NOTE,
+                            include_role=not state.get("role_sent"),
+                            chunk_id=state.get("stream_id"))
+                        state["role_sent"] = True
+
+                c = delta.get("content")
+                if isinstance(c, str) and c:
+                    if state.get("has_explicit_reasoning"):
+                        # Backend liefert Reasoning in eigenem Feld → content unveraendert
+                        state["content"] = (state.get("content") or "") + c
+                        yield _format_openai_stream_chunk(
+                            state.get("model", category), content=c,
+                            include_role=not state.get("role_sent"),
+                            chunk_id=state.get("stream_id"))
+                        state["role_sent"] = True
+                    else:
+                        # <think>...</think> im content (vLLM Qwen3 preserve_thinking)
+                        # → als eigenen Reasoning-Context mappen, Rest als content
+                        reasoning_part, content_part = _split_think_chunk(c, think_state)
+                        if reasoning_part:
+                            state["reasoning"] = (state.get("reasoning") or "") + reasoning_part
+                            fwd, note_now = _reasoning_forward(
+                                len(state["reasoning"]), len(reasoning_part), reasoning_cap)
+                            if fwd:
+                                yield _format_openai_stream_chunk(
+                                    state.get("model", category), reasoning_content=reasoning_part[:fwd],
+                                    include_role=not state.get("role_sent"),
+                                    chunk_id=state.get("stream_id"))
+                                state["role_sent"] = True
+                            if note_now and not cap_triggered:
+                                cap_triggered = True
+                                _log(f"Reasoning-Cap erreicht ({len(state['reasoning'])} >= "
+                                     f"{reasoning_cap} chars, <think>-Block) — Modus={cap_mode}")
+                                if cap_mode == "restart":
+                                    restart_requested = True
+                                    break
+                                yield _format_openai_stream_chunk(
+                                    state.get("model", category), content=REASONING_CAP_NOTE,
+                                    include_role=not state.get("role_sent"),
+                                    chunk_id=state.get("stream_id"))
+                                state["role_sent"] = True
+                        if content_part:
+                            state["content"] = (state.get("content") or "") + content_part
+                            yield _format_openai_stream_chunk(
+                                state.get("model", category), content=content_part,
+                                include_role=not state.get("role_sent"),
+                                chunk_id=state.get("stream_id"))
+                            state["role_sent"] = True
+
+                tcs = delta.get("tool_calls")
+                if tcs:
+                    _accumulate_stream_tool_calls(state, tcs)
+
+            # Angebrochene <think>-Tags am Turn-Ende flushen (Modell stoppt selten
+            # mitten in einem Tag, aber falls doch: in reasoning/content nachladen)
+            # Bei Restart-Abbruch NICHT flushen — der Turn wird verworfen.
+            if not restart_requested and think_state.get("pending"):
+                pending = think_state.pop("pending", "")
+                if think_state.get("in_think"):
+                    state["reasoning"] = (state.get("reasoning") or "") + pending
+                else:
+                    state["content"] = (state.get("content") or "") + pending
+        finally:
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # ── Restart-Mode: abgebrochenen Turn mit Anti-Loop-Hinweis neu starten ──
+        if restart_requested and restarts_left > 0:
+            restarts_left -= 1
+            msgs = body.get("messages")
+            if isinstance(msgs, list):
+                msgs.append({"role": "user", "content": REASONING_CAP_RESTART_HINT})
+            _log(f"Reasoning-Restart: Backend-Stream abgebrochen, Folgeturn mit "
+                 f"Anti-Loop-Hinweis (Restarts uebrig={restarts_left})")
+            continue
+        break
 
 
 async def _stream_coworker_call(tool_call: Dict[str, Any], queue: asyncio.Queue,
@@ -6062,6 +6173,9 @@ async def healthz(request: Request):
         "hindsight_backend": "qdrant" if _hindsight._use_qdrant else "jsonl",
         "debug_enabled": DEBUG_ENABLED,
         "tool_result_cap": TOOL_RESULT_CAP,
+        "reasoning_cap_chars": REASONING_CAP_CHARS,
+        "reasoning_cap_mode": REASONING_CAP_MODE,
+        "reasoning_cap_max_restarts": REASONING_CAP_MAX_RESTARTS,
     })
 
 

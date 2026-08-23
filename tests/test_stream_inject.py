@@ -194,6 +194,126 @@ def test_backend_turn_emits_keepalive_when_backend_slow(monkeypatch):
     assert state["content"] == "A"
 
 
+def test_backend_turn_reasoning_cap_stops_and_injects_note(monkeypatch):
+    """Reasoning-Cap: ab REASONING_CAP_CHARS wird Reasoning verworfen und
+    einmalig eine Abschluss-Aufforderung als content injiziert."""
+    monkeypatch.setattr(proxy, "REASONING_CAP_CHARS", 10)
+
+    async def fake_single(body, category, def_idx, inject_hindsight=True):
+        yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "0123456789"}, "finish_reason": None}}
+        yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "XX"}, "finish_reason": None}}
+        yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "YY"}, "finish_reason": None}}
+        yield {"type": "chunk", "choice": {"delta": {"content": "Finale Antwort"}, "finish_reason": None}}
+        yield {"type": "chunk", "choice": {"delta": {}, "finish_reason": "stop"}}
+        yield {"type": "done"}
+
+    monkeypatch.setattr(proxy, "_stream_single_model_events", fake_single)
+    state: Dict[str, Any] = {"stream_id": "test-stream", "role_sent": False}
+    sse = _collect_sse(proxy._stream_backend_turn({"messages": []}, "local", None, state))
+
+    joined = "\n".join(sse)
+    # Reasoning wurde bis zum Cap durchgereicht (die ersten 10 Zeichen),
+    # danach verworfen: "XX"/"YY" duerfen NICHT als reasoning_content erscheinen.
+    assert '"reasoning_content": "0123456789"' in joined
+    assert '"reasoning_content": "XX"' not in joined
+    assert '"reasoning_content": "YY"' not in joined
+    # Abschluss-Aufforderung wurde als content injiziert (genau einmal).
+    assert joined.count("Reasoning-Limit erreicht") == 1
+    # content danach fliesst normal weiter.
+    assert "Finale Antwort" in joined
+    assert state["content"].endswith("Finale Antwort")
+    # state.reasoning haelt den VOLLEN internen Text (fuer Reporting), auch wenn
+    # die Deltas danach nicht mehr an den Client gingen.
+    assert state["reasoning"] == "0123456789XXYY"
+
+
+def test_backend_turn_reasoning_cap_disabled_by_default(monkeypatch):
+    """REASONING_CAP_CHARS=0 (Default) -> kein Cap, alles fliesst durch."""
+    monkeypatch.setattr(proxy, "REASONING_CAP_CHARS", 0)
+
+    async def fake_single(body, category, def_idx, inject_hindsight=True):
+        yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "0123456789"}, "finish_reason": None}}
+        yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "XX"}, "finish_reason": None}}
+        yield {"type": "chunk", "choice": {"delta": {"content": "A"}, "finish_reason": None}}
+        yield {"type": "done"}
+
+    monkeypatch.setattr(proxy, "_stream_single_model_events", fake_single)
+    state: Dict[str, Any] = {"stream_id": "test-stream", "role_sent": False}
+    sse = _collect_sse(proxy._stream_backend_turn({"messages": []}, "local", None, state))
+
+    joined = "\n".join(sse)
+    assert '"reasoning_content": "XX"' in joined
+    assert "Reasoning-Limit erreicht" not in joined
+
+
+def test_backend_turn_reasoning_cap_restart_mode(monkeypatch):
+    """Restart-Mode: Backend-Stream wird beim Cap ABGEBROCHEN und ein
+    Folgeturn mit Anti-Loop-Hinweis gestartet — Antwort kommt trotzdem."""
+    monkeypatch.setattr(proxy, "REASONING_CAP_CHARS", 10)
+    monkeypatch.setattr(proxy, "REASONING_CAP_MODE", "restart")
+    monkeypatch.setattr(proxy, "REASONING_CAP_MAX_RESTARTS", 1)
+
+    captured_messages = []
+
+    async def fake_single(body, category, def_idx, inject_hindsight=True):
+        captured_messages.append([dict(m) for m in (body.get("messages") or [])])
+        if len(captured_messages) == 1:
+            # Erste Runde: endlos Reasoning, ueber das Cap hinaus.
+            for _ in range(3):
+                yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "0123456789"}, "finish_reason": None}}
+            # Haengt danach fest (kein done) — wird per Restart abgebrochen.
+            await asyncio.Event().wait()
+            yield {"type": "done"}
+        else:
+            # Zweite Runde: kurze finale Antwort.
+            yield {"type": "chunk", "choice": {"delta": {"content": "Endlich Antwort"}, "finish_reason": None}}
+            yield {"type": "chunk", "choice": {"delta": {}, "finish_reason": "stop"}}
+            yield {"type": "done"}
+
+    monkeypatch.setattr(proxy, "_stream_single_model_events", fake_single)
+    body = {"messages": [{"role": "user", "content": "hi"}]}
+    state: Dict[str, Any] = {"stream_id": "test-stream", "role_sent": False}
+    sse = _collect_sse(proxy._stream_backend_turn(body, "local", None, state))
+
+    joined = "\n".join(sse)
+    # Zwei Aufrufe = Restart hat stattgefunden.
+    assert len(captured_messages) == 2
+    # Anti-Loop-Hinweis wurde vor dem Folgeturn an die History angehaengt.
+    assert captured_messages[1][-1]["role"] == "user"
+    assert "zu lange nachgedacht" in captured_messages[1][-1]["content"]
+    # Der erste (abgebrochene) Turn hatte den Hinweis noch NICHT.
+    assert all("zu lange nachgedacht" not in str(m.get("content", ""))
+               for m in captured_messages[0])
+    # Finale Antwort kommt durch.
+    assert "Endlich Antwort" in joined
+    assert state["content"].endswith("Endlich Antwort")
+
+
+def test_backend_turn_reasoning_cap_restart_exhausted_aborts(monkeypatch):
+    """Restart-Mode mit 0 Restarts: Turn endet nach Abbruch (kein Neustart)."""
+    monkeypatch.setattr(proxy, "REASONING_CAP_CHARS", 10)
+    monkeypatch.setattr(proxy, "REASONING_CAP_MODE", "restart")
+    monkeypatch.setattr(proxy, "REASONING_CAP_MAX_RESTARTS", 0)
+
+    call_count = {"n": 0}
+
+    async def fake_single(body, category, def_idx, inject_hindsight=True):
+        call_count["n"] += 1
+        for _ in range(3):
+            yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "0123456789"}, "finish_reason": None}}
+        await asyncio.Event().wait()
+        yield {"type": "done"}
+
+    monkeypatch.setattr(proxy, "_stream_single_model_events", fake_single)
+    state: Dict[str, Any] = {"stream_id": "test-stream", "role_sent": False}
+    sse = _collect_sse(proxy._stream_backend_turn({"messages": []}, "local", None, state))
+
+    joined = "\n".join(sse)
+    # Nur EIN Aufruf (kein Restart), kein finaler content.
+    assert call_count["n"] == 1
+    assert "Endlich" not in joined
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 4b. Reasoning-Mapping: verschiedene Backend-Strukturen + <think>-Tags
 # ═══════════════════════════════════════════════════════════════════════════
