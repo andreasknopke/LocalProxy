@@ -4026,18 +4026,53 @@ def _format_openai_stream_chunk(
     return f"data: {json.dumps(payload_data, ensure_ascii=False)}\n\n"
 
 
+def _normalize_usage(usage: Any) -> Dict[str, int]:
+    """Normalisiert usage zu {prompt_tokens, completion_tokens, total_tokens} (int)."""
+    if isinstance(usage, dict):
+        out: Dict[str, int] = {}
+        for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            v = usage.get(k)
+            try:
+                out[k] = int(v) if v is not None else 0
+            except (TypeError, ValueError):
+                out[k] = 0
+        return out
+    return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+def _format_usage_stream_chunk(
+    model: str, usage: Any, chunk_id: Optional[str] = None
+) -> str:
+    """OpenAI-Stream-Usage-Chunk (leere choices + usage). VS Code Copilot liest
+    daraus die Token-Zahlen (Anzeige in der Antwort + Auto-Kompaktierung des
+    Chatverlaufs). Kommt NACH dem finish_reason-Chunk."""
+    cid = chunk_id or f"chatcmpl-spark-{uuid.uuid4().hex}"
+    payload_data = {
+        "id": cid,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [],
+        "usage": _normalize_usage(usage),
+    }
+    return f"data: {json.dumps(payload_data, ensure_ascii=False)}\n\n"
+
+
 def _build_response_payload(
     body: Dict[str, Any], combined_text: str, results: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
     model = body.get("model", "")
     tool_calls = None
     reasoning_content = None
+    usage = None
     for r in reversed(results):
         if r.get("tool_calls") and not tool_calls:
             tool_calls = r["tool_calls"]
         if r.get("reasoning_content") and not reasoning_content:
             reasoning_content = r["reasoning_content"]
-        if tool_calls and reasoning_content:
+        if usage is None and isinstance(r.get("usage"), dict):
+            usage = r["usage"]
+        if tool_calls and reasoning_content and usage is not None:
             break
 
     if tool_calls:
@@ -4056,7 +4091,7 @@ def _build_response_payload(
                 },
                 "finish_reason": "tool_calls",
             }],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "usage": _normalize_usage(usage),
         }
 
     message: Dict[str, Any] = {"role": "assistant", "content": combined_text}
@@ -4072,7 +4107,7 @@ def _build_response_payload(
             "message": message,
             "finish_reason": "stop",
         }],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": _normalize_usage(usage),
     }
 
 
@@ -5101,12 +5136,16 @@ async def _stream_events(body: Dict[str, Any], category: str,
             reasoning_content=reasoning_content, chunk_id=stream_id,
         )
         yield _format_openai_stream_chunk(used_model, finish_reason="tool_calls", chunk_id=stream_id)
+        if isinstance(result.get("usage"), dict):
+            yield _format_usage_stream_chunk(used_model, result["usage"], chunk_id=stream_id)
     else:
         yield _format_openai_stream_chunk(
             used_model, content=content, include_role=True,
             reasoning_content=reasoning_content,
         )
         yield _format_openai_stream_chunk(used_model, "", finish_reason="stop")
+        if isinstance(result.get("usage"), dict):
+            yield _format_usage_stream_chunk(used_model, result["usage"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -5266,6 +5305,13 @@ async def _stream_single_model_events(body: Dict[str, Any], category: str, def_i
     payload = _build_passthrough_payload(body, category, def_idx=def_idx,
                                          force_no_thinking=force_no_thinking)
     payload["stream"] = True
+    # Token-Usage an VS Code: _build_passthrough_payload setzt stream=False und
+    # _clean_payload entfernt dabei stream_options. Fuer den echten Stream hier
+    # include_usage wieder einbauen, damit das Backend den Usage-Chunk liefert.
+    if isinstance(body.get("stream_options"), dict):
+        payload["stream_options"] = body["stream_options"]
+    else:
+        payload["stream_options"] = {"include_usage": True}
 
     messages = payload.get("messages", [])
     if isinstance(messages, list) and inject_hindsight:
@@ -5412,6 +5458,12 @@ async def _stream_single_model_events(body: Dict[str, Any], category: str, def_i
                         continue
                     choices = chunk.get("choices")
                     if not isinstance(choices, list) or not choices:
+                        # Usage-Chunk (stream_options.include_usage): choices ist
+                        # leer, usage enthaelt die Token-Zahlen. Durchreichen.
+                        usage = chunk.get("usage")
+                        if isinstance(usage, dict):
+                            _io_collect(chunk)
+                            yield {"type": "usage", "usage": usage}
                         continue
                     _io_collect(chunk)
                     yield {"type": "chunk", "choice": choices[0]}
@@ -5472,6 +5524,7 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
         "mid_stream_error": None, "error_content": None,
         "def_idx": 0, "model": category,
         "has_explicit_reasoning": False,
+        "usage": None,
     })
 
     defs = _model_defs(category)
@@ -5495,6 +5548,7 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
             "finish_reason": None, "all_failed": False,
             "mid_stream_error": None, "error_content": None,
             "has_explicit_reasoning": False,
+            "usage": None,
         })
         state["content"] = saved_content
         think_state: Dict[str, Any] = {"in_think": False, "pending": ""}
@@ -5523,6 +5577,8 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
                         ev_type = ev.get("type") if isinstance(ev, dict) else None
                         if ev_type == "chunk":
                             forwarded = True
+                            await queue.put(ev)
+                        elif ev_type == "usage":
                             await queue.put(ev)
                         elif ev_type == "done":
                             # Erfolg: aktiven Index merken (wie non-streaming Fallback)
@@ -5562,6 +5618,10 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
                 ev_type = ev.get("type") if isinstance(ev, dict) else None
                 if ev_type in ("done", "__end__"):
                     break
+                if ev_type == "usage":
+                    if isinstance(ev.get("usage"), dict):
+                        state["usage"] = ev["usage"]
+                    continue
                 if ev_type != "chunk":
                     continue
 
@@ -5958,6 +6018,8 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
             content = state.get("content", "") or ""
             fr = state.get("finish_reason") or "stop"
             yield _format_openai_stream_chunk(model, "", finish_reason=fr, chunk_id=stream_id)
+            if state.get("usage"):
+                yield _format_usage_stream_chunk(model, state["usage"], chunk_id=stream_id)
             if content.strip():
                 _spawn(_hindsight.retain_async(body, content))
             return
@@ -5989,6 +6051,8 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
                 model, include_role=True,
                 tool_calls=_build_forward_tool_calls(tool_calls), chunk_id=stream_id)
             yield _format_openai_stream_chunk(model, finish_reason="tool_calls", chunk_id=stream_id)
+            if state.get("usage"):
+                yield _format_usage_stream_chunk(model, state["usage"], chunk_id=stream_id)
             return
 
         # ── Fork: dispatches registrieren (non-blocking, Store = Truth) ──
