@@ -16,7 +16,6 @@ VS Code Copilot  --POST /v1/chat/completions-->  FastAPI Gateway
   |  4. Hindsight Recall (System-Message-Prafix)    |
   |  5. Payload bauen + transparente Mods:           |
   |     - image_url strippen (wenn is_vision=false)  |
-  |     - Moonshot-Patch (nur bei moonshot-ai URL)  |
   |     - Tool-Result-Capping (Token-Bombing)       |
   |  6. Request ans Modell --> Stream zuruck        |
   |  7. Background: Hindsight Retain                |
@@ -199,9 +198,7 @@ Refactore die Architektur --strong
 - **Hindsight Memory**: Qdrant/JSONL-basiertes persistentes Gedachtnis.
   Recall-Ergebnisse werden als `[HINDSIGHT MEMORY CONTEXT]` System-Message
   jedem Request vorangestellt.
-- **Transparente Modifikationen**: image_url-Sanitizer fur text-only Modelle,
-  Moonshot-Parameter-Patch (temp=1.0, top_p=0.95, penalties=0) nur bei
-  moonshot-ai URL.
+- **Transparente Modifikationen**: image_url-Sanitizer fur text-only Modelle.
 - **Tool-Result-Capping**: Verhindert Token-Bombing durch grosse grep/read-Results.
 - **Read-Loop-Detection**: Erkennt wenn ein Modell dieselbe Datei mit denselben
   Zeilen >N mal hintereinander liest (Default: >3) und injiziert eine

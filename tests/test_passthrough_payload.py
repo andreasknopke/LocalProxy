@@ -3,7 +3,7 @@ Unit-Tests fuer LocalProxy v3.0 Pass-Through Payload.
 
 Testet:
   1) Model-Flag-Extraktion (--local/--light/--strong/--vision)
-  2) Payload-Builder (image_url sanitizer, Moonshot-Patch)
+  2) Payload-Builder (image_url sanitizer)
   3) Tool-Call-Normalisierung
   4) Response-Payload (OpenAI-Shape)
 """
@@ -194,26 +194,12 @@ def test_sanitize_all_images_fallback():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 3. Moonshot-Patch
+# 3. Moonshot-Patch entfernt (Kimi-API akzeptiert jetzt Copilot-Temp-Settings)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def test_moonshot_patch_applies_on_moonshot_url():
-    payload = {"temperature": 0.3, "top_p": 0.5, "top_k": 10,
-               "presence_penalty": 1.0}
-    original = dict(payload)
-    proxy._patch_moonshot_payload(payload, "https://api.moonshot-ai.net/v1/chat/completions")
-    assert payload["temperature"] == 1.0
-    assert payload["top_p"] == 0.95
-    assert "top_k" not in payload
-    assert payload["presence_penalty"] == 0.0
-
-
-def test_moonshot_patch_skips_non_moonshot():
-    payload = {"temperature": 0.3, "top_p": 0.5, "top_k": 10}
-    original = dict(payload)
-    proxy._patch_moonshot_payload(payload, "https://api.openai.com/v1/chat/completions")
-    assert payload["temperature"] == 0.3  # unchanged
-    assert payload["top_k"] == 10  # unchanged
+def test_moonshot_patch_function_removed():
+    """Die Funktion _patch_moonshot_payload wurde entfernt (2026-08-23)."""
+    assert not hasattr(proxy, "_patch_moonshot_payload")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

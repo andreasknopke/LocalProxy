@@ -21,8 +21,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ── App-Code ─────────────────────────────────────────────────────────────
+# WICHTIG: data/ wird NICHT in das Image kopiert — es enthaelt zur Build-Zeit
+# config.json (API-Keys!), cooldowns.json und Debug-Dumps. Die Verzeichnisse
+# werden leer angelegt; der Inhalt kommt zur Laufzeit vom Volume-Mount.
 COPY proxy.py webui.py ./
-COPY data/ ./data/
 
 # ── Datenverzeichnisse (Volume-Mounts via Coolify) ───────────────────────
 # /app/data        — config.json, Logs, Hindsight-Speicher, Debug-Dumps

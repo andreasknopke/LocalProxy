@@ -5,7 +5,6 @@ Architektur:
   VS Code Copilot → FastAPI Gateway → Modell (1 von 4 Kategorien)
     ├─ Hindsight Recall (System-Message-Praefix)
     ├─ Transparente Modifikationen:
-    │   ├─ Moonshot-Parameter-Patch (nur bei moonshot-ai URL)
     │   ├─ image_url-Sanitizer (wenn is_vision=False)
     │   └─ Tool-Result-Capping (Token-Bombing-Schutz)
     └─ Pass-Through Streaming → VS Code Copilot
@@ -23,12 +22,15 @@ import asyncio
 import copy
 import hashlib
 import json
+import logging
+import logging.handlers
 import os
 import re
 import secrets
 import sys
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -56,6 +58,13 @@ import datetime as _dt
 
 LOG_FILE = os.getenv("LOG_FILE", str(Path(__file__).parent / "data" / "proxy.log"))
 
+# Rotierende Logdatei (5 MB x 3 Backups) — verhindert unbegrenztes Wachstum
+# (vorher: endlose Append-Datei, die in Docker auf dem Volume wuchs).
+_LOG_HANDLER = logging.handlers.RotatingFileHandler(
+    LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8",
+)
+_LOG_HANDLER.setFormatter(logging.Formatter("%(message)s"))
+
 
 def _log(msg: str) -> None:
     """Schreibt eine Log-Zeile mit Timestamp in Datei + stdout.
@@ -69,10 +78,27 @@ def _log(msg: str) -> None:
     except UnicodeEncodeError:
         print(line.encode("ascii", errors="replace").decode("ascii"), flush=True)
     try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        _LOG_HANDLER.handle(logging.LogRecord(
+            name="proxy", level=logging.INFO, pathname="", lineno=0,
+            msg=line, args=None, exc_info=None,
+        ))
     except Exception:
         pass
+
+
+# ── Background-Task-Registry ───────────────────────────────────────────────
+# Fire-and-forget-Tasks OHNE gehaltene Referenz koennen vom GC wegraeumt
+# werden, waehrend sie noch laufen (CPython: Task-Objekt ohne Referenz).
+# _spawn() haelt jede Task in _BG_TASKS, bis sie fertig ist.
+_BG_TASKS: Set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    """Startet einen Fire-and-forget-Task und haelt eine Referenz, bis er fertig ist."""
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
 
 
 def _truncate_key(key: str) -> str:
@@ -2217,30 +2243,6 @@ def _patch_reasoning_effort_payload(payload: Dict[str, Any], cat: Dict[str, Any]
         _log(f"reasoning_effort='{old_val}' entfernt fuer Model '{model_name}' (tools + reasoning_effort inkompatibel)")
 
 
-def _patch_moonshot_payload(payload: Dict[str, Any], api_url: str) -> None:
-    """Erzwingt Moonshot-kompatible Parameter — NUR wenn api_url moonshot-ai enthaelt."""
-    url_lower = api_url.lower()
-    if "moonshot-ai" not in url_lower and "moonshot" not in url_lower:
-        return
-    fixes = []
-    if payload.get("temperature") is not None and payload["temperature"] != 1.0:
-        fixes.append(f"temp {payload['temperature']}->1.0")
-        payload["temperature"] = 1.0
-    if payload.get("top_p") is not None and payload["top_p"] != 0.95:
-        fixes.append(f"top_p {payload['top_p']}->0.95")
-        payload["top_p"] = 0.95
-    if "top_k" in payload:
-        fixes.append("top_k entfernt")
-        del payload["top_k"]
-    for key in ("presence_penalty", "frequency_penalty"):
-        val = payload.get(key)
-        if val is not None and val != 0.0:
-            fixes.append(f"{key} {val}->0")
-            payload[key] = 0.0
-    if fixes:
-        _log(f"Moonshot-Fixes: {'; '.join(fixes)}")
-
-
 def _clean_payload(payload: Dict[str, Any], keep_tools: bool = False,
                    keep_top_k: bool = False) -> Dict[str, Any]:
     if not payload.get("stream") and "stream_options" in payload:
@@ -2363,7 +2365,6 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
     #     _patch_local_sampling_payload(payload)
     #     _inject_local_anti_loop_system(messages)
 
-    _patch_moonshot_payload(payload, cat.get("api_url", ""))
     _patch_max_tokens_payload(payload, cat)
     _patch_reasoning_effort_payload(payload, cat)
 
@@ -4051,8 +4052,8 @@ async def _run_startup_health_checks() -> None:
     _log("Health-Checks abgeschlossen")
 
 
-@app.on_event("startup")
-async def _startup_event() -> None:
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
     _log(f"LocalProxy v3.0 starting on port {PROXY_PORT}")
     _log(f"   Default:  {DEFAULT_CATEGORY}")
     for key in ("local", "coworker", "light", "strong", "vision"):
@@ -4070,14 +4071,13 @@ async def _startup_event() -> None:
     _purge_stale_active_calls()
 
     # Co-Worker-Health-Loop starten (Startup-Probe + periodischer Check)
-    asyncio.ensure_future(_coworker_health_loop())
+    _spawn(_coworker_health_loop())
 
     # Health-Checks nicht-blockierend im Hintergrund starten
-    asyncio.ensure_future(_run_startup_health_checks())
+    _spawn(_run_startup_health_checks())
 
+    yield
 
-@app.on_event("shutdown")
-async def _shutdown_event() -> None:
     _log("LocalProxy shutting down.")
 
 
@@ -4229,7 +4229,7 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     # der naechste Request den aktuellen Zustand sieht.
     if category == "local" and COWORKER_ENABLED and _coworker_configured():
         if time.time() - float(_COWORKER_HEALTH_CACHE.get("checked_at", 0.0)) > COWORKER_HEALTH_INTERVAL:
-            asyncio.ensure_future(_probe_coworker())
+            _spawn(_probe_coworker())
 
     # Fork-Join: Status offener Hintergrund-Tasks als kompakte user-Notiz
     # ans Ende der History haengen (nach Kategorie-Detection — beeinflusst
@@ -4275,7 +4275,7 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     #         ... (siehe Git-History)
 
     response_payload = _build_response_payload(body, content, [result])
-    asyncio.ensure_future(_hindsight.retain_async(body, content))
+    _spawn(_hindsight.retain_async(body, content))
     return JSONResponse(content=response_payload)
 
 
@@ -4342,7 +4342,7 @@ async def _stream_events(body: Dict[str, Any], category: str,
     content = result.get("content", "") or ""
     used_model = outcome.get("used_model", category)
 
-    asyncio.ensure_future(_hindsight.retain_async(body, content))
+    _spawn(_hindsight.retain_async(body, content))
 
     tool_calls = result.get("tool_calls")
     reasoning_content = result.get("reasoning_content")
@@ -5137,7 +5137,7 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
             fr = state.get("finish_reason") or "stop"
             yield _format_openai_stream_chunk(model, "", finish_reason=fr, chunk_id=stream_id)
             if content.strip():
-                asyncio.ensure_future(_hindsight.retain_async(body, content))
+                _spawn(_hindsight.retain_async(body, content))
             return
 
         dispatch_calls, collect_calls, ask_calls, other_calls = _partition_tool_calls(tool_calls)
@@ -5382,17 +5382,20 @@ async def _get_logs_handler(lines: int = 200):
 
 @app.get("/logs")
 async def get_logs(request: Request, lines: int = 200):
+    await _auth_or_raise(request)
     return JSONResponse(content=await _get_logs_handler(lines))
 
 
 @app.get("/v1/logs")
 async def get_v1_logs(request: Request, lines: int = 200):
+    await _auth_or_raise(request)
     return JSONResponse(content=await _get_logs_handler(lines))
 
 
 # ── /debug/* ───────────────────────────────────────────────────────────────
 @app.get("/debug/files")
 async def debug_files(request: Request):
+    await _auth_or_raise(request)
     try:
         files = []
         if DEBUG_DIR.exists():
@@ -5413,6 +5416,7 @@ async def debug_files(request: Request):
 
 @app.get("/debug/file/{file_id}")
 async def debug_file(file_id: str, request: Request):
+    await _auth_or_raise(request)
     if "/" in file_id or "\\" in file_id or ".." in file_id:
         return JSONResponse(status_code=400, content={"error": "invalid file_id"})
     path = DEBUG_DIR / file_id
@@ -5427,6 +5431,7 @@ async def debug_file(file_id: str, request: Request):
 
 @app.get("/debug/ring")
 async def debug_ring(request: Request, limit: int = 50):
+    await _auth_or_raise(request)
     items = list(_DEBUG_RING)
     if limit > 0:
         items = items[-limit:]
@@ -5436,6 +5441,7 @@ async def debug_ring(request: Request, limit: int = 50):
 
 @app.get("/debug/active")
 async def debug_active(request: Request):
+    await _auth_or_raise(request)
     active = []
     for call_id, info in _ACTIVE_CALLS.items():
         elapsed = time.time() - info.get("started_at", time.time())
@@ -5449,6 +5455,7 @@ async def debug_active(request: Request):
 
 @app.post("/debug/cleanup")
 async def debug_cleanup(request: Request):
+    await _auth_or_raise(request)
     _cleanup_old_debug_files()
     count = 0
     if DEBUG_DIR.exists():

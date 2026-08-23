@@ -17,9 +17,10 @@ __pycache__/
 # Test artifacts
 tests/
 
-# Logs & data (volume-mounted in production)
+# Logs & data (volume-mounted in production — enthaelt API-Keys, nie ins Image!)
 proxy.log
 .hindsight_memory/
+data/
 
 # Debug dumps (volume-mounted)
 data/debug/

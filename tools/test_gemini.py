@@ -58,13 +58,14 @@ def main():
         duration = time.monotonic() - started
         body = e.read().decode("utf-8", errors="replace")
         print(f"❌ HTTP {e.code} ({duration:.1f}s)")
-        print(f"   {body[:1000]}")
+        print(f"   Body: {body[:500]}")
     except URLError as e:
         duration = time.monotonic() - started
-        print(f"❌ Connection Error ({duration:.1f}s): {e.reason}")
-    except Exception as e:
-        duration = time.monotonic() - started
-        print(f"❌ Error ({duration:.1f}s): {e}")
+        print(f"❌ Netzwerkfehler ({duration:.1f}s): {e.reason}")
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":

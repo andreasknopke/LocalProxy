@@ -6,6 +6,8 @@ Modernes Single-Page-Dashboard: 4 Modell-Kategorien, Hindsight, Proxy.
 from __future__ import annotations
 
 import json
+import logging
+import logging.handlers
 import os
 import re
 import secrets
@@ -23,6 +25,13 @@ PROFILES_DIR = CONFIG_PATH.parent / "profiles"
 LOG_FILE = os.getenv("LOG_FILE", str(Path(__file__).parent / "data" / "proxy.log"))
 
 
+# Rotierende Logdatei (5 MB x 3 Backups) — teilt sich die Datei mit proxy.py
+_WEBUI_LOG_HANDLER = logging.handlers.RotatingFileHandler(
+    LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8",
+)
+_WEBUI_LOG_HANDLER.setFormatter(logging.Formatter("%(message)s"))
+
+
 def _log(msg: str) -> None:
     import datetime as _dt
     timestamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -32,8 +41,10 @@ def _log(msg: str) -> None:
     except UnicodeEncodeError:
         print(line.encode("ascii", errors="replace").decode("ascii"), flush=True)
     try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        _WEBUI_LOG_HANDLER.handle(logging.LogRecord(
+            name="webui", level=logging.INFO, pathname="", lineno=0,
+            msg=line, args=None, exc_info=None,
+        ))
     except Exception:
         pass
 
@@ -152,7 +163,7 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
     if (!r.ok) { errorEl.style.display = 'block'; return; }
     const data = await r.json();
     document.cookie = 'webui_token=' + data.token + '; path=/webui; max-age=86400; SameSite=Lax';
-    window.location.href = '/webui/?token=' + data.token;
+    window.location.href = '/webui/';
   } catch(e) {
     errorEl.textContent = 'Netzwerkfehler: ' + e.message;
     errorEl.style.display = 'block';
@@ -433,8 +444,14 @@ def _load_config() -> Dict[str, Any]:
 
 
 def _save_config(cfg: Dict[str, Any]) -> None:
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+    """Atomares Schreiben (tmp + os.replace) — verhindert halbschriebene
+    config.json, wenn proxy.py parallel liest (z.B. bei WebUI-Neustart)."""
+    tmp_path = CONFIG_PATH.with_suffix(".json.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, CONFIG_PATH)
 
 
 def _deep_merge(base: Dict, override: Dict) -> None:
@@ -1917,7 +1934,9 @@ def create_webui_app() -> FastAPI:
     async def _auth_middleware(request: Request, call_next):
         if request.url.path in ("/webui/login", "/webui/api/login", "/webui/api/logout"):
             return await call_next(request)
-        token = request.cookies.get(COOKIE_NAME) or request.query_params.get("token", "")
+        # NUR Cookie — Query-Param-Token (?token=...) landet in Logs, Browser-History
+        # und Referer-Headern und ist damit ein Sicherheitsrisiko.
+        token = request.cookies.get(COOKIE_NAME, "")
         if not token or not _validate_token(token):
             return RedirectResponse(url="/webui/login", status_code=302)
         return await call_next(request)
