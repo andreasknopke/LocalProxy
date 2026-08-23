@@ -277,6 +277,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "max_parallel": 8,
             "dispatch_cap_per_request": 12,
             "bg_ttl_seconds": 1800,
+            "teach_delegation": True,
             "system_prompt": "You are a co-worker coding model acting as a subagent for planning, code review, brainstorming and parallel implementation tasks. You receive a self-contained task and optional context. Answer with concrete, actionable output: for planning give a step-by-step plan; for review list issues with file/line references and concrete fixes; for coding give complete, idiomatic code. You have NO access to tools, the conversation history or the workspace — work only from what is given to you.",
         },
         "local_sampling": {
@@ -756,6 +757,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
         <div class="toggle-row">
           <span>Fork-Join aktiviert (dispatch_coworker + collect_coworker)</span>
           <label class="toggle"><input type="checkbox" id="coworker_fork_join" checked><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+          <span>Delegations-Anleitung injizieren (system-Message: wann/wie Coworker-Tools nutzen)</span>
+          <label class="toggle"><input type="checkbox" id="coworker_teach_delegation" checked><span class="slider"></span></label>
         </div>
         <div class="row">
           <div class="form-group">
@@ -1534,6 +1539,8 @@ async function loadConfig() {
     if (cwDCEl) cwDCEl.value = cw.dispatch_cap_per_request != null ? cw.dispatch_cap_per_request : 12;
     const cwTTLEl = document.getElementById('coworker_bg_ttl');
     if (cwTTLEl) cwTTLEl.value = cw.bg_ttl_seconds != null ? cw.bg_ttl_seconds : 1800;
+    const cwTDEl = document.getElementById('coworker_teach_delegation');
+    if (cwTDEl) cwTDEl.checked = cw.teach_delegation !== false;
     const cwSPEl = document.getElementById('coworker_system_prompt');
     if (cwSPEl) cwSPEl.value = cw.system_prompt || '';
 
@@ -1627,6 +1634,7 @@ async function saveConfig() {
       max_parallel: parseInt(document.getElementById('coworker_max_parallel')?.value) || 8,
       dispatch_cap_per_request: parseInt(document.getElementById('coworker_dispatch_cap')?.value) || 12,
       bg_ttl_seconds: parseFloat(document.getElementById('coworker_bg_ttl')?.value) || 1800,
+      teach_delegation: document.getElementById('coworker_teach_delegation')?.checked ?? true,
       system_prompt: document.getElementById('coworker_system_prompt')?.value || '',
     },
     local_sampling: {

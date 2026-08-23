@@ -459,6 +459,10 @@ COWORKER_DISPATCH_CAP: int = int(os.getenv("COWORKER_DISPATCH_CAP", "12"))
 # TTL der Hintergrund-Tasks in Sekunden (0 = unbegrenzt); laufende Tasks werden
 # bei Ablauf abgebrochen (Status=expired), abgelieferte nach 60s entfernt.
 COWORKER_BG_TTL: float = float(os.getenv("COWORKER_BG_TTL", "1800"))
+# Bootstrap-Anleitung: lehrt das Hauptmodell als system-Message, WANN und WIE
+# es an den Co-Worker delegiert. Ohne diesen Hinweis delegiert das Modell in
+# der Praxis nie — Tool-Beschreibungen allein aendern das Verhalten nicht.
+COWORKER_TEACH_DELEGATION: bool = os.getenv("COWORKER_TEACH_DELEGATION", "true").lower() in {"1", "true", "yes", "y", "on"}
 COWORKER_SYSTEM_PROMPT: str = os.getenv(
     "COWORKER_SYSTEM_PROMPT",
     "You are a co-worker coding model acting as a subagent for planning, code "
@@ -667,7 +671,7 @@ def _apply_config_file() -> None:
     global COWORKER_HEALTH_INTERVAL, COWORKER_PROBE_TIMEOUT
     global COWORKER_FORK_JOIN, COWORKER_MAX_PARALLEL
     global COWORKER_DISPATCH_CAP, COWORKER_BG_TTL
-    global COWORKER_SYSTEM_PROMPT
+    global COWORKER_SYSTEM_PROMPT, COWORKER_TEACH_DELEGATION
     cw = tokens_cfg.get("coworker", {})
     if isinstance(cw, dict) and cw:
         COWORKER_ENABLED = bool(cw.get("enabled", COWORKER_ENABLED))
@@ -681,6 +685,7 @@ def _apply_config_file() -> None:
         COWORKER_MAX_PARALLEL = int(cw.get("max_parallel", COWORKER_MAX_PARALLEL))
         COWORKER_DISPATCH_CAP = int(cw.get("dispatch_cap_per_request", COWORKER_DISPATCH_CAP))
         COWORKER_BG_TTL = float(cw.get("bg_ttl_seconds", COWORKER_BG_TTL))
+        COWORKER_TEACH_DELEGATION = bool(cw.get("teach_delegation", COWORKER_TEACH_DELEGATION))
         cw_prompt = cw.get("system_prompt", "")
         if cw_prompt:
             COWORKER_SYSTEM_PROMPT = str(cw_prompt)
@@ -2637,6 +2642,37 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
 
 _COWORKER_TOOL_NAME = "ask_coworker"
 
+# System-Guidance, die das Hauptmodell bootstrapt, die Co-Worker-Tools
+# ueberhaupt zu nutzen. Wird als system-Message NACH der Client-System-Message
+# injiziert (nur wenn Tools injiziert wurden). Lehrt die Parallelitaets-
+# Regeln aus dem Fork-Join-Design (Skalier-Lektionen):
+#   triviales → selbst, 1 Task pro Datei/Aspekt im selben Turn, 4-8 fuer
+#   grosse Aufgahaben, dispatch → eigene Arbeit → collect.
+_COWORKER_GUIDANCE_SYSTEM: str = (
+    "[PROXY DELEGATION GUIDANCE]\n"
+    "You lead a two-machine team: you run on machine A; a Co-Worker model runs "
+    "on a SEPARATE machine B (own hardware, ~6-10 parallel sessions). It is "
+    "reachable ONLY via the ask_coworker / dispatch_coworker / collect_coworker "
+    "tools. Using it well makes the team much faster — this is expected "
+    "behavior, not an exception.\n"
+    "WHEN to delegate:\n"
+    "- Multi-file or multi-aspect work: dispatch ONE task per "
+    "file/aspect — all in the SAME turn, not sequentially.\n"
+    "- Large explore/review/refactor jobs: fan out 4-8 tasks, then integrate.\n"
+    "- Trivial single-file questions: do them yourself.\n"
+    "- A long read/search list: hand the files to the Co-Worker and keep only "
+    "a small set for yourself.\n"
+    "HOW:\n"
+    "- Independent sub-tasks → dispatch_coworker (non-blocking, returns "
+    "task_id immediately), then do your OWN work, then collect_coworker.\n"
+    "- Need the answer before continuing → ask_coworker (blocking).\n"
+    "- Patterns to avoid: dispatching one task per turn sequentially; "
+    "doing everything yourself while machine B idles; delegating "
+    "trivia.\n"
+    "The proxy automatically attaches the files from this conversation to "
+    "every co-worker call — task/context can stay concise."
+)
+
 _COWORKER_TOOL_DEF: Dict[str, Any] = {
     "type": "function",
     "function": {
@@ -2871,8 +2907,27 @@ def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
             tools.append(copy.deepcopy(_COWORKER_COLLECT_TOOL_DEF))
     if "tool_choice" not in payload:
         payload["tool_choice"] = "auto"
+    # Bootstrap-Guidance: system-Message direkt nach der Client-System-Message.
+    # Ohne diesen Hinweis nutzen lokale Modelle die Co-Worker-Tools in der
+    # Praxis nicht (Tool-Beschreibungen allein reichen nicht) — getestet in
+    # test_inject_coworker_tool_ok / test_inject_coworker_tool_fork_join.
+    if COWORKER_TEACH_DELEGATION:
+        messages = payload.get("messages")
+        if isinstance(messages, list):
+            has_guidance = any(
+                isinstance(m, dict) and m.get("role") == "system"
+                and "[PROXY DELEGATION GUIDANCE]" in str(m.get("content", ""))
+                for m in messages)
+            if not has_guidance:
+                insert_idx = 1 if (messages and isinstance(messages[0], dict)
+                                   and messages[0].get("role") == "system") else 0
+                messages.insert(insert_idx, {
+                    "role": "system",
+                    "content": _COWORKER_GUIDANCE_SYSTEM,
+                })
     _log(f"Co-Worker-Tools injiziert (Health-OK"
-         f"{', Fork-Join' if COWORKER_FORK_JOIN else ''})")
+         f"{', Fork-Join' if COWORKER_FORK_JOIN else ''}"
+         f"{', Guidance' if COWORKER_TEACH_DELEGATION else ''})")
     return True
 
 
@@ -3484,14 +3539,17 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
         if rounds > 1:
             reminder = (
                 "[Proxy-Hinweis] Erinnerung: Du (das Hauptmodell) hast Zugriff auf "
-                "das Tool 'ask_coworker'. Der Co-Worker ist ein VÖLLIG ANDERES "
+                "die Co-Worker-Tools 'ask_coworker' (blockierend) sowie "
+                "'dispatch_coworker' + 'collect_coworker' (nicht-blockierend, "
+                "fuer Parallelitaet). Der Co-Worker ist ein VÖLLIG ANDERES "
                 "Modell auf einem ANDEREN Server (eigene Base-URL, separate "
-                "Hardware) — er ist ausschließlich über den Funktionsaufruf "
-                "ask_coworker erreichbar. Wenn du eine Teilaufgabe an einen "
-                "Subagenten delegieren willst (Planung, Code-Review, "
-                "Parallelisierung), rufe IMMER ask_coworker mit task/context auf. "
-                "Simuliere keinen Subagenten selbst und beantworte delegierbare "
-                "Teilaufgaben nicht als imaginären Subagenten in deinem Text."
+                "Hardware) — er ist ausschließlich über diese Funktionsaufrufe "
+                "erreichbar. Wenn du Teilaufgaben an einen Subagenten delegieren "
+                "willst (Planung, Code-Review, Parallelisierung), rufe die Tools "
+                "mit task/context auf — mehrere dispatch_coworker gerne im "
+                "gleichen Turn. Simuliere keinen Subagenten selbst und "
+                "beantworte delegierbare Teilaufgaben nicht als imaginären "
+                "Subagenten in deinem Text."
             )
             msgs.append({"role": "user", "content": reminder})
 

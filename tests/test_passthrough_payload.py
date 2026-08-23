@@ -1451,6 +1451,55 @@ def test_inject_coworker_tool_ok(monkeypatch):
     assert payload.get("tool_choice") == "auto"
 
 
+def test_inject_coworker_guidance_system_message(monkeypatch):
+    """Bootstrap-Guidance wird als system-Message injiziert (nach client-system)."""
+    _setup_coworker_configured(monkeypatch, fork_join=True)
+    payload = {"messages": [
+        {"role": "system", "content": "You are GitHub Copilot."},
+        {"role": "user", "content": "explore the workspace"},
+    ]}
+    assert proxy._inject_coworker_tool(payload) is True
+    msgs = payload["messages"]
+    # guidance nach client-system, vor user
+    assert msgs[0]["role"] == "system"
+    assert msgs[1]["role"] == "system"
+    assert "[PROXY DELEGATION GUIDANCE]" in msgs[1]["content"]
+    assert "dispatch_coworker" in msgs[1]["content"]
+    assert msgs[2]["role"] == "user"
+
+
+def test_inject_coworker_guidance_no_client_system(monkeypatch):
+    """Ohne client-system landet die Guidance an Index 0."""
+    _setup_coworker_configured(monkeypatch, fork_join=True)
+    payload = {"messages": [{"role": "user", "content": "hi"}]}
+    proxy._inject_coworker_tool(payload)
+    msgs = payload["messages"]
+    assert msgs[0]["role"] == "system"
+    assert "[PROXY DELEGATION GUIDANCE]" in msgs[0]["content"]
+    assert msgs[1]["role"] == "user"
+
+
+def test_inject_coworker_guidance_disabled(monkeypatch):
+    """COWORKER_TEACH_DELEGATION=False -> keine Guidance-Message."""
+    _setup_coworker_configured(monkeypatch, fork_join=True)
+    monkeypatch.setattr(proxy, "COWORKER_TEACH_DELEGATION", False)
+    payload = {"messages": [{"role": "user", "content": "hi"}]}
+    proxy._inject_coworker_tool(payload)
+    assert all(not (isinstance(m, dict) and "[PROXY DELEGATION GUIDANCE]" in str(m.get("content", "")))
+               for m in payload["messages"])
+
+
+def test_inject_coworker_guidance_idempotent(monkeypatch):
+    """Guidance wird nur einmal injiziert (Marker-Check)."""
+    _setup_coworker_configured(monkeypatch, fork_join=True)
+    payload = {"messages": [{"role": "user", "content": "hi"}]}
+    proxy._inject_coworker_tool(payload)
+    proxy._inject_coworker_tool(payload)
+    n = sum(1 for m in payload["messages"]
+            if isinstance(m, dict) and "[PROXY DELEGATION GUIDANCE]" in str(m.get("content", "")))
+    assert n == 1
+
+
 def test_inject_coworker_tool_fork_join(monkeypatch):
     """Fork-Join an -> ask + dispatch + collect werden injiziert."""
     _setup_coworker_configured(monkeypatch, fork_join=True)
