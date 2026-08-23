@@ -41,7 +41,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Set, Tupl
 import httpx
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qdrant_models
 from dataclasses import dataclass, field
@@ -503,6 +503,19 @@ COWORKER_SYSTEM_PROMPT: str = os.getenv(
     "code. You have NO access to tools, the conversation history or the workspace "
     "— work only from what is given to you.",
 )
+
+# ── Co-Worker Agent-Mode (v4): echter Subagent mit Tool-Zugriff ───────────
+# Der Coworker wird nicht mehr als nacktes Chat-Modell benutzt, sondern als
+# agentischer Subagent: Er bekommt Tools (read_file/write_file/list_dir/
+# web_search), emittiert tool_calls, die der Proxy an einen lokalen Runner
+# auf dem User-PC relayed (der Proxy-Container selbst hat KEINEN Datei-
+# zugriff — die Files liegen beim User). Loop bis finish oder Max-Runden.
+COWORKER_AGENT_MODE: bool = os.getenv("COWORKER_AGENT_MODE", "true").lower() in {"1", "true", "yes", "y", "on"}
+COWORKER_AGENT_MAX_ROUNDS: int = int(os.getenv("COWORKER_AGENT_MAX_ROUNDS", "12"))
+# Runner-Auth (Bearer): muss identisch mit dem Token im tools/agent_runner.py sein.
+AGENT_RUNNER_TOKEN: str = os.getenv("AGENT_RUNNER_TOKEN", "")
+# Wie lange ein offener Tool-Call im Queue auf Abholung/Antwort warten darf.
+AGENT_TOOL_TIMEOUT: float = float(os.getenv("AGENT_TOOL_TIMEOUT", "120"))
 
 
 # ── Laguna-S-2.1 Modell-Erkennung ─────────────────────────────────────────
@@ -3112,10 +3125,14 @@ async def _run_coworker_call(tool_call: Dict[str, Any],
     context = str(args.get("context", "") or "")
 
     started = time.perf_counter()
-    body = _build_coworker_body(task, context, extra_context=extra_context)
-    # inject_hindsight=False: kein Hindsight-Recall fuer Co-Worker-Calls
-    # (vermeidet Kontamination des Co-Worker-Sessions mit Haupt-History)
-    result = await _call_single_model(body, "coworker", 0, inject_hindsight=False)
+    if COWORKER_AGENT_MODE:
+        # v4 Agent-Mode: agentischer Loop mit Tool-Zugriff (Runner-Relay)
+        result = await _run_coworker_agent(task, context, extra_context=extra_context)
+    else:
+        body = _build_coworker_body(task, context, extra_context=extra_context)
+        # inject_hindsight=False: kein Hindsight-Recall fuer Co-Worker-Calls
+        # (vermeidet Kontamination des Co-Worker-Sessions mit Haupt-History)
+        result = await _call_single_model(body, "coworker", 0, inject_hindsight=False)
     duration = time.perf_counter() - started
 
     if result.get("status") == "ok":
@@ -3143,6 +3160,204 @@ async def _run_coworker_call(tool_call: Dict[str, Any],
         "content": f"[Co-Worker nicht verfuegbar]\n{err}",
         "reasoning_content": None,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Co-Worker Agent-Mode (v4) ── Tool-Relay zum lokalen Runner
+# ═══════════════════════════════════════════════════════════════════════════
+# Der Proxy-Container hat keinen Dateizugriff — die Workspace-Files liegen
+# beim User. Der agentische Loop laeuft trotzdem IM Proxy (Coworker-Modell
+# ↔ tool_calls ↔ Ergebnisse), aber die Tool-AUSFUEHRUNG relayed der Proxy an
+# einen kleinen Runner auf dem User-PC, der per Long-Polling an der Queue
+# haengt und read_file/write_file/list_dir/web_search lokal ausfuehrt.
+
+_COWORKER_AGENT_SYSTEM_PROMPT: str = (
+    "You are an autonomous coding subagent running on a separate machine. "
+    "You have FULL tool access to the user's workspace via the provided "
+    "tools: you can read files, write files, list directories and search "
+    "the web. Work iteratively: call tools as needed, inspect results, and "
+    "continue until the task is fully done. When finished, respond with a "
+    "concise final summary of what you did (including created/modified "
+    "file paths). Be efficient: batch independent operations."
+)
+
+_COWORKER_AGENT_TOOLS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a text file from the user's workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative or absolute file path."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Create or overwrite a text file in the user's workspace. Parent directories are created automatically.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative or absolute file path."},
+                    "content": {"type": "string", "description": "Full file content to write."},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": "List directory entries (name, type, size).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path ('.' = workspace root)."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web and return snippets (DuckDuckGo HTML endpoint, no API key needed).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
+
+# ── Tool-Call-Queue (Proxy ↔ Runner) ──────────────────────────────────────
+# Eintrag: {call_id, task_id, name, arguments, result, error, done}
+# Der Runner long-pollt /agent/tools/claim und /agent/tools/result.
+_AGENT_TOOL_QUEUE: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue(maxsize=64)
+_AGENT_TOOL_PENDING: Dict[str, Dict[str, Any]] = {}   # call_id -> entry
+_AGENT_RUNNER_SEEN: float = 0.0                        # letzter Runner-Poll
+
+
+def _agent_runner_online() -> bool:
+    """Runner gilt als online, wenn er in den letzten 90s gepollt hat."""
+    return _AGENT_RUNNER_SEEN > 0 and (time.time() - _AGENT_RUNNER_SEEN) < 90.0
+
+
+async def _execute_tool_via_runner(name: str, arguments: Dict[str, Any],
+                                   task_id: str = "") -> str:
+    """Reicht EINEN Tool-Call an den lokalen Runner weiter und wartet auf das
+    Ergebnis. Wirft RuntimeError bei Timeout/keinem Runner."""
+    if not _agent_runner_online():
+        raise RuntimeError(
+            "Kein Agent-Runner verbunden — starte tools/agent_runner.py lokal "
+            "(der Proxy-Container hat keinen Dateizugriff).")
+    call_id = f"tc_{uuid.uuid4().hex[:12]}"
+    entry: Dict[str, Any] = {
+        "call_id": call_id, "task_id": task_id, "name": name,
+        "arguments": arguments, "result": None, "error": None,
+        "done": asyncio.Event(),
+    }
+    _AGENT_TOOL_PENDING[call_id] = entry
+    try:
+        await asyncio.wait_for(_AGENT_TOOL_QUEUE.put(entry), timeout=5.0)
+        try:
+            await asyncio.wait_for(entry["done"].wait(), timeout=AGENT_TOOL_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"Tool-Timeout ({AGENT_TOOL_TIMEOUT}s): {name}")
+        if entry["error"]:
+            return f"[Tool-Fehler] {entry['error']}"
+        return str(entry["result"] or "")
+    finally:
+        _AGENT_TOOL_PENDING.pop(call_id, None)
+
+
+async def _run_coworker_agent(task_text: str, context_text: str,
+                              extra_context: Optional[str] = None,
+                              task_id: str = "") -> Dict[str, Any]:
+    """Agentischer Loop: Coworker-Modell mit Tools, Tool-Calls werden per
+    Relay ausgefuehrt, bis das Modell final antwortet oder Max-Runden erreicht.
+    Returns wie _call_single_model: {status, content, ...}."""
+    defs = _model_defs("coworker")
+    if not defs:
+        return {"status": "error", "content": "coworker nicht konfiguriert"}
+    cat = defs[0]
+    api_url = cat["api_url"].rstrip("/")
+    api_key = cat.get("api_key", "")
+
+    user_content = task_text.strip()
+    if context_text.strip():
+        user_content += f"\n\n## Context\n{context_text.strip()}"
+    if extra_context:
+        user_content += ("\n\n## Dateiinhalte aus dem Chat (automatisch angehaengt)\n"
+                         + extra_context)
+    if COWORKER_TASK_CAP > 0 and len(user_content) > COWORKER_TASK_CAP:
+        user_content = user_content[:COWORKER_TASK_CAP] + "\n…[gekappt]"
+
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": _COWORKER_AGENT_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+    async with httpx.AsyncClient(timeout=float(cat.get("timeout_seconds", 300))) as client:
+        content = ""
+        for round_no in range(1, COWORKER_AGENT_MAX_ROUNDS + 1):
+            body = {
+                "model": cat["model_name"],
+                "messages": messages,
+                "tools": _COWORKER_AGENT_TOOLS,
+                "tool_choice": "auto",
+                "stream": False,
+            }
+            resp = await client.post(api_url, json=body,
+                                     headers={"Authorization": f"Bearer {api_key}"} if api_key else {})
+            if resp.status_code != 200:
+                return {"status": "error",
+                        "content": f"Coworker HTTP {resp.status_code}: {resp.text[:300]}"}
+            msg = ((resp.json() or {}).get("choices") or [{}])[0].get("message") or {}
+            tool_calls = msg.get("tool_calls")
+            content = msg.get("content") or ""
+
+            if not tool_calls:
+                return {"status": "ok", "content": content, "rounds": round_no}
+
+            messages.append({"role": "assistant", "content": content,
+                             "tool_calls": tool_calls})
+
+            async def _exec(tc: Dict[str, Any]) -> Dict[str, Any]:
+                fn = tc.get("function") or {}
+                name = str(fn.get("name", ""))
+                raw_args = fn.get("arguments", "{}")
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                except (json.JSONDecodeError, ValueError):
+                    args = {}
+                if not isinstance(args, dict):
+                    args = {}
+                try:
+                    res = await _execute_tool_via_runner(name, args, task_id)
+                    return {"role": "tool", "tool_call_id": tc.get("id"),
+                            "name": name, "content": res}
+                except Exception as exc:
+                    return {"role": "tool", "tool_call_id": tc.get("id"),
+                            "name": name, "content": f"[Tool-Fehler] {_safe_str(exc)}"}
+
+            results = await asyncio.gather(*[_exec(tc) for tc in tool_calls])
+            messages.extend(results)
+
+        return {"status": "ok",
+                "content": "[Subagent: Max-Runden erreicht — Teilergebnis]\n" + content,
+                "rounds": COWORKER_AGENT_MAX_ROUNDS}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3224,10 +3439,17 @@ async def _run_bg_coworker_task(task: CoworkerTask, tool_call_args: Dict[str, An
     task_text = str(tool_call_args.get("task", "") or "")
     context_text = str(tool_call_args.get("context", "") or "")
     try:
-        body = _build_coworker_body(task_text, context_text, extra_context=task.file_context)
-        # Begrenzung der parallelen Co-Worker-Calls passiert HIER, vor dem Call
-        async with _coworker_semaphore():
-            result = await _call_single_model(body, "coworker", 0, inject_hindsight=False)
+        if COWORKER_AGENT_MODE:
+            # v4 Agent-Mode: agentischer Loop mit Tool-Zugriff
+            async with _coworker_semaphore():
+                result = await _run_coworker_agent(task_text, context_text,
+                                                   extra_context=task.file_context,
+                                                   task_id=task.task_id)
+        else:
+            body = _build_coworker_body(task_text, context_text, extra_context=task.file_context)
+            # Begrenzung der parallelen Co-Worker-Calls passiert HIER, vor dem Call
+            async with _coworker_semaphore():
+                result = await _call_single_model(body, "coworker", 0, inject_hindsight=False)
         duration = time.perf_counter() - started
         if result.get("status") == "ok":
             content = result.get("content", "") or ""
@@ -5901,6 +6123,68 @@ async def debug_file(file_id: str, request: Request):
     except Exception as exc:
         return JSONResponse(status_code=500, content={"error": str(exc)})
     return JSONResponse(content={"name": file_id, "content": content})
+
+
+# ── Agent-Runner-API (v4): lokaler Runner long-pollt diese Endpoints ──────
+async def _agent_auth(request: Request) -> None:
+    """Auth fuer Runner-Endpoints: PROXY_API_KEY oder AGENT_RUNNER_TOKEN."""
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if not token:
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    for candidate in (AGENT_RUNNER_TOKEN, os.getenv("PROXY_API_KEY", "")):
+        if candidate and secrets.compare_digest(token, candidate):
+            return
+    raise HTTPException(status_code=403, detail="invalid runner token")
+
+
+@app.get("/agent/status")
+async def agent_status(request: Request):
+    await _agent_auth(request)
+    return JSONResponse(content={
+        "runner_online": _agent_runner_online(),
+        "last_seen": _AGENT_RUNNER_SEEN,
+        "queue_depth": _AGENT_TOOL_QUEUE.qsize(),
+        "pending": len(_AGENT_TOOL_PENDING),
+        "agent_mode": COWORKER_AGENT_MODE,
+    })
+
+
+@app.get("/agent/tools/claim")
+async def agent_tools_claim(request: Request, wait: float = 25.0):
+    """Long-Poll: liefert den naechsten Tool-Call (oder 204 nach wait Sek.)."""
+    await _agent_auth(request)
+    global _AGENT_RUNNER_SEEN
+    _AGENT_RUNNER_SEEN = time.time()
+    deadline = time.monotonic() + max(0.0, min(wait, 60.0))
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return Response(status_code=204)
+        try:
+            entry = await asyncio.wait_for(_AGENT_TOOL_QUEUE.get(), timeout=min(remaining, 5.0))
+        except asyncio.TimeoutError:
+            continue
+        return JSONResponse(content={
+            "call_id": entry["call_id"], "task_id": entry["task_id"],
+            "name": entry["name"], "arguments": entry["arguments"],
+        })
+
+
+@app.post("/agent/tools/result")
+async def agent_tools_result(request: Request):
+    """Runner liefert das Ergebnis eines Tool-Calls zurueck."""
+    await _agent_auth(request)
+    body = await request.json()
+    call_id = str(body.get("call_id", ""))
+    entry = _AGENT_TOOL_PENDING.get(call_id)
+    if entry is None:
+        return JSONResponse(status_code=404, content={"error": f"unknown call_id {call_id}"})
+    entry["result"] = body.get("result")
+    entry["error"] = body.get("error")
+    entry["done"].set()
+    return JSONResponse(content={"ok": True})
+
 
 
 @app.get("/debug/ring")

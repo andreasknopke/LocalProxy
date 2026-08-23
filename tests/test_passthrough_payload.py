@@ -1726,7 +1726,10 @@ def test_extract_conversation_files_empty():
 
 
 def test_run_coworker_call_error_becomes_tool_result(monkeypatch):
-    """Co-Worker-Ausfall wird tool-result mit Fehlertext, kein Crash."""
+    """Co-Worker-Ausfall wird tool-result mit Fehlertext, kein Crash.
+    (Legacy-Pfad: COWORKER_AGENT_MODE=False — der Agent-Mode hat eigene
+    Tests in tests/test_coworker_agent.py.)"""
+    monkeypatch.setattr(proxy, "COWORKER_AGENT_MODE", False)
     monkeypatch.setattr(proxy, "_MODEL_CATEGORIES", {
         **proxy._MODEL_CATEGORIES,
         "coworker": _coworker_def(api_url="http://127.0.0.1:1/v1/chat/completions"),
