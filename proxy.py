@@ -2318,6 +2318,11 @@ def _inject_local_anti_loop_system(messages: List[Dict[str, Any]]) -> None:
 
     Wird NACH der ersten System-Message (falls vorhanden) eingefuegt,
     damit der Modell-eigene System-Prompt Vorrang hat.
+
+    ACHTUNG: Wuerde eine ZWEITE system-Message erzeugen — Jinja-Challenge-
+    Templates (Qwen etc.) verbieten system nach Position 0. Bei Reaktivierung:
+    in die erste system-Message mergen (siehe _inject_coworker_tool /
+    _inject_hindsight_context).
     """
     if not LOCAL_ANTI_LOOP_SYSTEM_PROMPT.strip():
         return
@@ -2382,11 +2387,16 @@ def _inject_hindsight_context(messages: List[Dict[str, Any]]) -> None:
     records = _hindsight.recall(query)
     context = _hindsight.format_context(records)
     if context:
-        messages.insert(0, {
-            "role": "system",
-            "content": f"[HINDSIGHT MEMORY CONTEXT]\n{context}\n[/HINDSIGHT]",
-        })
-        _log(f"Hindsight-Recall: {len(records)} records als System-Message-Praefix")
+        # Merge in die BESTEHENDE erste system-Message statt neue an Index 0
+        # einzufuegen — Jinja-Templates (Qwen etc.) verbieten system-Nachrichten
+        # nach Position 0 ("System message must be at the beginning").
+        first = messages[0] if messages and isinstance(messages[0], dict) else None
+        block = f"[HINDSIGHT MEMORY CONTEXT]\n{context}\n[/HINDSIGHT]"
+        if first is not None and first.get("role") == "system":
+            first["content"] = str(first.get("content") or "").rstrip() + "\n\n" + block
+        else:
+            messages.insert(0, {"role": "system", "content": block})
+        _log(f"Hindsight-Recall: {len(records)} records (in System-Message gemerged)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2907,24 +2917,30 @@ def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
             tools.append(copy.deepcopy(_COWORKER_COLLECT_TOOL_DEF))
     if "tool_choice" not in payload:
         payload["tool_choice"] = "auto"
-    # Bootstrap-Guidance: system-Message direkt nach der Client-System-Message.
-    # Ohne diesen Hinweis nutzen lokale Modelle die Co-Worker-Tools in der
-    # Praxis nicht (Tool-Beschreibungen allein reichen nicht) — getestet in
-    # test_inject_coworker_tool_ok / test_inject_coworker_tool_fork_join.
+    # Bootstrap-Guidance: an die BESTEHENDE System-Message anhaengen (merge),
+    # NICHT als zusaetzliche system-Message einfuegen — Qwen-/Jinja-Challenge-
+    # Templates erlauben system NUR als allererste Message ("System message
+    # must be at the beginning", sonst 500 vom Backend). Ohne Guidance nutzen
+    # lokale Modelle die Co-Worker-Tools in der Praxis nicht.
     if COWORKER_TEACH_DELEGATION:
         messages = payload.get("messages")
         if isinstance(messages, list):
             has_guidance = any(
-                isinstance(m, dict) and m.get("role") == "system"
+                isinstance(m, dict)
                 and "[PROXY DELEGATION GUIDANCE]" in str(m.get("content", ""))
                 for m in messages)
             if not has_guidance:
-                insert_idx = 1 if (messages and isinstance(messages[0], dict)
-                                   and messages[0].get("role") == "system") else 0
-                messages.insert(insert_idx, {
-                    "role": "system",
-                    "content": _COWORKER_GUIDANCE_SYSTEM,
-                })
+                first = messages[0] if messages and isinstance(messages[0], dict) else None
+                if first is not None and first.get("role") == "system":
+                    first["content"] = (
+                        str(first.get("content") or "").rstrip()
+                        + "\n\n" + _COWORKER_GUIDANCE_SYSTEM
+                    )
+                else:
+                    messages.insert(0, {
+                        "role": "system",
+                        "content": _COWORKER_GUIDANCE_SYSTEM,
+                    })
     _log(f"Co-Worker-Tools injiziert (Health-OK"
          f"{', Fork-Join' if COWORKER_FORK_JOIN else ''}"
          f"{', Guidance' if COWORKER_TEACH_DELEGATION else ''})")

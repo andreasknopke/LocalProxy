@@ -1452,7 +1452,8 @@ def test_inject_coworker_tool_ok(monkeypatch):
 
 
 def test_inject_coworker_guidance_system_message(monkeypatch):
-    """Bootstrap-Guidance wird als system-Message injiziert (nach client-system)."""
+    """Bootstrap-Guidance wird in die bestehende system-Message GEMERGET —
+    Qwen-Jinja-Templates verbieten system nach Position 0 (500-Fehler)."""
     _setup_coworker_configured(monkeypatch, fork_join=True)
     payload = {"messages": [
         {"role": "system", "content": "You are GitHub Copilot."},
@@ -1460,16 +1461,16 @@ def test_inject_coworker_guidance_system_message(monkeypatch):
     ]}
     assert proxy._inject_coworker_tool(payload) is True
     msgs = payload["messages"]
-    # guidance nach client-system, vor user
+    assert len(msgs) == 2  # KEINE zusaetzliche Message — in system gemerged
     assert msgs[0]["role"] == "system"
-    assert msgs[1]["role"] == "system"
-    assert "[PROXY DELEGATION GUIDANCE]" in msgs[1]["content"]
-    assert "dispatch_coworker" in msgs[1]["content"]
-    assert msgs[2]["role"] == "user"
+    assert msgs[0]["content"].startswith("You are GitHub Copilot.")
+    assert "[PROXY DELEGATION GUIDANCE]" in msgs[0]["content"]
+    assert "dispatch_coworker" in msgs[0]["content"]
+    assert msgs[1]["role"] == "user"
 
 
 def test_inject_coworker_guidance_no_client_system(monkeypatch):
-    """Ohne client-system landet die Guidance an Index 0."""
+    """Ohne client-system wird die Guidance als neue Message an Index 0 gesetzt."""
     _setup_coworker_configured(monkeypatch, fork_join=True)
     payload = {"messages": [{"role": "user", "content": "hi"}]}
     proxy._inject_coworker_tool(payload)
@@ -1477,6 +1478,19 @@ def test_inject_coworker_guidance_no_client_system(monkeypatch):
     assert msgs[0]["role"] == "system"
     assert "[PROXY DELEGATION GUIDANCE]" in msgs[0]["content"]
     assert msgs[1]["role"] == "user"
+
+
+def test_inject_coworker_guidance_idempotent_with_client_system(monkeypatch):
+    """Merge-Idempotenz: bei bestehender system-Message nicht doppelt anhaengen."""
+    _setup_coworker_configured(monkeypatch, fork_join=True)
+    payload = {"messages": [
+        {"role": "system", "content": "You are GitHub Copilot."},
+        {"role": "user", "content": "hi"},
+    ]}
+    proxy._inject_coworker_tool(payload)
+    proxy._inject_coworker_tool(payload)
+    assert payload["messages"][0]["content"].count("[PROXY DELEGATION GUIDANCE]") == 1
+    assert len(payload["messages"]) == 2
 
 
 def test_inject_coworker_guidance_disabled(monkeypatch):
