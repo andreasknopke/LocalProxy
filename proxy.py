@@ -366,6 +366,10 @@ LOCAL_DRY_PENALTY_LAST_N: int = int(os.getenv("LOCAL_DRY_PENALTY_LAST_N", "-1"))
 LOCAL_DRY_SEQUENCE_BREAKER: str = os.getenv("LOCAL_DRY_SEQUENCE_BREAKER", '\n,:,",*,;,{,}')
 LOCAL_ENABLE_THINKING: bool = os.getenv("LOCAL_ENABLE_THINKING", "true").lower() in {"1", "true", "yes", "y", "on"}
 LOCAL_PRESERVE_THINKING: bool = os.getenv("LOCAL_PRESERVE_THINKING", "true").lower() in {"1", "true", "yes", "y", "on"}
+# Thinking-Mode fuer das lokale Modell: ueberschreibt reasoning_effort aus dem
+# originalen VSCode-Request. "none" = kein Reasoning (Feld wird entfernt).
+LOCAL_THINKING_MODE: str = os.getenv("LOCAL_THINKING_MODE", "none").strip().lower()
+_VALID_THINKING_MODES = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 # Anti-Loop-System-Prompt: wird als zusaetzliche System-Message injiziert
 LOCAL_ANTI_LOOP_SYSTEM_PROMPT: str = os.getenv(
     "LOCAL_ANTI_LOOP_SYSTEM_PROMPT",
@@ -799,7 +803,7 @@ def _apply_config_file() -> None:
     global LOCAL_TEMPERATURE, LOCAL_TOP_P, LOCAL_TOP_K, LOCAL_MIN_P
     global LOCAL_DRY_MULTIPLIER, LOCAL_DRY_BASE, LOCAL_DRY_ALLOWED_LENGTH
     global LOCAL_DRY_PENALTY_LAST_N, LOCAL_DRY_SEQUENCE_BREAKER
-    global LOCAL_ENABLE_THINKING, LOCAL_PRESERVE_THINKING
+    global LOCAL_ENABLE_THINKING, LOCAL_PRESERVE_THINKING, LOCAL_THINKING_MODE
     global LOCAL_ANTI_LOOP_SYSTEM_PROMPT
     local_cfg = tokens_cfg.get("local_sampling", {})
     if isinstance(local_cfg, dict) and local_cfg:
@@ -814,6 +818,8 @@ def _apply_config_file() -> None:
         LOCAL_DRY_SEQUENCE_BREAKER = str(local_cfg.get("dry_sequence_breaker", LOCAL_DRY_SEQUENCE_BREAKER))
         LOCAL_ENABLE_THINKING = bool(local_cfg.get("enable_thinking", LOCAL_ENABLE_THINKING))
         LOCAL_PRESERVE_THINKING = bool(local_cfg.get("preserve_thinking", LOCAL_PRESERVE_THINKING))
+        tm = str(local_cfg.get("thinking_mode", LOCAL_THINKING_MODE)).strip().lower()
+        LOCAL_THINKING_MODE = tm if tm in _VALID_THINKING_MODES else "none"
         al_prompt = local_cfg.get("anti_loop_system_prompt", "")
         if al_prompt:
             LOCAL_ANTI_LOOP_SYSTEM_PROMPT = str(al_prompt)
@@ -2323,6 +2329,42 @@ def _patch_reasoning_effort_payload(payload: Dict[str, Any], cat: Dict[str, Any]
         _log(f"reasoning_effort='{old_val}' entfernt fuer Model '{model_name}' (tools + reasoning_effort inkompatibel)")
 
 
+def _patch_thinking_mode_payload(payload: Dict[str, Any]) -> None:
+    """Setzt den konfigurierten Thinking-Mode (LOCAL_THINKING_MODE) im Payload.
+
+    Ueberschreibt das reasoning_effort aus dem originalen VSCode-Request:
+      - "none"   -> reasoning_effort wird entfernt, enable_thinking=false
+      - sonst    -> reasoning_effort=<mode> + enable_thinking=true
+    """
+    mode = LOCAL_THINKING_MODE
+    if mode not in _VALID_THINKING_MODES:
+        return
+    if mode == "none":
+        if "reasoning_effort" in payload:
+            _log(f"Thinking-Mode 'none': reasoning_effort='{payload.pop('reasoning_effort')}' entfernt")
+        ctk = payload.get("chat_template_kwargs")
+        if isinstance(ctk, dict):
+            ctk["enable_thinking"] = False
+            ctk["preserve_thinking"] = False
+        else:
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": False, "preserve_thinking": False,
+            }
+        _log("Thinking-Mode 'none' angewendet (Reasoning deaktiviert)")
+        return
+    old = payload.get("reasoning_effort")
+    payload["reasoning_effort"] = mode
+    ctk = payload.get("chat_template_kwargs")
+    if isinstance(ctk, dict):
+        ctk["enable_thinking"] = True
+        ctk["preserve_thinking"] = True
+    else:
+        payload["chat_template_kwargs"] = {
+            "enable_thinking": True, "preserve_thinking": True,
+        }
+    _log(f"Thinking-Mode '{mode}' angewendet (reasoning_effort war: {old!r})")
+
+
 def _clean_payload(payload: Dict[str, Any], keep_tools: bool = False,
                    keep_top_k: bool = False) -> Dict[str, Any]:
     if not payload.get("stream") and "stream_options" in payload:
@@ -2447,6 +2489,7 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
     #     _inject_local_anti_loop_system(messages)
 
     _patch_max_tokens_payload(payload, cat)
+    _patch_thinking_mode_payload(payload)
     _patch_reasoning_effort_payload(payload, cat)
 
     # Reasoning-Restart: Thinking fuer den Folgeturn erzwingen AUS (Modell soll

@@ -303,6 +303,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "dry_sequence_breaker": "\n,:,\",*,;,{,}",
             "enable_thinking": True,
             "preserve_thinking": True,
+            "thinking_mode": "none",
             "anti_loop_system_prompt": "",
         },
     },
@@ -1359,6 +1360,19 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
         </div>
       </div>
       <div class="form-group">
+        <label>Thinking Mode (überschreibt reasoning_effort aus dem VSCode-Request)</label>
+        <select id="local_thinking_mode">
+          <option value="none">none — kein Reasoning</option>
+          <option value="minimal">minimal</option>
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
+          <option value="xhigh">xhigh</option>
+          <option value="max">max</option>
+        </select>
+        <div class="hint">Wird in den ausgehenden Request als reasoning_effort gepatcht (none = Feld entfernt)</div>
+      </div>
+      <div class="form-group">
         <label>Anti-Loop-System-Prompt (optional)</label>
         <textarea id="local_anti_loop_system_prompt" rows="4" placeholder="Leer = Standard-Anti-Loop-Prompt"></textarea>
         <div class="hint">Zusätzlicher System-Prompt der dem lokalen Modell Anti-Loop-Regeln vorgibt.</div>
@@ -1530,6 +1544,7 @@ async function loadConfig() {
     document.getElementById('local_dry_sequence_breaker').value = ls.dry_sequence_breaker || '\\n,:,",*,;,{,}';
     document.getElementById('local_enable_thinking').checked = ls.enable_thinking !== false;
     document.getElementById('local_preserve_thinking').checked = ls.preserve_thinking !== false;
+    document.getElementById('local_thinking_mode').value = ls.thinking_mode || 'none';
     document.getElementById('local_anti_loop_system_prompt').value = ls.anti_loop_system_prompt || '';
 
     // Co-Worker-Delegation Settings
@@ -1666,6 +1681,7 @@ async function saveConfig() {
       dry_sequence_breaker: document.getElementById('local_dry_sequence_breaker').value || '',
       enable_thinking: document.getElementById('local_enable_thinking').checked,
       preserve_thinking: document.getElementById('local_preserve_thinking').checked,
+      thinking_mode: document.getElementById('local_thinking_mode').value || 'none',
       anti_loop_system_prompt: document.getElementById('local_anti_loop_system_prompt').value || '',
     },
   };
