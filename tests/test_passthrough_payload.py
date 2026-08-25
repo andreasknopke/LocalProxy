@@ -1279,6 +1279,59 @@ def test_patch_local_sampling_sets_params():
     assert payload["chat_template_kwargs"]["preserve_thinking"] == proxy.LOCAL_PRESERVE_THINKING
 
 
+# ── Qwen-Anti-Loop-Sampling (qwen3.8-26b etc.) ─────────────────────────────
+
+def test_patch_qwen_anti_loop_sets_params():
+    """Qwen-Modell -> temp=0.3, presence_penalty=1.5, top_p=0.95 erzwungen."""
+    payload = {"temperature": 1.0, "top_p": 1.0, "presence_penalty": 0.0}
+    proxy._patch_qwen_anti_loop_payload(payload, "qwen3.8-26b")
+    assert payload["temperature"] == 0.3
+    assert payload["presence_penalty"] == 1.5
+    assert payload["top_p"] == 0.95
+
+
+def test_patch_qwen_anti_loop_idempotent():
+    """Bereits korrekte Werte -> keine Aenderung, keine Fehler."""
+    payload = {"temperature": 0.3, "top_p": 0.95, "presence_penalty": 1.5}
+    proxy._patch_qwen_anti_loop_payload(payload, "Qwen/Qwen3-Next-80B")
+    assert payload["temperature"] == 0.3
+    assert payload["presence_penalty"] == 1.5
+    assert payload["top_p"] == 0.95
+
+
+def test_patch_qwen_anti_loop_ignores_non_qwen():
+    """Nicht-Qwen-Modell -> Payload unveraendert."""
+    payload = {"temperature": 1.0, "top_p": 1.0, "presence_penalty": 0.0}
+    proxy._patch_qwen_anti_loop_payload(payload, "gpt-4.1-mini")
+    assert payload["temperature"] == 1.0
+    assert payload["top_p"] == 1.0
+    assert payload["presence_penalty"] == 0.0
+
+
+def test_build_passthrough_payload_qwen_anti_loop(monkeypatch):
+    """Passthrough-Payload fuer Qwen local-Modell enthaelt Anti-Loop-Werte."""
+    monkeypatch.setitem(proxy._MODEL_CATEGORIES["local"], "model_name", "qwen3.8-26b")
+    body = {"model": "irrelevant", "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 1.0, "top_p": 1.0, "presence_penalty": 0.0}
+    payload = proxy._build_passthrough_payload(body, "local", 0)
+    assert payload["temperature"] == 0.3
+    assert payload["presence_penalty"] == 1.5
+    assert payload["top_p"] == 0.95
+
+
+def test_build_passthrough_payload_coworker_qwen_anti_loop(monkeypatch):
+    """Passthrough-Payload fuer Qwen coworker-Modell enthaelt Anti-Loop-Werte."""
+    monkeypatch.setitem(proxy._MODEL_CATEGORIES["coworker"], "model_name", "qwen3.8-26b")
+    monkeypatch.setitem(proxy._MODEL_CATEGORIES["coworker"], "api_url", "http://localhost:9999/v1/chat/completions")
+    body = {"model": "irrelevant", "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 1.0, "top_p": 1.0, "presence_penalty": 0.0}
+    payload = proxy._build_passthrough_payload(body, "coworker", 0)
+    assert payload["model"] == "qwen3.8-26b"
+    assert payload["temperature"] == 0.3
+    assert payload["presence_penalty"] == 1.5
+    assert payload["top_p"] == 0.95
+
+
 def test_inject_local_anti_loop_system_no_existing_system():
     """Anti-Loop-Prompt wird an Position 0 eingefuegt wenn kein system vorhanden."""
     msgs = [{"role": "user", "content": "hello"}]

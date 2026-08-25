@@ -579,6 +579,19 @@ def _is_laguna_model(model_name: str) -> bool:
     return bool(model_name and _LAGUNA_MODEL_RE.search(model_name))
 
 
+# ── Qwen-Modell-Erkennung ─────────────────────────────────────────────────
+# Qwen-Reasoning-Modelle (Qwen3 etc.) neigen zu Endlos-Denkschleifen — die
+# Anti-Loop-Sampling-Parameter gelten deshalb fuer ALLE Qwen-Modelle, egal
+# ob local oder coworker, egal welche Groesse/Quantisierung (qwen3.8-26b,
+# Qwen/Qwen3-Next-80B, qwen3-coder, ...).
+_QWEN_MODEL_RE = re.compile(r"qwen", re.IGNORECASE)
+
+
+def _is_qwen_model(model_name: str) -> bool:
+    """True wenn der Modellname ein Qwen-Modell ist (case-insensitive)."""
+    return bool(model_name and _QWEN_MODEL_RE.search(model_name))
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Config aus config.json laden (nachdem Globals initialisiert sind)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2437,6 +2450,42 @@ def _patch_local_sampling_payload(payload: Dict[str, Any]) -> None:
          f"thinking={LOCAL_ENABLE_THINKING}, preserve={LOCAL_PRESERVE_THINKING}")
 
 
+# ── Qwen-Anti-Loop-Sampling ────────────────────────────────────────────────
+# Qwen-Reasoning-Modelle (z.B. qwen3.8-26b) neigen zu Endlos-Denkschleifen.
+# Als Anti-Loop-Strategie werden fuer Qwen-Modelle — lokal UND Coworker —
+# IMMER folgende Parameter erzwungen, egal was der VS-Code-Client sendet:
+#   temperature=0.3, presence_penalty=1.5, top_p=0.95
+_QWEN_ANTI_LOOP_TEMPERATURE: float = 0.3
+_QWEN_ANTI_LOOP_PRESENCE_PENALTY: float = 1.5
+_QWEN_ANTI_LOOP_TOP_P: float = 0.95
+
+
+def _patch_qwen_anti_loop_payload(payload: Dict[str, Any], model_name: str) -> None:
+    """Erzwingt Qwen-Anti-Loop-Sampling — NUR wenn model_name ein Qwen-Modell ist.
+
+    Wie der fruehere Moonshot-Patch: ueberschreibt die vom Client gesendeten
+    Sampling-Parameter hart mit den Anti-Loop-Werten (temp=0.3,
+    presence_penalty=1.5, top_p=0.95) und loggt die Aenderungen.
+    """
+    if not _is_qwen_model(model_name):
+        return
+    fixes = []
+    cur = payload.get("temperature")
+    if cur != _QWEN_ANTI_LOOP_TEMPERATURE:
+        fixes.append(f"temp {cur}->{_QWEN_ANTI_LOOP_TEMPERATURE}")
+        payload["temperature"] = _QWEN_ANTI_LOOP_TEMPERATURE
+    cur = payload.get("presence_penalty")
+    if cur != _QWEN_ANTI_LOOP_PRESENCE_PENALTY:
+        fixes.append(f"presence_penalty {cur}->{_QWEN_ANTI_LOOP_PRESENCE_PENALTY}")
+        payload["presence_penalty"] = _QWEN_ANTI_LOOP_PRESENCE_PENALTY
+    cur = payload.get("top_p")
+    if cur != _QWEN_ANTI_LOOP_TOP_P:
+        fixes.append(f"top_p {cur}->{_QWEN_ANTI_LOOP_TOP_P}")
+        payload["top_p"] = _QWEN_ANTI_LOOP_TOP_P
+    if fixes:
+        _log(f"Qwen-Anti-Loop: {'; '.join(fixes)} (model={model_name})")
+
+
 def _inject_local_anti_loop_system(messages: List[Dict[str, Any]]) -> None:
     """Injiziert Anti-Loop-System-Prompt fuer Laguna-S-2.1 Modelle.
 
@@ -2468,6 +2517,11 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
     payload["model"] = cat["model_name"]
     payload["max_tokens"] = int(cat.get("max_tokens", 65536))
     payload["stream"] = False
+
+    # Qwen-Anti-Loop: fuer Qwen-Modelle (local UND coworker) IMMER die
+    # Loop-Schutz-Sampling-Parameter erzwingen (temp=0.3,
+    # presence_penalty=1.5, top_p=0.95).
+    _patch_qwen_anti_loop_payload(payload, cat["model_name"])
 
     messages = payload.get("messages", [])
     if not isinstance(messages, list):
@@ -3436,6 +3490,9 @@ async def _run_coworker_agent(task_text: str, context_text: str,
                 "tool_choice": "auto",
                 "stream": False,
             }
+            # Qwen-Anti-Loop: auch im Agent-Loop des Coworkers die Loop-Schutz-
+            # Sampling-Parameter erzwingen (temp=0.3, presence_penalty=1.5, top_p=0.95).
+            _patch_qwen_anti_loop_payload(body, cat["model_name"])
             resp = await client.post(api_url, json=body,
                                      headers={"Authorization": f"Bearer {api_key}"} if api_key else {})
             if resp.status_code != 200:
