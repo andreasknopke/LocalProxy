@@ -352,6 +352,9 @@ def test_build_passthrough_payload_force_no_thinking_sets_chat_template(monkeypa
                   "max_tokens": 4096, "is_vision": False},
     })
     monkeypatch.setattr(proxy, "COWORKER_ENABLED", False)
+    # Thinking-Mode deaktivieren, damit _patch_thinking_mode_payload kein
+    # chat_template_kwargs unabhaengig von force_no_thinking setzt.
+    monkeypatch.setattr(proxy, "LOCAL_THINKING_MODE", "")
     p = proxy._build_passthrough_payload(
         {"messages": [{"role": "user", "content": "hi"}]},
         "local", 0, force_no_thinking=True)
@@ -456,10 +459,18 @@ def test_backend_turn_prefers_explicit_reasoning_field(monkeypatch):
 # 4c. Co-Worker-Phase — Reasoning live streamen (Issue 1)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def test_coworker_phase_streams_reasoning_live(monkeypatch):
-    """Das reasoning_content des Co-Workers wird als eigener Reasoning-Context
-    live an VS Code gestreamt; die Antwort landet in den tool results."""
-    async def fake_single(body, category, def_idx, inject_hindsight=True, force_no_thinking=False):
+def test_tunnel_phase_streams_reasoning_and_final(monkeypatch):
+    """Die Tunnel-Phase streamt das Co-Worker-Reasoning live und markiert die
+    Session als final (Antwort als tool-result, keine getunnelten Calls)."""
+    monkeypatch.setattr(proxy, "_MODEL_CATEGORIES", {
+        **proxy._MODEL_CATEGORIES,
+        "coworker": {"api_url": "http://spark:30000/v1/chat/completions",
+                     "api_key": "", "model_name": "qwen3.8-27b",
+                     "timeout_seconds": 60},
+    })
+
+    async def fake_single(body, category, def_idx=0, inject_hindsight=True,
+                          force_no_thinking=False):
         assert category == "coworker"
         assert inject_hindsight is False
         yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "Co-Worker denkt "}, "finish_reason": None}}
@@ -469,78 +480,121 @@ def test_coworker_phase_streams_reasoning_live(monkeypatch):
         yield {"type": "done"}
 
     monkeypatch.setattr(proxy, "_stream_single_model_events", fake_single)
-    calls = [{"id": "call_1", "function": {"name": "ask_coworker",
-             "arguments": '{"task": "T", "context": "C"}'}}]
-    coworker_state: Dict[str, Any] = {"stream_id": "test-stream", "model": "local-model"}
-    sse = _collect_sse(proxy._stream_coworker_phase(calls, coworker_state))
+    sess = proxy._cw_session_new("T", "C", client_tools=[])
+    state: Dict[str, Any] = {"stream_id": "test-stream", "model": "local-model"}
+    sse = _collect_sse(proxy._stream_coworker_tunnel_phase([sess], state))
     joined = "\n".join(sse)
 
     # Reasoning streamt live als eigener Context
     assert "Co-Worker denkt" in joined
     assert "weiter" in joined
     assert '"reasoning_content"' in joined
-    # Antwort streamt LIVE token-fuer-token (Header + Content als Content-Chunks)
-    assert "[Proxy] Co-Worker-Antwort:" in joined
+    # Antwort streamt LIVE token-fuer-token
+    assert "[Proxy] Co-Worker" in joined
     assert "Ergebnis: mach X" in joined
     assert "<think>" not in joined
 
-    results = coworker_state["coworker_results"]
-    assert len(results) == 1
-    assert results[0]["role"] == "tool"
-    assert results[0]["content"] == "Ergebnis: mach X"
-    assert results[0]["reasoning_content"] == "Co-Worker denkt weiter"
+    assert state["fwd_calls"] == []
+    assert len(state["finals"]) == 1
+    assert sess["done"] is True
+    assert sess["final"] == "Ergebnis: mach X"
 
 
-def test_coworker_phase_streams_think_tags_live(monkeypatch):
-    """Co-Worker mit <think>-Tags im content (vLLM Qwen3): Reasoning wird als
-    reasoning_content gemappt und gestreamt, Antwort-Content streamt live."""
-    async def fake_single(body, category, def_idx, inject_hindsight=True, force_no_thinking=False):
+def test_tunnel_phase_streams_think_tags(monkeypatch):
+    """Co-Worker mit <think>-Tags im content: Reasoning wird als
+    reasoning_content gemappt und gestreamt."""
+    monkeypatch.setattr(proxy, "_MODEL_CATEGORIES", {
+        **proxy._MODEL_CATEGORIES,
+        "coworker": {"api_url": "http://spark:30000/v1/chat/completions",
+                     "api_key": "", "model_name": "qwen3.8-27b",
+                     "timeout_seconds": 60},
+    })
+
+    async def fake_single(body, category, def_idx=0, inject_hindsight=True,
+                          force_no_thinking=False):
         yield {"type": "chunk", "choice": {"delta": {"content": "<think>ueberleg</think>Ergebnis"}, "finish_reason": None}}
         yield {"type": "done"}
 
     monkeypatch.setattr(proxy, "_stream_single_model_events", fake_single)
-    calls = [{"id": "call_1", "function": {"name": "ask_coworker",
-             "arguments": '{"task": "T"}'}}]
-    coworker_state: Dict[str, Any] = {"stream_id": "test-stream", "model": "local-model"}
-    sse = _collect_sse(proxy._stream_coworker_phase(calls, coworker_state))
+    sess = proxy._cw_session_new("T", "", client_tools=[])
+    state: Dict[str, Any] = {"stream_id": "test-stream", "model": "local-model"}
+    sse = _collect_sse(proxy._stream_coworker_tunnel_phase([sess], state))
     joined = "\n".join(sse)
 
     assert "ueberleg" in joined
     assert '"reasoning_content"' in joined
     assert "<think>" not in joined
     assert "Ergebnis" in joined
-    assert "[Proxy] Co-Worker-Antwort:" in joined
+    assert "[Proxy] Co-Worker" in joined
 
-    results = coworker_state["coworker_results"]
-    assert results[0]["content"] == "Ergebnis"
-    assert results[0]["reasoning_content"] == "ueberleg"
+    assert sess["done"] is True
+    assert sess["final"] == "Ergebnis"
 
 
-def test_coworker_phase_streams_error(monkeypatch):
+def test_tunnel_phase_streams_error(monkeypatch):
     """Fehler beim Co-Worker werden ebenfalls live sichtbar gestreamt."""
-    async def fake_single(body, category, def_idx, inject_hindsight=True, force_no_thinking=False):
+    monkeypatch.setattr(proxy, "_MODEL_CATEGORIES", {
+        **proxy._MODEL_CATEGORIES,
+        "coworker": {"api_url": "http://spark:30000/v1/chat/completions",
+                     "api_key": "", "model_name": "qwen3.8-27b",
+                     "timeout_seconds": 60},
+    })
+
+    async def fake_single(body, category, def_idx=0, inject_hindsight=True,
+                          force_no_thinking=False):
         yield {"type": "error", "status_code": 500, "content": "Model kaputt",
                "trigger_fallback": True}
 
     monkeypatch.setattr(proxy, "_stream_single_model_events", fake_single)
-    calls = [{"id": "call_1", "function": {"name": "ask_coworker",
-             "arguments": '{"task": "T"}'}}]
-    coworker_state: Dict[str, Any] = {"stream_id": "test-stream", "model": "local-model"}
-    sse = _collect_sse(proxy._stream_coworker_phase(calls, coworker_state))
+    sess = proxy._cw_session_new("T", "", client_tools=[])
+    state: Dict[str, Any] = {"stream_id": "test-stream", "model": "local-model"}
+    sse = _collect_sse(proxy._stream_coworker_tunnel_phase([sess], state))
     joined = "\n".join(sse)
 
-    assert "[Proxy] Co-Worker-Antwort:" in joined
+    assert "[Proxy] Co-Worker" in joined
     assert "Model kaputt" in joined
-    results = coworker_state["coworker_results"]
-    assert len(results) == 1
-    assert results[0]["role"] == "tool"
-    assert "Model kaputt" in results[0]["content"]
+    assert len(state["finals"]) == 1
+    assert sess["done"] is True
+    assert "Model kaputt" in sess["final"]
+
+
+def test_tunnel_phase_tunnels_tool_calls(monkeypatch):
+    """Endet die Runde mit tool_calls, werden getunnelte cws_-IDs in fwd_calls
+    gelegt und die Session pausiert (nicht final)."""
+    monkeypatch.setattr(proxy, "_MODEL_CATEGORIES", {
+        **proxy._MODEL_CATEGORIES,
+        "coworker": {"api_url": "http://spark:30000/v1/chat/completions",
+                     "api_key": "", "model_name": "qwen3.8-27b",
+                     "timeout_seconds": 60},
+    })
+
+    async def fake_single(body, category, def_idx=0, inject_hindsight=True,
+                          force_no_thinking=False):
+        yield {"type": "chunk", "choice": {"delta": {"tool_calls": [
+            {"index": 0, "id": "call_1", "type": "function",
+             "function": {"name": "read_file", "arguments": '{"filePath": "a.py"}'}},
+        ]}, "finish_reason": None}}
+        yield {"type": "done"}
+
+    monkeypatch.setattr(proxy, "_stream_single_model_events", fake_single)
+    sess = proxy._cw_session_new("T", "", client_tools=[])
+    state: Dict[str, Any] = {"stream_id": "test-stream", "model": "local-model"}
+    sse = _collect_sse(proxy._stream_coworker_tunnel_phase([sess], state))
+    joined = "\n".join(sse)
+
+    assert state["fwd_calls"]
+    tc = state["fwd_calls"][0]
+    assert tc["id"].startswith(proxy.CW_TUNNEL_ID_PREFIX)
+    assert tc["function"]["name"] == "read_file"
+    assert sess["done"] is False
+    assert sess["pending"]
+    assert state["finals"] == []
 
 
 def test_local_events_strips_coworker_reasoning_from_history(monkeypatch):
-    """reasoning_content der Co-Worker-tool-results wird live als
-    Reasoning-Context gestreamt, aber NICHT in die History geschrieben
-    (kein unbekanntes Feld am Backend des Hauptmodells)."""
+    """Die finale Co-Worker-Antwort wird als ask/result-Paar in die History
+    geschrieben (ohne reasoning_content); der Tunnel bleibt dem Backend
+    verborgen."""
     calls = {"call_count": 0}
 
     async def fake_backend_turn(body, category, force_start_idx, state):
@@ -568,31 +622,41 @@ def test_local_events_strips_coworker_reasoning_from_history(monkeypatch):
             yield proxy._format_openai_stream_chunk("local-model", content="Endergebnis",
                                                     include_role=True, chunk_id="test")
 
-    async def fake_single(body, category, def_idx, inject_hindsight=True, force_no_thinking=False):
-        yield {"type": "chunk", "choice": {"delta": {"reasoning_content": "denkt"}, "finish_reason": None}}
-        yield {"type": "chunk", "choice": {"delta": {"content": "Antwort"}, "finish_reason": None}}
-        yield {"type": "done"}
+    async def fake_tunnel_phase(sessions, coworker_state):
+        for s in sessions:
+            s["done"] = True
+            s["final"] = "Antwort"
+        coworker_state["fwd_calls"] = []
+        coworker_state["finals"] = sessions
+        yield proxy._format_openai_stream_chunk(
+            "local-model", content="[Proxy] Co-Worker-Antwort:\nAntwort",
+            include_role=False, chunk_id="test")
+        yield ": keepalive\n\n"
 
     async def noop_retain(body, content):
         pass
 
     monkeypatch.setattr(proxy, "_stream_backend_turn", fake_backend_turn)
-    monkeypatch.setattr(proxy, "_stream_single_model_events", fake_single)
+    monkeypatch.setattr(proxy, "_stream_coworker_tunnel_phase", fake_tunnel_phase)
     monkeypatch.setattr(proxy._hindsight, "retain_async", noop_retain)
 
     body: Dict[str, Any] = {"messages": [{"role": "user", "content": "mach was\n--local"}]}
     sse = _collect_sse(proxy._stream_local_events(body, "local", None))
     joined = "\n".join(sse)
 
-    # Reasoning live als Reasoning-Context gestreamt + Antwort-Inject
-    assert "denkt" in joined
-    assert '"reasoning_content"' in joined
+    # Delegation + Co-Worker-Antwort sichtbar
+    assert "[Proxy] Delegation an Co-Worker" in joined
     assert "[Proxy] Co-Worker-Antwort:" in joined
-    # History ohne reasoning_content
+    assert "Antwort" in joined
+    # History: ask/result-Paar OHNE reasoning_content
     tool_msgs = [m for m in body["messages"] if m.get("role") == "tool"]
     assert len(tool_msgs) == 1
     assert "reasoning_content" not in tool_msgs[0]
     assert tool_msgs[0]["content"] == "Antwort"
+    # assistant mit orig_ask wurde angehaengt
+    assistant_msgs = [m for m in body["messages"] if m.get("role") == "assistant"]
+    assert len(assistant_msgs) == 1
+    assert assistant_msgs[0]["tool_calls"][0]["function"]["name"] == "ask_coworker"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -632,11 +696,12 @@ def test_local_events_coworker_stream_inject(monkeypatch):
             yield proxy._format_openai_stream_chunk("local-model", content="Hier ist das Endergebnis",
                                                     chunk_id="test")
 
-    async def fake_coworker_phase(coworker_calls_norm, coworker_state):
-        coworker_state["coworker_results"] = [
-            {"role": "tool", "tool_call_id": "call_1", "name": "ask_coworker",
-             "content": "Co-Worker sagt: mach X"}
-        ]
+    async def fake_tunnel_phase(sessions, coworker_state):
+        for s in sessions:
+            s["done"] = True
+            s["final"] = "Co-Worker sagt: mach X"
+        coworker_state["fwd_calls"] = []
+        coworker_state["finals"] = sessions
         # Realer Pfad: Header + Antwort-Content streamen LIVE waehrend der Phase
         yield proxy._format_openai_stream_chunk("local-model", content="\n\n[Proxy] Co-Worker-Antwort:\n",
                                                 include_role=False, chunk_id="test")
@@ -648,7 +713,7 @@ def test_local_events_coworker_stream_inject(monkeypatch):
         pass
 
     monkeypatch.setattr(proxy, "_stream_backend_turn", fake_backend_turn)
-    monkeypatch.setattr(proxy, "_stream_coworker_phase", fake_coworker_phase)
+    monkeypatch.setattr(proxy, "_stream_coworker_tunnel_phase", fake_tunnel_phase)
     monkeypatch.setattr(proxy._hindsight, "retain_async", noop_retain)
 
     body: Dict[str, Any] = {"messages": [{"role": "user", "content": "mach was\n--local"}]}

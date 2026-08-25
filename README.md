@@ -1,8 +1,11 @@
 # LocalProxy v3.0 — Single-Model Pass-Through Proxy
 
-Ein OpenAI-kompatibler **Single-Model-Pass-Through-Proxy** fur VS Code Copilot.
-Der Proxy leitet Anfragen 1:1 an genau EIN konfiguriertes Modell weiter und streamed
-die Antwort zuruck. **Keine** internen Agent-Loops, **keine** Planner-Worker-Architektur.
+Ein OpenAI-kompatibler **Pass-Through-Proxy** fur VS Code Copilot.
+Der Proxy leitet Anfragen an die konfigurierten Modelle weiter und streamed
+die Antwort zuruck. Der Proxy bleibt **immer reiner Forwarder**: Er fuehrt
+selbst keine Tools aus — Tool-Ausfuehrung macht ausschliesslich der Client
+(VS Code / OpenCode). Auch Co-Worker-Toolcalls laufen als getunnelte
+assistant-tool_calls durch denselben Stream zum Client.
 
 ## Architektur
 
@@ -48,10 +51,15 @@ Bei aktiver Kategorie `--local` injiziert der Proxy ein synthetisches Tool
 `ask_coworker(task, context)` in den Payload — **nur wenn** der Health-Check
 das Co-Worker-Modell als erreichbar meldet (Hauptrechner an). Mit aktivem
 Fork-Join (siehe unten) kommen `dispatch_coworker` / `collect_coworker` hinzu.
-Ruft das Hauptmodell das Tool auf, arbeitet der Proxy den Call intern an das
-Co-Worker-Modell ab (frische, minimale Session — keine VS-Code-History, kein
-Thinking-Leak, keine VS-Code-Tools) und ruft das Hauptmodell mit dem Ergebnis
-erneut auf.
+Ruft das Hauptmodell das Tool auf, startet der Proxy eine agentische
+Co-Worker-Session **mit denselben Client-Tools**. Der Co-Worker arbeitet
+eigenstaendig (Tool-Calls + Ergebnisse), doch seine Tool-Calls werden mit
+ID-Praefix (`cws_<sid>_<id>`) als assistant-tool_calls in denselben
+SSE-Stream getunnelt — der Client fuehrt sie aus, ohne zu wissen, dass ein
+anderes Modell sie emittiert hat. Die role:"tool"-Results kommen im
+Folgerequest zurueck und werden per ID-Praefix zur pausierten Session
+zurueckgeroutet. Die finale Antwort geht als ask_coworker-tool-result
+zurueck ans Hauptmodell (History-Rewrite versteckt die Tunnel-Artefakte).
 
 ### Live-Streaming + Stream-Inject (Kategorie `local`)
 
@@ -93,8 +101,10 @@ streamt der Proxy bei `--local` das Backend live mit `stream=True`:
 - Health-Check: periodischer Ping (Intervall konfigurierbar); bei Ausfall wird
 das Tool nicht mehr injiziert, ein laufender Call liefert einen Fehlertext als
 tool-result (Hauptmodell antwortet trotzdem)
-- Gemischte Turns (ask_coworker + VS-Code-Tool gleichzeitig) werden mit einem
-Hinweis an das Modell zurueckgegeben (keine fragile History-Rekonstruktion)
+- Gemischte Turns (ask_coworker + VS-Code-Tool gleichzeitig) sind ueber den
+Tunnel moeglich: VS-Code-Tools werden mit Original-IDs, Co-Worker-Toolcalls
+mit Tunnel-IDs (cws_...) gemeinsam an den Client durchgereicht — der Client
+fuehrt alle aus.
 - Env-Vars: `COWORKER_API_URL/KEY/MODEL_NAME/...`, `COWORKER_ENABLED`,
   `COWORKER_MAX_DELEGATIONS`, `COWORKER_TASK_CAP`, `COWORKER_RESULT_CAP`,
   `COWORKER_FILES_CAP`, `COWORKER_HEALTH_INTERVAL`, `COWORKER_PROBE_TIMEOUT`,

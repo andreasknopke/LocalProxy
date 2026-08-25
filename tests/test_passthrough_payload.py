@@ -1823,8 +1823,10 @@ def test_delegation_loop_passthrough_other_tools(monkeypatch):
     assert tcs[0]["function"]["name"] == "read_file"
 
 
-def test_delegation_loop_mixed_turn_hint(monkeypatch):
-    """Gemischter Turn -> Hinweis injiziert, kein interner Co-Worker-Call."""
+def test_delegation_loop_mixed_turn_forwarded(monkeypatch):
+    """Gemischter Turn (ask_coworker + read_file): der ask laeuft durch den
+    Tunnel (intern final beantwortet), read_file wird an den Client
+    durchgereicht."""
     calls = {"n": 0}
 
     async def fake_call(body, category, force_start_idx=None):
@@ -1843,8 +1845,13 @@ def test_delegation_loop_mixed_turn_hint(monkeypatch):
     monkeypatch.setattr(proxy, "COWORKER_MAX_DELEGATIONS", 5)
     body = {"messages": [{"role": "user", "content": "test"}]}
     outcome = asyncio.run(proxy._delegation_loop(body, "local"))
-    assert outcome["result"]["content"] == "antwort"
-    assert any("[Proxy-Hinweis]" in m.get("content", "") for m in body["messages"])
+    # read_file wird an den Client durchgereicht (kein interner Block mehr)
+    tcs = outcome["result"]["tool_calls"]
+    assert tcs is not None
+    assert any(t["function"]["name"] == "read_file" for t in tcs)
+    # ask_coworker wurde intern als ask/result-Paar in die History gelegt
+    tool_msgs = [m for m in body["messages"] if m.get("role") == "tool"]
+    assert any(m.get("name") == "ask_coworker" for m in tool_msgs)
 
 
 def test_delegation_loop_enforces_limit(monkeypatch):

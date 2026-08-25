@@ -515,18 +515,20 @@ COWORKER_SYSTEM_PROMPT: str = os.getenv(
     "— work only from what is given to you.",
 )
 
-# ── Co-Worker Agent-Mode (v4): echter Subagent mit Tool-Zugriff ───────────
-# Der Coworker wird nicht mehr als nacktes Chat-Modell benutzt, sondern als
-# agentischer Subagent: Er bekommt Tools (read_file/write_file/list_dir/
-# web_search), emittiert tool_calls, die der Proxy an einen lokalen Runner
-# auf dem User-PC relayed (der Proxy-Container selbst hat KEINEN Datei-
-# zugriff — die Files liegen beim User). Loop bis finish oder Max-Runden.
+# ── Co-Worker Client-Tool-Tunnel (v5): der Client ist der Executor ────────
+# Der Coworker arbeitet als agentischer Subagent im GLEICHEN SSE-Stream wie
+# das Hauptmodell: Seine tool_calls werden mit ID-Praefix (cws_<sid>_<id>)
+# als assistant-tool_calls an den Client getunnelt. Der Client (VS Code/
+# OpenCode) fuehrt sie wie eigene Calls aus — er weiss nichts von mehreren
+# Modellen hinter dem Proxy. Die role:"tool"-Results kommen mit den ge-
+# mappten IDs zurueck und werden vom Proxy in die pausierte Co-Worker-
+# Session geroutet. Kein Runner, keine Relay-Queue: alles durch den Stream.
 COWORKER_AGENT_MODE: bool = os.getenv("COWORKER_AGENT_MODE", "true").lower() in {"1", "true", "yes", "y", "on"}
-COWORKER_AGENT_MAX_ROUNDS: int = int(os.getenv("COWORKER_AGENT_MAX_ROUNDS", "12"))
-# Runner-Auth (Bearer): muss identisch mit dem Token im tools/agent_runner.py sein.
-AGENT_RUNNER_TOKEN: str = os.getenv("AGENT_RUNNER_TOKEN", "")
-# Wie lange ein offener Tool-Call im Queue auf Abholung/Antwort warten darf.
-AGENT_TOOL_TIMEOUT: float = float(os.getenv("AGENT_TOOL_TIMEOUT", "120"))
+COWORKER_AGENT_MAX_ROUNDS: int = int(os.getenv("COWORKER_AGENT_MAX_ROUNDS", "24"))
+# Praefix der getunnelten tool_call_ids (cws_<session>_<origid>)
+CW_TUNNEL_ID_PREFIX: str = "cws_"
+# Wie lange Co-Worker-Sessions/Overlays im Speicher ueberleben (Sekunden).
+CW_SESSION_TTL: float = float(os.getenv("CW_SESSION_TTL", "7200"))
 
 # ── Reasoning-Cap (optional) ──────────────────────────────────────────────
 # Reasoning-Modelle (Qwen3 etc.) neigen zu Endlos-Denkschleifen: Sie denken
@@ -3343,140 +3345,168 @@ async def _run_coworker_call(tool_call: Dict[str, Any],
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Co-Worker Agent-Mode (v4) ── Tool-Relay zum lokalen Runner
+# Co-Worker Client-Tool-Tunnel (v5) ── der Client ist der Executor
 # ═══════════════════════════════════════════════════════════════════════════
-# Der Proxy-Container hat keinen Dateizugriff — die Workspace-Files liegen
-# beim User. Der agentische Loop laeuft trotzdem IM Proxy (Coworker-Modell
-# ↔ tool_calls ↔ Ergebnisse), aber die Tool-AUSFUEHRUNG relayed der Proxy an
-# einen kleinen Runner auf dem User-PC, der per Long-Polling an der Queue
-# haengt und read_file/write_file/list_dir/web_search lokal ausfuehrt.
+# Der Proxy bleibt reiner Forwarder: KEINE eigene Tool-Ausfuehrung, kein
+# Runner, keine Relay-Queue. Wenn das Hauptmodell ask_coworker aufruft,
+# startet der Proxy eine agentische Co-Worker-Session MIT den Client-Tools.
+# Die tool_calls des Co-Workers werden mit Praefix-IDs (cws_<sid>_<origid>)
+# als assistant-tool_calls in den GLEICHEN SSE-Stream getunnelt - der Client
+# (VS Code / OpenCode) fuehrt sie aus, ohne zu wissen, dass ein anderes
+# Modell sie emittiert hat. Die role:"tool"-Results kommen im Folgerequest
+# zurueck und werden per ID-Praefix zur Session geroutet.
 
 _COWORKER_AGENT_SYSTEM_PROMPT: str = (
-    "You are an autonomous coding subagent running on a separate machine. "
-    "You have FULL tool access to the user's workspace via the provided "
-    "tools: you can read files, write files, list directories and search "
-    "the web. Work iteratively: call tools as needed, inspect results, and "
-    "continue until the task is fully done. When finished, respond with a "
+    "You are an autonomous coding subagent collaborating with the main agent "
+    "in the same workspace. You have access to the same tools as the main "
+    "agent (they are provided in the tools parameter of every request). "
+    "Work iteratively: call tools as needed, inspect results, and continue "
+    "until the task is fully done or blocked. When finished, respond with a "
     "concise final summary of what you did (including created/modified "
-    "file paths). Be efficient: batch independent operations."
+    "file paths). Be efficient: batch independent operations. Do NOT ask "
+    "the user questions and do NOT restate the task — your output goes "
+    "back to the main agent, not to a human."
 )
 
-_COWORKER_AGENT_TOOLS: List[Dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read a text file from the user's workspace.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Relative or absolute file path."},
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Create or overwrite a text file in the user's workspace. Parent directories are created automatically.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Relative or absolute file path."},
-                    "content": {"type": "string", "description": "Full file content to write."},
-                },
-                "required": ["path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_dir",
-            "description": "List directory entries (name, type, size).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Directory path ('.' = workspace root)."},
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Search the web and return snippets (DuckDuckGo HTML endpoint, no API key needed).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query."},
-                },
-                "required": ["query"],
-            },
-        },
-    },
-]
+_COWORKER_PLAIN_PROMPT: str = (
+    "You are a helpful assistant supporting a main agent as a delegated "
+    "subagent. Answer the given task concisely and technically, purely "
+    "from the provided context (you have NO tool access in this mode). "
+    "If information is missing, say so explicitly and give the best "
+    "possible answer from what you have."
+)
 
-# ── Tool-Call-Queue (Proxy ↔ Runner) ──────────────────────────────────────
-# Eintrag: {call_id, task_id, name, arguments, result, error, done}
-# Der Runner long-pollt /agent/tools/claim und /agent/tools/result.
-_AGENT_TOOL_QUEUE: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue(maxsize=64)
-_AGENT_TOOL_PENDING: Dict[str, Dict[str, Any]] = {}   # call_id -> entry
-_AGENT_RUNNER_SEEN: float = 0.0                        # letzter Runner-Poll
+# ── Tunnel-Session-Store ──────────────────────────────────────────────────
+# sid -> Session-Objekt:
+#   task_text    Urspruenglicher Co-Worker-Auftrag (ask_coworker-Argument)
+#   rounds/done/final   Runden-Zaehler, Abschluss-Flag, finale Antwort
+#   messages     Co-Worker-eigene History (system/user/assistant/tool)
+#   pending      {tunnel_id: {orig_id, name, arguments}} — wartende Calls
+#   client_tools Original-Tool-Definitionen aus dem Client-Request
+_CW_SESSIONS: Dict[str, Dict[str, Any]] = {}
+_CW_SESSIONS_LAST_CLEANUP: float = 0.0
 
 
-def _agent_runner_online() -> bool:
-    """Runner gilt als online, wenn er in den letzten 90s gepollt hat."""
-    return _AGENT_RUNNER_SEEN > 0 and (time.time() - _AGENT_RUNNER_SEEN) < 90.0
+def _cw_parse_tunnel_id(tool_call_id: str) -> Optional[Tuple[str, str]]:
+    """Zerlegt eine getunnelte tool_call_id (cws_<sid>_<origid>) in
+    (sid, orig_id). None, wenn die ID nicht aus dem Tunnel stammt."""
+    if not tool_call_id or not tool_call_id.startswith(CW_TUNNEL_ID_PREFIX):
+        return None
+    rest = tool_call_id[len(CW_TUNNEL_ID_PREFIX):]
+    sid, _, orig = rest.partition("_")
+    if not sid or not orig:
+        return None
+    return sid, orig
 
 
-async def _execute_tool_via_runner(name: str, arguments: Dict[str, Any],
-                                   task_id: str = "") -> str:
-    """Reicht EINEN Tool-Call an den lokalen Runner weiter und wartet auf das
-    Ergebnis. Wirft RuntimeError bei Timeout/keinem Runner."""
-    if not _agent_runner_online():
-        raise RuntimeError(
-            "Kein Agent-Runner verbunden — starte tools/agent_runner.py lokal "
-            "(der Proxy-Container hat keinen Dateizugriff).")
-    call_id = f"tc_{uuid.uuid4().hex[:12]}"
-    entry: Dict[str, Any] = {
-        "call_id": call_id, "task_id": task_id, "name": name,
-        "arguments": arguments, "result": None, "error": None,
-        "done": asyncio.Event(),
+def _cw_sessions_cleanup(force: bool = False) -> int:
+    """Entfernt abgelaufene Sessions (CW_SESSION_TTL); max. 1x/Minute."""
+    global _CW_SESSIONS_LAST_CLEANUP
+    now = time.time()
+    if not force and (now - _CW_SESSIONS_LAST_CLEANUP) < 60.0:
+        return 0
+    _CW_SESSIONS_LAST_CLEANUP = now
+    stale = [sid for sid, s in _CW_SESSIONS.items()
+             if (now - s.get("last_active", now)) > CW_SESSION_TTL]
+    for sid in stale:
+        _CW_SESSIONS.pop(sid, None)
+    if stale:
+        _log(f"CW-Tunnel: {len(stale)} Session(s) nach TTL entfernt")
+    return len(stale)
+
+
+# ── Gruppen: mehrere ask_coworker-Calls eines Turns teilen eine Gruppe ────
+_CW_GROUPS: Dict[str, Dict[str, Any]] = {}
+
+# Pausierte Tunnel-Sessions, die im aktuellen Folgerequest weiterzulaufen
+# haben (in _handle_chat_completion befuellt, in _stream_local_events
+# konsumiert — non-streaming wendet _cw_drive_quiet an).
+_CW_RESUME_PENDING: List[Dict[str, Any]] = []
+
+
+def _cw_group_new() -> Dict[str, Any]:
+    """Neue Co-Worker-Gruppe fuer den aktuellen Main-Turn (parallel delegierbar)."""
+    _cw_sessions_cleanup()
+    gid = f"cwgroup_{uuid.uuid4().hex[:10]}"
+    group: Dict[str, Any] = {"gid": gid, "created": time.time(),
+                             "sids": [], "results": {}, "done": False}
+    _CW_GROUPS[gid] = group
+    return group
+
+
+def _cw_group_done(group: Dict[str, Any]) -> bool:
+    """True, wenn ALLE Sessions der Gruppe final sind."""
+    return all((_CW_SESSIONS.get(sid) or {}).get("done") for sid in group.get("sids", []))
+
+
+# Archiv abgeschlossener Tunnel-Sessions: sid -> {ask, result}. Ueberlebt die
+# Session selbst (Requests tragen die cws_-Marker in der History weiter —
+# spaetere Requests rekonstruieren die ask/result-Paare daraus).
+_CW_ARCHIVE: Dict[str, Dict[str, Any]] = {}
+
+
+def _cw_archive_session(sess: Dict[str, Any]) -> None:
+    """Archiviert eine finale Session fuer spaetere History-Rewrites."""
+    if not isinstance(sess.get("orig_ask"), dict):
+        return
+    _CW_ARCHIVE[sess["sid"]] = {
+        "ts": time.time(),
+        "ask": sess["orig_ask"],
+        "result": sess.get("final") or "",
     }
-    _AGENT_TOOL_PENDING[call_id] = entry
-    try:
-        await asyncio.wait_for(_AGENT_TOOL_QUEUE.put(entry), timeout=5.0)
-        try:
-            await asyncio.wait_for(entry["done"].wait(), timeout=AGENT_TOOL_TIMEOUT)
-        except asyncio.TimeoutError:
-            raise RuntimeError(f"Tool-Timeout ({AGENT_TOOL_TIMEOUT}s): {name}")
-        if entry["error"]:
-            return f"[Tool-Fehler] {entry['error']}"
-        return str(entry["result"] or "")
-    finally:
-        _AGENT_TOOL_PENDING.pop(call_id, None)
+    if len(_CW_ARCHIVE) > 500:
+        oldest = sorted(_CW_ARCHIVE.items(), key=lambda kv: kv[1].get("ts", 0))[:100]
+        _log(f"CW-Tunnel: Archiv auf {500-100} begrenzt")
+        for sid, _ in oldest:
+            _CW_ARCHIVE.pop(sid, None)
 
 
-async def _run_coworker_agent(task_text: str, context_text: str,
-                              extra_context: Optional[str] = None,
-                              task_id: str = "") -> Dict[str, Any]:
-    """Agentischer Loop: Coworker-Modell mit Tools, Tool-Calls werden per
-    Relay ausgefuehrt, bis das Modell final antwortet oder Max-Runden erreicht.
-    Returns wie _call_single_model: {status, content, ...}."""
-    defs = _model_defs("coworker")
-    if not defs:
-        return {"status": "error", "content": "coworker nicht konfiguriert"}
-    cat = defs[0]
-    api_url = cat["api_url"].rstrip("/")
-    api_key = cat.get("api_key", "")
+def _cw_strip_tunnel_from_messages(messages: List[Dict[str, Any]]) -> int:
+    """Entfernt getunnelte Co-Worker-Turne aus einer Message-Liste IN-PLACE.
+    Assistant-Turns NUR mit cws_-tool_calls verschwinden ganz; gemischte
+    Turns behalten die Nicht-Tunnel-Calls. role:'tool' mit cws_-ID wird
+    entfernt (auch orphaned). Returns Anzahl entfernter Nachrichten."""
+    removed = 0
+    out: List[Dict[str, Any]] = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        role = msg.get("role")
+        if role == "assistant" and isinstance(msg.get("tool_calls"), list) and msg["tool_calls"]:
+            keep = [tc for tc in msg["tool_calls"]
+                    if not (isinstance(tc, dict)
+                            and _cw_parse_tunnel_id(str(tc.get("id") or "")))]
+            if len(keep) != len(msg["tool_calls"]):
+                dropped = len(msg["tool_calls"]) - len(keep)
+                if keep:
+                    msg = {**msg, "tool_calls": keep}
+                    _log(f"CW-Rewrite: gemischter Turn — {dropped} Tunnel-Call(s) "
+                         "aus assistant-tool_calls gefiltert")
+                else:
+                    removed += 1
+                    continue
+        if role == "tool" and _cw_parse_tunnel_id(str(msg.get("tool_call_id") or "")):
+            removed += 1
+            continue
+        out.append(msg)
+    if isinstance(messages, list) and removed:
+        messages[:] = out
+    return removed
 
-    user_content = task_text.strip()
-    if context_text.strip():
+
+def _cw_session_new(task_text: str, context_text: str,
+                    extra_context: Optional[str] = None,
+                    client_tools: Optional[List[Dict[str, Any]]] = None,
+                    system_prompt: Optional[str] = None,
+                    group: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Startet eine frische Co-Worker-Tunnel-Session. client_tools sind die
+    ORIGINAL-Tool-Definitionen aus dem Client-Request — der Co-Worker erhaelt
+    exakt die Werkzeuge, die der Client sowieso ausfuehren kann."""
+    _cw_sessions_cleanup()
+
+    user_content = (task_text or "").strip()
+    if (context_text or "").strip():
         user_content += f"\n\n## Context\n{context_text.strip()}"
     if extra_context:
         user_content += ("\n\n## Dateiinhalte aus dem Chat (automatisch angehaengt)\n"
@@ -3484,63 +3514,440 @@ async def _run_coworker_agent(task_text: str, context_text: str,
     if COWORKER_TASK_CAP > 0 and len(user_content) > COWORKER_TASK_CAP:
         user_content = user_content[:COWORKER_TASK_CAP] + "\n…[gekappt]"
 
-    messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": _COWORKER_AGENT_SYSTEM_PROMPT},
-        {"role": "user", "content": user_content},
-    ]
+    sess: Dict[str, Any] = {
+        "sid": uuid.uuid4().hex[:8],
+        "gid": (group or {}).get("gid"),
+        "created": time.time(),
+        "last_active": time.time(),
+        "task_text": user_content,
+        "rounds": 0,
+        "done": False,
+        "final": None,
+        "messages": [
+            {"role": "system",
+             "content": system_prompt or _COWORKER_AGENT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "pending": {},
+        "client_tools": client_tools or [],
+        "orig_ask": None,
+        "last_fwd_calls": None,
+    }
+    _CW_SESSIONS[sess["sid"]] = sess
+    if group is not None:
+        group.setdefault("sids", []).append(sess["sid"])
+    _log(f"CW-Tunnel: Session {sess['sid']} gestartet "
+         f"(task={_safe_str(task_text)[:80]!r}, client_tools={len(sess['client_tools'])})")
+    return sess
 
-    async with httpx.AsyncClient(timeout=float(cat.get("timeout_seconds", 300))) as client:
-        content = ""
-        for round_no in range(1, COWORKER_AGENT_MAX_ROUNDS + 1):
-            body = {
-                "model": cat["model_name"],
-                "messages": messages,
-                "tools": _COWORKER_AGENT_TOOLS,
-                "tool_choice": "auto",
-                "stream": False,
-            }
-            # Qwen-Anti-Loop: auch im Agent-Loop des Coworkers die Loop-Schutz-
-            # Sampling-Parameter erzwingen (temp=0.3, presence_penalty=1.5, top_p=0.95).
-            _patch_qwen_anti_loop_payload(body, cat["model_name"])
-            resp = await client.post(api_url, json=body,
-                                     headers={"Authorization": f"Bearer {api_key}"} if api_key else {})
-            if resp.status_code != 200:
-                return {"status": "error",
-                        "content": f"Coworker HTTP {resp.status_code}: {resp.text[:300]}"}
-            msg = ((resp.json() or {}).get("choices") or [{}])[0].get("message") or {}
-            tool_calls = msg.get("tool_calls")
-            content = msg.get("content") or ""
 
-            if not tool_calls:
-                return {"status": "ok", "content": content, "rounds": round_no}
+def _cw_session_get(sid: str) -> Optional[Dict[str, Any]]:
+    sess = _CW_SESSIONS.get(sid)
+    if sess is not None:
+        sess["last_active"] = time.time()
+    return sess
 
-            messages.append({"role": "assistant", "content": content,
-                             "tool_calls": tool_calls})
 
-            async def _exec(tc: Dict[str, Any]) -> Dict[str, Any]:
-                fn = tc.get("function") or {}
-                name = str(fn.get("name", ""))
-                raw_args = fn.get("arguments", "{}")
-                try:
-                    args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-                except (json.JSONDecodeError, ValueError):
-                    args = {}
-                if not isinstance(args, dict):
-                    args = {}
-                try:
-                    res = await _execute_tool_via_runner(name, args, task_id)
-                    return {"role": "tool", "tool_call_id": tc.get("id"),
-                            "name": name, "content": res}
-                except Exception as exc:
-                    return {"role": "tool", "tool_call_id": tc.get("id"),
-                            "name": name, "content": f"[Tool-Fehler] {_safe_str(exc)}"}
+def _cw_find_session_by_tool_id(tool_call_id: str) -> Optional[Dict[str, Any]]:
+    """Findet die Session zu einer getunnelten tool_call_id (ohne Touch)."""
+    parsed = _cw_parse_tunnel_id(tool_call_id)
+    if not parsed:
+        return None
+    sess = _CW_SESSIONS.get(parsed[0])
+    if sess is None:
+        _log(f"CW-Tunnel: unbekannte Session {parsed[0]} fuer "
+             f"tool_call_id={_safe_str(tool_call_id)[:60]}")
+    return sess
 
-            results = await asyncio.gather(*[_exec(tc) for tc in tool_calls])
-            messages.extend(results)
+# ── ID-Mapping: Co-Worker-IDs <-> Tunnel-IDs ─────────────────────────────
 
-        return {"status": "ok",
-                "content": "[Subagent: Max-Runden erreicht — Teilergebnis]\n" + content,
-                "rounds": COWORKER_AGENT_MAX_ROUNDS}
+def _cw_map_tool_calls_out(sess: Dict[str, Any],
+                           tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Uebersetzt normalisierte Co-Worker-tool_calls ins Forward-Format
+    (wie _build_forward_tool_calls: index/id/type/function) und vergibt
+    Tunnel-IDs (cws_<sid>_<origid>). Setzt sess['pending']."""
+    fwd: List[Dict[str, Any]] = []
+    pending: Dict[str, Dict[str, Any]] = {}
+    for idx, tc in enumerate(tool_calls or []):
+        fn = tc.get("function") or {}
+        orig_id = str(tc.get("id") or f"call_{uuid.uuid4().hex[:12]}")
+        name = str(fn.get("name", ""))
+        args = fn.get("arguments", "{}")
+        if not isinstance(args, str):
+            try:
+                args = json.dumps(args, ensure_ascii=False)
+            except (TypeError, ValueError):
+                args = "{}"
+        tunnel_id = f"{CW_TUNNEL_ID_PREFIX}{sess['sid']}_{orig_id}"
+        pending[tunnel_id] = {"orig_id": orig_id, "name": name, "arguments": args}
+        fwd.append({"index": idx, "id": tunnel_id, "type": "function",
+                    "function": {"name": name, "arguments": args}})
+    sess["pending"] = pending
+    sess["last_active"] = time.time()
+    return fwd
+
+
+def _cw_absorb_tool_results(sess: Dict[str, Any],
+                            tool_msgs: List[Dict[str, Any]]) -> int:
+    """Fuettert role:'tool'-Nachrichten mit Tunnel-IDs dieser Session in
+    deren History ein (mit ORIGINAL-IDs zurueckuebersetzt). Liefert die
+    Anzahl absorbierter Results; fremde IDs werden ignoriert."""
+    absorbed = 0
+    for msg in tool_msgs or []:
+        tc_id = str(msg.get("tool_call_id") or "")
+        entry = sess["pending"].get(tc_id)
+        if entry is None:
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str):
+            try:
+                content = json.dumps(content, ensure_ascii=False)
+            except (TypeError, ValueError):
+                content = str(content or "")
+        sess["messages"].append({
+            "role": "tool",
+            "tool_call_id": entry["orig_id"],
+            "name": entry["name"],
+            "content": content,
+        })
+        sess["pending"].pop(tc_id, None)
+        absorbed += 1
+    if absorbed:
+        sess["last_active"] = time.time()
+        _log(f"CW-Tunnel: {absorbed} tool-result(s) -> Session {sess['sid']} "
+             f"(noch pending={len(sess['pending'])})")
+    return absorbed
+
+
+def _cw_collect_tunnel_tool_msgs(messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Sammelt die role:'tool'-Nachrichten mit Tunnel-ID (cws_...) vom Ende
+    der Request-History (das sind die Ergebnisse des pausierten Tunnels)."""
+    found: List[Dict[str, Any]] = []
+    for msg in reversed(messages or []):
+        if (isinstance(msg, dict) and msg.get("role") == "tool"
+                and _cw_parse_tunnel_id(str(msg.get("tool_call_id") or ""))):
+            found.append(msg)
+        else:
+            break
+    found.reverse()
+    return found
+
+
+def _cw_resume_sessions(tool_msgs: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any], int]]:
+    """Verteilt Tunnel-Tool-Results auf ihre Sessions. Returns Liste von
+    (sess, absorbed_count) fuer alle Sessions mit absorbed>0 — der Aufrufer
+    muss diese jetzt weiterfuehren (naechste Runde streamen bis final)."""
+    _cw_sessions_cleanup()
+    by_sid: Dict[str, List[Dict[str, Any]]] = {}
+    for msg in tool_msgs or []:
+        parsed = _cw_parse_tunnel_id(str(msg.get("tool_call_id") or ""))
+        if not parsed:
+            continue
+        by_sid.setdefault(parsed[0], []).append(msg)
+    resumed: List[Tuple[Dict[str, Any], int]] = []
+    for sid, msgs in by_sid.items():
+        sess = _CW_SESSIONS.get(sid)
+        if sess is None:
+            _log(f"CW-Tunnel: Ergebnis fuer unbekannte/tote Session {sid} ignoriert")
+            continue
+        n = _cw_absorb_tool_results(sess, msgs)
+        if n:
+            resumed.append((sess, n))
+    return resumed
+
+
+def _cw_append_assistant_round(sess: Dict[str, Any], content: str,
+                               tool_calls: List[Dict[str, Any]]) -> None:
+    """Haengt die Assistant-Runde des Co-Workers (mit ORIGINAL-IDs) an die
+    Session-History an — Grundlage fuer die naechste Modellrunde."""
+    msg: Dict[str, Any] = {"role": "assistant", "content": content or ""}
+    tcs: List[Dict[str, Any]] = []
+    for tc in tool_calls or []:
+        fn = tc.get("function") or {}
+        tcs.append({
+            "id": str(tc.get("id") or f"call_{uuid.uuid4().hex[:12]}"),
+            "type": "function",
+            "function": {"name": str(fn.get("name", "")),
+                         "arguments": fn.get("arguments", "{}")},
+        })
+    if tcs:
+        msg["tool_calls"] = tcs
+    sess["messages"].append(msg)
+    sess["last_active"] = time.time()
+
+
+def _cw_session_round_body(sess: Dict[str, Any]) -> Dict[str, Any]:
+    """Request-Body fuer die naechste Co-Worker-Runde: Session-History plus
+    die Client-Tools (falls der Client welche mitgeschickt hat)."""
+    defs = _model_defs("coworker")
+    cat = defs[0] if defs else {}
+    body: Dict[str, Any] = {
+        "model": cat.get("model_name", ""),
+        "messages": copy.deepcopy(sess["messages"]),
+        "stream": True,
+    }
+    if sess["client_tools"]:
+        body["tools"] = copy.deepcopy(sess["client_tools"])
+        body["tool_choice"] = "auto"
+    return body
+
+
+def _cw_sessions_snapshot() -> List[Dict[str, Any]]:
+    """Kompakter Status aller Tunnel-Sessions (Debug/WebUI)."""
+    now = time.time()
+    return [{
+        "sid": sid,
+        "age_s": round(now - s.get("created", now), 1),
+        "rounds": s.get("rounds", 0),
+        "done": s.get("done", False),
+        "pending": len(s.get("pending") or {}),
+        "messages": len(s.get("messages") or []),
+        "tools": len(s.get("client_tools") or []),
+        "task": (s.get("task_text") or "")[:120],
+    } for sid, s in sorted(_CW_SESSIONS.items(),
+                           key=lambda kv: -kv[1].get("created", 0))]
+
+
+async def _cw_stream_round(sess: Dict[str, Any], queue: asyncio.Queue,
+                           model: str, stream_id: str) -> None:
+    """Fuehrt EINE Co-Worker-Runde der Session aus und streamt dabei dessen
+    reasoning_content + content LIVE an den Client (queue). Endet die Runde
+    mit tool_calls, werden sie in sess['last_fwd_calls'] (Tunnel-Format,
+    cws_<sid>_<origid>) abgelegt — die Session pausiert bis die tool-Results
+    im Folgerequest zurueckkommen. Endet sie mit Text, ist die Session final
+    (done/final gesetzt)."""
+    defs = _model_defs("coworker")
+    sid = sess["sid"]
+    if not defs:
+        sess["done"] = True
+        sess["final"] = "[Co-Worker nicht konfiguriert]"
+        await queue.put(_format_openai_stream_chunk(
+            model, content="\n\n[Proxy] Co-Worker nicht konfiguriert\n",
+            include_role=False, chunk_id=stream_id))
+        return
+
+    sess["rounds"] = sess.get("rounds", 0) + 1
+    body = _cw_session_round_body(sess)
+    _patch_qwen_anti_loop_payload(body, defs[0].get("model_name", ""))
+
+    tc_state: Dict[str, Any] = {}
+    think_state: Dict[str, Any] = {"in_think": False, "pending": ""}
+    content_parts: List[str] = []
+    has_explicit_reasoning = False
+    status = "failed"
+    err_text = "unbekannter Fehler"
+    header_sent = False
+
+    async def push_reasoning(rc: str) -> None:
+        await queue.put(_format_openai_stream_chunk(
+            model, reasoning_content=rc, include_role=False, chunk_id=stream_id))
+
+    async def push_content(c: str) -> None:
+        nonlocal header_sent
+        if not header_sent:
+            await queue.put(_format_openai_stream_chunk(
+                model, content=f"\n\n[Proxy] Co-Worker {sid} — Antwort:\n",
+                include_role=False, chunk_id=stream_id))
+            header_sent = True
+        await queue.put(_format_openai_stream_chunk(
+            model, content=c, include_role=False, chunk_id=stream_id))
+
+    try:
+        async for ev in _stream_single_model_events(body, "coworker", 0,
+                                                    inject_hindsight=False):
+            ev_type = ev.get("type") if isinstance(ev, dict) else None
+            if ev_type == "chunk":
+                choice = ev.get("choice") or {}
+                delta = choice.get("delta") or {}
+                rc = _extract_reasoning_from_delta(delta)
+                if rc:
+                    has_explicit_reasoning = True
+                    await push_reasoning(rc)
+                tcd = delta.get("tool_calls")
+                if isinstance(tcd, list) and tcd:
+                    _accumulate_stream_tool_calls(tc_state, tcd)
+                c = delta.get("content")
+                if isinstance(c, str) and c:
+                    if has_explicit_reasoning:
+                        content_parts.append(c)
+                        await push_content(c)
+                    else:
+                        rp, cp = _split_think_chunk(c, think_state)
+                        if rp:
+                            await push_reasoning(rp)
+                        if cp:
+                            content_parts.append(cp)
+                            await push_content(cp)
+            elif ev_type == "usage":
+                pass  # interne Co-Worker-Usage: nicht an den Client
+            elif ev_type == "done":
+                status = "ok"
+            elif ev_type == "error":
+                err_text = ev.get("content") or err_text
+                status = "failed"
+                break
+        if think_state.get("pending"):
+            pending = think_state.pop("pending", "")
+            if think_state.get("in_think"):
+                await push_reasoning(pending)
+            else:
+                content_parts.append(pending)
+                await push_content(pending)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        err_text = _safe_str(exc)
+        status = "failed"
+        _log(f"CW-Tunnel {sid}: EXCEPTION: {err_text[:200]}")
+
+    content = "".join(content_parts).strip()
+    tool_calls = _finalize_stream_tool_calls(tc_state) if status == "ok" else None
+
+    if status == "ok" and tool_calls and sess["rounds"] < COWORKER_AGENT_MAX_ROUNDS:
+        _cw_append_assistant_round(sess, content, tool_calls)
+        sess["last_fwd_calls"] = _cw_map_tool_calls_out(sess, tool_calls)
+        _log(f"CW-Tunnel {sid}: Runde {sess['rounds']} pausiert — "
+             f"{len(tool_calls)} tool_call(s) an den Client getunnelt")
+        return
+    if status == "ok":
+        _cw_append_assistant_round(sess, content, tool_calls or [])
+        sess["done"] = True
+        sess["final"] = content or "(leere Co-Worker-Antwort)"
+        if tool_calls:
+            _log(f"CW-Tunnel {sid}: Runden-Limit {COWORKER_AGENT_MAX_ROUNDS} — "
+                 f"final erzwungen")
+        return
+
+    _COWORKER_HEALTH_CACHE["reachable"] = False
+    _log(f"CW-Tunnel {sid}: FEHLER: {err_text[:200]}")
+    err_display = f"[Co-Worker nicht verfuegbar]\n{err_text}"
+    try:
+        if not header_sent:
+            await queue.put(_format_openai_stream_chunk(
+                model, content=f"\n\n[Proxy] Co-Worker {sid} — Antwort:\n",
+                include_role=False, chunk_id=stream_id))
+        await queue.put(_format_openai_stream_chunk(
+            model, content=err_display, include_role=False, chunk_id=stream_id))
+    except Exception:
+        pass
+    sess["done"] = True
+    sess["final"] = err_display
+
+
+async def _stream_coworker_tunnel_phase(sessions: List[Dict[str, Any]],
+                                        coworker_state: Dict[str, Any]) -> AsyncIterator[str]:
+    """Treibt die Co-Worker-Sessions EINE Runde voran — parallel ueber alle
+    Sessions (separate Hardware), jede Session authentisch sequenziell.
+    Reasoning/content streamen LIVE (queue → SSE), Keepalives halten den
+    Client am Leben. Danach liegen in coworker_state:
+      'fwd_calls'  kombinierte Tunnel-tool_calls aller pausierten Sessions
+                   (bereits re-indexiert 0..n-1)
+      'finals'     Liste der finalen Sessions
+    Der Aufrufer entscheidet: fwd_calls → Stream pausieren (finish_reason
+    'tool_calls'); sonst finals als ask_coworker-results in den Main-Loop."""
+    model = coworker_state.get("model", "local")
+    stream_id = coworker_state.get("stream_id") or f"chatcmpl-spark-{uuid.uuid4().hex}"
+    queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+    tasks = [asyncio.ensure_future(_cw_stream_round(s, queue, model, stream_id))
+             for s in sessions]
+    try:
+        while not all(t.done() for t in tasks):
+            try:
+                sse = await asyncio.wait_for(queue.get(), timeout=_STREAM_KEEPALIVE_INTERVAL)
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+                continue
+            yield sse
+        while True:
+            try:
+                yield queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    fwd: List[Dict[str, Any]] = []
+    for sess in sessions:
+        fwd.extend(sess.pop("last_fwd_calls", None) or [])
+    for i, tc in enumerate(fwd):
+        tc["index"] = i
+    coworker_state["fwd_calls"] = fwd
+    coworker_state["finals"] = [s for s in sessions if s.get("done")]
+    _log(f"CW-Tunnel-Phase: {len(fwd)} getunnelte tool_call(s), "
+         f"{len(coworker_state['finals'])}/{len(sessions)} Session(s) final")
+
+
+async def _cw_drive_quiet(sessions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Treibt Sessions OHNE Client-Stream voran (non-streaming Requests):
+    Chunks landen in einer leeren Queue (verworfen). Returns die kombinierten
+    Tunnel-tool_calls (leer, wenn alle Sessions final wurden)."""
+    q: asyncio.Queue = asyncio.Queue()
+    await asyncio.gather(*[
+        _cw_stream_round(s, q, "local", f"cwq-{uuid.uuid4().hex[:8]}")
+        for s in sessions])
+    fwd: List[Dict[str, Any]] = []
+    for sess in sessions:
+        fwd.extend(sess.pop("last_fwd_calls", None) or [])
+    for i, tc in enumerate(fwd):
+        tc["index"] = i
+    return fwd
+
+
+def _cw_attach_finals(msgs: List[Dict[str, Any]],
+                      sessions: List[Dict[str, Any]]) -> None:
+    """Haengt finale Co-Worker-Antworten als assistant-Turn (Original-
+    ask_coworker-Calls) + tool-results an die Main-History — der Tunnel
+    bleibt gegenueber dem Backend unsichtbar."""
+    done = [s for s in sessions if s.get("done")]
+    if not done:
+        return
+    asks = [s.get("orig_ask") for s in done]
+    asks = [a for a in asks if isinstance(a, dict)]
+    if not asks:
+        msgs.append({"role": "user", "content":
+            "[Proxy] Co-Worker-Ergebnis konnte keiner open delegation "
+            "zugeordnet werden (Session-Daten unvollstaendig)."})
+        return
+    msgs.append({"role": "assistant", "content": None, "tool_calls": asks})
+    for s in done:
+        content = s.get("final") or ""
+        if COWORKER_RESULT_CAP > 0 and len(content) > COWORKER_RESULT_CAP:
+            content = content[:COWORKER_RESULT_CAP] + "\n…[gekappt]"
+        msgs.append({
+            "role": "tool",
+            "tool_call_id": (s.get("orig_ask") or {}).get("id"),
+            "name": _COWORKER_TOOL_NAME,
+            "content": content,
+        })
+
+
+async def _run_coworker_agent(task_text: str, context_text: str,
+                              extra_context: Optional[str] = None,
+                              task_id: str = "") -> Dict[str, Any]:
+    """Fallback-Pfad OHNE Live-Stream (z. B. dispatch-Hintergrund-Tasks):
+    Co-Worker als befragbares Modell ohne Tools (_COWORKER_PLAIN_PROMPT).
+    Der agentische Pfad mit Client-Tools laeuft als Tunnel durch die
+    Streaming-Fabric (_stream_local_events + _stream_coworker_tunnel_phase).
+    Returns wie _call_single_model: {status, content, ...}."""
+    defs = _model_defs("coworker")
+    if not defs:
+        return {"status": "error", "content": "coworker nicht konfiguriert"}
+    sess = _cw_session_new(task_text, context_text, extra_context,
+                           client_tools=[], system_prompt=_COWORKER_PLAIN_PROMPT)
+    body = _cw_session_round_body(sess)
+    body["stream"] = False
+    _patch_qwen_anti_loop_payload(body, defs[0]["model_name"])
+    try:
+        result = await _call_single_model(body, "coworker", 0, inject_hindsight=False)
+    except Exception as exc:
+        _COWORKER_HEALTH_CACHE["reachable"] = False
+        result = {"status": "error", "content": _safe_str(exc)}
+    sess["done"] = True
+    sess["final"] = (result or {}).get("content") or ""
+    return result or {"status": "error", "content": "leere Co-Worker-Antwort"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3750,11 +4157,11 @@ def _auto_dispatch_todos(titles: List[str], files_context: str,
         _COWORKER_AUTO_DISPATCHED.add(h)
         task_text = (
             f"Task: {title}\n\n"
-            "Execute this task autonomously and completely. Use the provided "
-            "tools (read_file, write_file, list_dir) to inspect and modify the "
-            "workspace as needed. The relevant file contents from the main "
-            "conversation are attached below for context. When finished, respond "
-            "with a concise summary of what you did, including any file paths "
+            "Execute this task autonomously and completely using the "
+            "available tools to inspect and modify the workspace as needed. "
+            "The relevant file contents from the main conversation are "
+            "attached below for context. When finished, respond with a "
+            "concise summary of what you did, including any file paths "
             "you created or modified."
         )
         tc = {
@@ -3900,6 +4307,26 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
     if files_context:
         _log(f"Co-Worker-Delegation: {len(files_context)} chars Datei-Kontext "
              f"automatisch angehaengt")
+
+    # ── CW-Tunnel-Resume (non-streaming): pausierte Sessions weiterfahren ──
+    # Tunnel-tool_calls werden als normale tool_calls in der Response an den
+    # Client zurueckgegeben — auch non-streaming Clients sind Executor.
+    if _CW_RESUME_PENDING:
+        resumed = _CW_RESUME_PENDING[:]
+        _CW_RESUME_PENDING.clear()
+        _log(f"CW-Tunnel-Resume (non-stream): {len(resumed)} Session(s)")
+        fwd = await _cw_drive_quiet(resumed)
+        finals = [s for s in resumed if s.get("done")]
+        msgs_ns = body.get("messages", [])
+        if finals:
+            _cw_attach_finals(msgs_ns, finals)
+            for s in finals:
+                _cw_archive_session(s)
+        if fwd:
+            return {"result": {"content": "", "tool_calls": fwd},
+                    "used_model": "coworker-tunnel", "all_failed": False}
+        # sonst: Finals sind in der History → normale Schleife läuft weiter
+
     while True:
         outcome = await _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
         result = outcome.get("result", {})
@@ -4044,33 +4471,53 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
             else:
                 continue  # collect done → nächste Runde (Modell verarbeitet)
 
-        if other_calls and (coworker_calls or collect_calls):
-            # Gemischter Turn: Hinweis injizieren + neu aufrufen. Die bisherigen
-            # assistant-tool_calls bleiben in der History ohne Ergebnisse — das
-            # Modell formuliert den naechsten Schritt neu (gleiches Muster wie
-            # der fruehere Loop-Retry).
-            _log(f"Gemischter Turn (ask_coworker + {len(other_calls)} andere Tools) "
-                 f"— Hinweis injizieren")
-            msgs = body.get("messages", [])
-            msgs.append({"role": "user", "content":
-                "[Proxy-Hinweis] Rufe ask_coworker nicht zusammen mit anderen Tools "
-                "auf. Fuehre entweder die anderen Tools aus ODER rufe ask_coworker "
-                "in einem separaten Turn allein auf."})
-            continue
+        # ── CW-Tunnel (non-streaming): asks an Sessions binden ──
+        # Wie im Streaming-Pfad: Co-Worker-Toolcalls werden mit Tunnel-IDs
+        # (cws_...) als tool_calls in der Response zurueckgegeben — auch
+        # non-streaming Clients sind Executor. Gemischte Turns (ask + andere
+        # Tools) funktionieren genauso: andere Calls mit Original-IDs zuerst.
+        ask_norm_ns = _normalize_tool_calls(ask_calls) or ask_calls
+        other_norm_ns = _normalize_tool_calls(other_calls) or other_calls
+        if ask_norm_ns:
+            group = _cw_group_new()
+            sessions_ns: List[Dict[str, Any]] = []
+            for tc in ask_norm_ns:
+                args_raw = (tc.get("function") or {}).get("arguments", "{}")
+                try:
+                    a = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+                    if not isinstance(a, dict):
+                        a = {}
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    a = {}
+                task = str(a.get("task", "") or "")
+                context = str(a.get("context", "") or "")
+                sess = _cw_session_new(task, context, extra_context=files_context,
+                                       client_tools=body.get("tools"), group=group)
+                sess["orig_ask"] = tc
+                sessions_ns.append(sess)
 
-        # Reiner Co-Worker-Turn: intern abarbeiten (parallel, Hardware getrennt)
-        if coworker_calls:
-            coworker_calls_norm = _normalize_tool_calls(coworker_calls) or coworker_calls
-            msgs = body.get("messages", [])
-            msgs.append({"role": "assistant", "content": None, "tool_calls": coworker_calls_norm})
-            results = await asyncio.gather(
-                *[_run_coworker_call(tc, extra_context=files_context)
-                  for tc in coworker_calls_norm])
-            # reasoning_content nicht an das Hauptmodell schicken (nur Reporting)
-            for r in results:
-                r.pop("reasoning_content", None)
-            msgs.extend(results)
-            _log(f"Co-Worker-Delegation Runde {rounds}: {len(coworker_calls_norm)} Call(s) abgearbeitet")
+            fwd_ns = await _cw_drive_quiet(sessions_ns)
+            finals_ns = [s for s in sessions_ns if s.get("done")]
+            if finals_ns:
+                msgs = body.get("messages", [])
+                _cw_attach_finals(msgs, finals_ns)
+                for s in finals_ns:
+                    _cw_archive_session(s)
+                _log(f"CW-Tunnel (non-stream): {len(finals_ns)} Session(s) final")
+            if fwd_ns or other_norm_ns:
+                # Tunnel-Toolcalls + andere Calls an den Client durchreichen
+                combined = _build_forward_tool_calls(other_norm_ns) + fwd_ns
+                for i, tc in enumerate(combined):
+                    tc["index"] = i
+                if combined:
+                    result["tool_calls"] = combined
+                    _log(f"CW-Tunnel (non-stream): {len(fwd_ns)} getunnelte "
+                         f"tool_call(s) an den Client (ggf. gemischt)")
+                    return outcome
+            if finals_ns and not fwd_ns:
+                # Finals sind in der History → Modell verarbeitet sie in der
+                # naechsten Runde (continue unten über die Schleife).
+                pass
 
         # Erinnerung injizieren: bei langem Context vergisst das Modell,
         # dass es ask_coworker hat. Als user-Message (NICHT system — lokale
@@ -5201,6 +5648,27 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
             msgs.append({"role": "user", "content": status})
             _log("Fork-Join: Status-Notiz fuer offene BG-Tasks injiziert")
 
+    # ── CW-Tunnel-Resume: pausierte Co-Worker-Sessions weiterfahren ──
+    # Trailing role:'tool'-Nachrichten mit Tunnel-ID (cws_...) sind die
+    # Ergebnisse des pausierten Tunnels — sie werden in die Sessions
+    # zurueckgespielt und der Tunnel in _stream_local_events fortgesetzt
+    # (streaming) bzw. per _cw_drive_quiet zu Ende getrieben (non-streaming).
+    _CW_RESUME_PENDING.clear()
+    tunnel_tool_msgs = _cw_collect_tunnel_tool_msgs(msgs)
+    if tunnel_tool_msgs:
+        if category == "local":
+            resumed = _cw_resume_sessions(tunnel_tool_msgs)
+            _CW_RESUME_PENDING.extend(sess for sess, _n in resumed)
+            removed = _cw_strip_tunnel_from_messages(msgs)
+            _log(f"CW-Tunnel-Resume: {len(resumed)} Session(s) reaktiviert, "
+                 f"{removed} Tunnel-Nachricht(en) aus der History entfernt")
+        else:
+            # Andere Kategorie (per Flag gewaehlt): Tunnel-Artefakte einfach
+            # entfernen, damit das Backend keine fremden IDs sieht.
+            removed = _cw_strip_tunnel_from_messages(msgs)
+            _log(f"CW-Tunnel-Resume: Kategorie {category} — {removed} "
+                 f"Tunnel-Nachricht(en) entfernt (kein Resume)")
+
     _log(f"Kategorie: {category} (Flag={'--'+category if flag_category else 'default'}"
          f"{' Slot='+str(flag_slot) if flag_slot else ''}), "
          f"Idx={active_idx}, Modell={active_model}")
@@ -6306,207 +6774,6 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
         break
 
 
-async def _stream_coworker_call(tool_call: Dict[str, Any], queue: asyncio.Queue,
-                                model: str, stream_id: str,
-                                extra_context: Optional[str] = None) -> Dict[str, Any]:
-    """Fuehrt EINEN ask_coworker-Call intern aus und streamt dabei dessen
-    reasoning_content LIVE als eigenen Reasoning-Context an VS Code durch
-    (delta.reasoning_content) — der User sieht, worueber der Co-Worker
-    nachdenkt, waehrend er arbeitet.
-
-    Die Antwort-Content streamt LIVE token-fuer-token an VS Code durch
-    (einmal "[Proxy] Co-Worker-Antwort:"-Header, dann die Text-Chunks) —
-    so gibt es waehrend der Co-Worker-Arbeit keine toten Phasen und kein
-    Timeout-Gefuehl. Returns die tool-result Message (inkl.
-    'reasoning_content' fuer Reporting/Logs)."""
-    tool_call_id = tool_call.get("id") or f"call_{uuid.uuid4().hex[:12]}"
-    args_raw = (tool_call.get("function") or {}).get("arguments", "{}")
-    try:
-        args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
-        if not isinstance(args, dict):
-            args = {}
-    except (json.JSONDecodeError, ValueError, TypeError):
-        args = {}
-    task = str(args.get("task", "") or "")
-    context = str(args.get("context", "") or "")
-
-    started = time.perf_counter()
-    body = _build_coworker_body(task, context, extra_context=extra_context)
-    content_parts: List[str] = []
-    reasoning_parts: List[str] = []
-    think_state: Dict[str, Any] = {"in_think": False, "pending": ""}
-    has_explicit_reasoning = False
-    status = "failed"
-    err_text = "unbekannter Fehler"
-    answer_header_sent = False
-
-    async def push_reasoning(rc: str) -> None:
-        reasoning_parts.append(rc)
-        await queue.put(_format_openai_stream_chunk(
-            model, reasoning_content=rc, include_role=False, chunk_id=stream_id))
-
-    async def push_content(c: str) -> None:
-        """Streamt die Antwort-Content LIVE an VS Code (token-fuer-token).
-        Einmal pro Call wird der '[Proxy] Co-Worker-Antwort:'-Header davor
-        gesetzt — so sieht der User den Co-Worker-Text waehrend er entsteht."""
-        nonlocal answer_header_sent
-        if not answer_header_sent:
-            await queue.put(_format_openai_stream_chunk(
-                model, content="\n\n[Proxy] Co-Worker-Antwort:\n",
-                include_role=False, chunk_id=stream_id))
-            answer_header_sent = True
-        await queue.put(_format_openai_stream_chunk(
-            model, content=c, include_role=False, chunk_id=stream_id))
-
-    try:
-        async for ev in _stream_single_model_events(body, "coworker", 0, inject_hindsight=False):
-            ev_type = ev.get("type") if isinstance(ev, dict) else None
-            if ev_type == "chunk":
-                choice = ev.get("choice") or {}
-                delta = choice.get("delta") or {}
-                rc = _extract_reasoning_from_delta(delta)
-                if rc:
-                    has_explicit_reasoning = True
-                    await push_reasoning(rc)
-                c = delta.get("content")
-                if isinstance(c, str) and c:
-                    if has_explicit_reasoning:
-                        content_parts.append(c)
-                        await push_content(c)
-                    else:
-                        reasoning_part, content_part = _split_think_chunk(c, think_state)
-                        if reasoning_part:
-                            await push_reasoning(reasoning_part)
-                        if content_part:
-                            content_parts.append(content_part)
-                            await push_content(content_part)
-            elif ev_type == "done":
-                status = "ok"
-            elif ev_type == "error":
-                err_text = ev.get("content") or err_text
-                status = "failed"
-        # Angebrochene <think>-Tags am Ende flushen
-        if think_state.get("pending"):
-            pending = think_state.pop("pending", "")
-            if think_state.get("in_think"):
-                await push_reasoning(pending)
-            else:
-                content_parts.append(pending)
-                await push_content(pending)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        err_text = _safe_str(exc)
-        status = "failed"
-        _log(f"Co-Worker-Stream FEHLER: {err_text[:200]}")
-
-    duration = time.perf_counter() - started
-    content = "".join(content_parts).strip()
-    reasoning = "".join(reasoning_parts).strip()
-
-    if status == "ok":
-        if COWORKER_RESULT_CAP > 0 and len(content) > COWORKER_RESULT_CAP:
-            content = content[:COWORKER_RESULT_CAP] + "\n…[gekappt]"
-        _log(f"Co-Worker-Stream OK duration={duration:.1f}s len={len(content)} "
-             f"reasoning={len(reasoning)}")
-        return {
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "name": _COWORKER_TOOL_NAME,
-            "content": content,
-            "reasoning_content": reasoning or None,
-        }
-
-    # Fehlertext ebenfalls sichtbar streamen (sonst wuerde der User nichts sehen)
-    _COWORKER_HEALTH_CACHE["reachable"] = False
-    _log(f"Co-Worker-Stream FEHLER duration={duration:.1f}s: {err_text[:200]}")
-    err_display = f"[Co-Worker nicht verfuegbar]\n{err_text}"
-    try:
-        if not answer_header_sent:
-            await queue.put(_format_openai_stream_chunk(
-                model, content="\n\n[Proxy] Co-Worker-Antwort:\n",
-                include_role=False, chunk_id=stream_id))
-        await queue.put(_format_openai_stream_chunk(
-            model, content=err_display, include_role=False, chunk_id=stream_id))
-    except Exception:
-        pass
-    return {
-        "role": "tool",
-        "tool_call_id": tool_call_id,
-        "name": _COWORKER_TOOL_NAME,
-        "content": err_display,
-        "reasoning_content": reasoning or None,
-    }
-
-
-async def _stream_coworker_phase(coworker_calls_norm: List[Dict[str, Any]],
-                                 coworker_state: Dict[str, Any]) -> AsyncIterator[str]:
-    """Fuehrt die Co-Worker-Calls (parallel, separate Hardware) intern aus.
-
-    Das reasoning_content der Co-Worker wird LIVE als eigener Reasoning-Context
-    (delta.reasoning_content) an VS Code gestreamt; die Antwort-Content streamt
-    LIVE token-fuer-token mit "[Proxy] Co-Worker-Antwort:"-Header.
-
-    Yields Keepalive-SSE-Kommentare, damit VS Code waehrend der (langen)
-    Co-Worker-Arbeit nicht timeoutet. Die tool-result Messages landen in
-    coworker_state['coworker_results'] (inkl. 'reasoning_content').
-    """
-    model = coworker_state.get("model", "local")
-    stream_id = coworker_state.get("stream_id") or f"chatcmpl-spark-{uuid.uuid4().hex}"
-    files_context = coworker_state.get("files_context") or ""
-    queue: asyncio.Queue = asyncio.Queue(maxsize=256)
-    results: List[Optional[Dict[str, Any]]] = [None] * len(coworker_calls_norm)
-    done_count = 0
-
-    async def run_one(idx: int, tc: Dict[str, Any]) -> None:
-        nonlocal done_count
-        try:
-            results[idx] = await _stream_coworker_call(
-                tc, queue, model, stream_id, extra_context=files_context)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            _log(f"Co-Worker-Stream EXCEPTION call#{idx}: {_safe_str(exc)}")
-            err_text = f"[Co-Worker nicht verfuegbar]\n{_safe_str(exc)}"
-            results[idx] = {
-                "role": "tool",
-                "tool_call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
-                "name": _COWORKER_TOOL_NAME,
-                "content": err_text,
-            }
-            try:
-                await queue.put(_format_openai_stream_chunk(
-                    model, content=f"\n\n[Proxy] Co-Worker-Antwort:\n{err_text}",
-                    include_role=False, chunk_id=stream_id))
-            except Exception:
-                pass
-        done_count += 1
-
-    tasks = [asyncio.ensure_future(run_one(i, tc)) for i, tc in enumerate(coworker_calls_norm)]
-    try:
-        while done_count < len(tasks):
-            try:
-                sse = await asyncio.wait_for(queue.get(), timeout=_STREAM_KEEPALIVE_INTERVAL)
-            except asyncio.TimeoutError:
-                yield ": keepalive\n\n"
-                continue
-            yield sse
-        # Queue-Reste nach allen Calls drainen
-        while True:
-            try:
-                yield queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-    finally:
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    coworker_state["coworker_results"] = [r for r in results if r is not None]
-    _log(f"Co-Worker-Phase beendet: {len(coworker_state['coworker_results'])} Ergebnis(se)")
-
-
 async def _stream_local_events(body: Dict[str, Any], category: str,
                                force_start_idx: Optional[int] = None) -> AsyncIterator[str]:
     """Live-Streaming fuer Kategorie=local inkl. Co-Worker-Stream-Inject.
@@ -6546,6 +6813,37 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
     rounds = 0
     dispatch_count = 0
     hard_limit = False
+
+    # ── CW-Tunnel-Resume: pausierte Co-Worker-Sessions weiterfahren ──
+    # Die Tunnel-tool-results kamen im Folgerequest zurueck (bereits in die
+    # Sessions absorbiert, History bereinigt). Jetzt: Sessions weitertreiben.
+    # Enden sie mit tool_calls → erneut pausieren (finish 'tool_calls').
+    # Werden sie final → ask/result-Paare an die History, dann Main-Runde.
+    if _CW_RESUME_PENDING:
+        resumed_sessions = _CW_RESUME_PENDING[:]
+        _CW_RESUME_PENDING.clear()
+        _log(f"CW-Tunnel-Resume (Stream): {len(resumed_sessions)} Session(s)")
+        # Role-Chunk: erster Delta dieses Responses (OpenAI-Protokoll)
+        yield _format_openai_stream_chunk(body.get("model", category), "",
+                                          include_role=True, chunk_id=stream_id)
+        state["role_sent"] = True
+        resume_state: Dict[str, Any] = {"stream_id": stream_id, "model": category}
+        async for sse in _stream_coworker_tunnel_phase(resumed_sessions, resume_state):
+            yield sse
+        resume_finals = resume_state.get("finals") or []
+        if resume_finals:
+            _cw_attach_finals(body.setdefault("messages", []), resume_finals)
+            for s in resume_finals:
+                _cw_archive_session(s)
+        if resume_state.get("fwd_calls"):
+            yield _format_openai_stream_chunk(
+                body.get("model", category), include_role=True,
+                tool_calls=resume_state["fwd_calls"], chunk_id=stream_id)
+            yield _format_openai_stream_chunk(body.get("model", category),
+                                              finish_reason="tool_calls",
+                                              chunk_id=stream_id)
+            return
+        # sonst: gefallene Finals sind in der History → Main-Modell antwortet
 
     while True:
         async for sse in _stream_backend_turn(body, category, force_start_idx, state):
@@ -6742,48 +7040,74 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
             else:
                 continue  # collect done → nächste Runde (Modell verarbeitet)
 
-        # ── Gemischter Turn: Hinweis injizieren + neu aufrufen ──
-        if other_calls:
-            _log(f"Gemischter Turn (ask_coworker + {len(other_calls)} andere Tools) "
-                 f"— Hinweis injizieren")
-            msgs = body.get("messages", [])
-            msgs.append({"role": "user", "content":
-                "[Proxy-Hinweis] Rufe ask_coworker nicht zusammen mit anderen Tools "
-                "auf. Fuehre entweder die anderen Tools aus ODER rufe ask_coworker "
-                "in einem separaten Turn allein auf."})
-            continue
-
-        # ── Reiner Co-Worker-Turn: intern abarbeiten + Stream-Inject ──
-        coworker_calls_norm = _normalize_tool_calls(coworker_calls) or coworker_calls
+        # ── Co-Worker-Tunnel: ask_coworker-Calls an Sessions binden ──
+        # Gemischte Turns (ask + andere Tools) UND reine ask-Turns laufen
+        # beide durch den Tunnel: die Co-Worker-Toolcalls werden mit Tunnel-
+        # IDs (cws_...) an den Client weitergereicht — der Client fuehrt
+        # ALLE Tools aus, der Proxy bleibt reiner Forwarder.
+        ask_norm = _normalize_tool_calls(ask_calls) or ask_calls
+        other_norm = _normalize_tool_calls(other_calls) or other_calls
         msgs = body.get("messages", [])
-        msgs.append({"role": "assistant", "content": None, "tool_calls": coworker_calls_norm})
 
-        # 1) Stream-Inject: Delegations-Hinweis (User sieht, dass uebergeben wird)
-        preview = _coworker_task_preview(coworker_calls_norm)
+        # Sessions fuer die asks anlegen
+        group = _cw_group_new()
+        sessions: List[Dict[str, Any]] = []
+        for tc in ask_norm:
+            args_raw = (tc.get("function") or {}).get("arguments", "{}")
+            try:
+                a = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+                if not isinstance(a, dict):
+                    a = {}
+            except (json.JSONDecodeError, ValueError, TypeError):
+                a = {}
+            task = str(a.get("task", "") or "")
+            context = str(a.get("context", "") or "")
+            sess = _cw_session_new(task, context, extra_context=files_context,
+                                   client_tools=body.get("tools"), group=group)
+            sess["orig_ask"] = tc
+            sessions.append(sess)
+
+        # 1) Stream-Inject: Delegations-Hinweis (User sieht sofort, dass
+        #    an den Co-Worker delegiert wird)
+        preview = _coworker_task_preview(ask_norm)
         yield _format_openai_stream_chunk(
             model,
             content=f"\n\n[Proxy] Delegation an Co-Worker: {preview}…",
             include_role=not state.get("role_sent"), chunk_id=stream_id)
         state["role_sent"] = True
 
-        # 2) Co-Worker-Calls ausfuehren (Reasoning streamt live als eigener
-        #    Reasoning-Context; Keepalives halten VS Code am Leben)
+        # 2) Tunnel-Phase: Co-Worker-Sessions parallel weitertreiben
         coworker_state: Dict[str, Any] = {"stream_id": stream_id, "model": model,
                                           "files_context": files_context}
-        async for sse in _stream_coworker_phase(coworker_calls_norm, coworker_state):
+        async for sse in _stream_coworker_tunnel_phase(sessions, coworker_state):
             yield sse
-        results = coworker_state.get("coworker_results", [])
-        # reasoning_content nicht in die History schreiben (nur Reporting —
-        # der User sieht es bereits live als Reasoning-Context in VS Code)
-        for r in results:
-            r.pop("reasoning_content", None)
-        msgs.extend(results)
 
-        # 3) Die Co-Worker-Antwort wurde bereits waehrend der Phase LIVE
-        #    token-fuer-token gestreamt (siehe _stream_coworker_call/push_content)
-        #    — kein One-Shot-Inject mehr noetig.
+        # 3) Ausgang pruefen: tool_calls an den Client → Pause. Finals →
+        #    an die Main-History und weiter mit der naechsten Main-Runde.
+        finals = coworker_state.get("finals") or []
+        if finals:
+            _cw_attach_finals(msgs, finals)
+            for s in finals:
+                _cw_archive_session(s)
+        if coworker_state.get("fwd_calls"):
+            fwd_calls = coworker_state["fwd_calls"]
+            # Andere Tools im selben Turn: VOR den Tunnel-Calls mitliefern
+            # (Original-IDs, Client kennt sie aus dem assistant-Turn oben).
+            if other_norm:
+                fwd_calls = _build_forward_tool_calls(other_norm) + fwd_calls
+                for i, tc in enumerate(fwd_calls):
+                    tc["index"] = i
+            yield _format_openai_stream_chunk(
+                model, include_role=True, tool_calls=fwd_calls, chunk_id=stream_id)
+            yield _format_openai_stream_chunk(model, finish_reason="tool_calls",
+                                              chunk_id=stream_id)
+            if state.get("usage"):
+                yield _format_usage_stream_chunk(model, state["usage"], chunk_id=stream_id)
+            return
 
-        # 4) Naechste Runde: Hauptmodell verarbeitet die Antwort (live gestreamt)
+        # 4) Finals wurden (via _cw_attach_finals) in die History geschrieben;
+        #    Co-Worker-Text streamte bereits LIVE waehrend der Phase.
+        #    Naechste Runde: Hauptmodell verarbeitet die Ergebnisse.
         continue
 
 
@@ -6913,66 +7237,13 @@ async def debug_file(file_id: str, request: Request):
     return JSONResponse(content={"name": file_id, "content": content})
 
 
-# ── Agent-Runner-API (v4): lokaler Runner long-pollt diese Endpoints ──────
-async def _agent_auth(request: Request) -> None:
-    """Auth fuer Runner-Endpoints: PROXY_API_KEY oder AGENT_RUNNER_TOKEN."""
-    auth = request.headers.get("authorization", "")
-    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-    if not token:
-        raise HTTPException(status_code=401, detail="missing bearer token")
-    for candidate in (AGENT_RUNNER_TOKEN, os.getenv("PROXY_API_KEY", "")):
-        if candidate and secrets.compare_digest(token, candidate):
-            return
-    raise HTTPException(status_code=403, detail="invalid runner token")
-
-
 @app.get("/agent/status")
 async def agent_status(request: Request):
-    await _agent_auth(request)
+    await _auth_or_raise(request)
     return JSONResponse(content={
-        "runner_online": _agent_runner_online(),
-        "last_seen": _AGENT_RUNNER_SEEN,
-        "queue_depth": _AGENT_TOOL_QUEUE.qsize(),
-        "pending": len(_AGENT_TOOL_PENDING),
         "agent_mode": COWORKER_AGENT_MODE,
+        "cw_sessions": _cw_sessions_snapshot(),
     })
-
-
-@app.get("/agent/tools/claim")
-async def agent_tools_claim(request: Request, wait: float = 25.0):
-    """Long-Poll: liefert den naechsten Tool-Call (oder 204 nach wait Sek.)."""
-    await _agent_auth(request)
-    global _AGENT_RUNNER_SEEN
-    _AGENT_RUNNER_SEEN = time.time()
-    deadline = time.monotonic() + max(0.0, min(wait, 60.0))
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return Response(status_code=204)
-        try:
-            entry = await asyncio.wait_for(_AGENT_TOOL_QUEUE.get(), timeout=min(remaining, 5.0))
-        except asyncio.TimeoutError:
-            continue
-        return JSONResponse(content={
-            "call_id": entry["call_id"], "task_id": entry["task_id"],
-            "name": entry["name"], "arguments": entry["arguments"],
-        })
-
-
-@app.post("/agent/tools/result")
-async def agent_tools_result(request: Request):
-    """Runner liefert das Ergebnis eines Tool-Calls zurueck."""
-    await _agent_auth(request)
-    body = await request.json()
-    call_id = str(body.get("call_id", ""))
-    entry = _AGENT_TOOL_PENDING.get(call_id)
-    if entry is None:
-        return JSONResponse(status_code=404, content={"error": f"unknown call_id {call_id}"})
-    entry["result"] = body.get("result")
-    entry["error"] = body.get("error")
-    entry["done"].set()
-    return JSONResponse(content={"ok": True})
-
 
 
 @app.get("/debug/ring")
