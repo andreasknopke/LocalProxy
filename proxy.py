@@ -497,6 +497,13 @@ COWORKER_BG_TTL: float = float(os.getenv("COWORKER_BG_TTL", "1800"))
 # es an den Co-Worker delegiert. Ohne diesen Hinweis delegiert das Modell in
 # der Praxis nie — Tool-Beschreibungen allein aendern das Verhalten nicht.
 COWORKER_TEACH_DELEGATION: bool = os.getenv("COWORKER_TEACH_DELEGATION", "true").lower() in {"1", "true", "yes", "y", "on"}
+# Deterministische Verteilung: Sobald das Hauptmodell per manage_todo_list eine
+# Task-Liste anlegt, verteilt der Proxy alle 'not-started' Todos AUTOMATISCH an
+# den Co-Worker — unabhaengig davon, ob das Hauptmodell die Co-Worker-Tools
+# selbst aufruft. Prompt-Injection allein ist NICHT deterministisch (lokale
+# Modelle delegieren in der Praxis nie); der Trigger ist hier ein parsebarer
+# Tool-Call (manage_todo_list), nicht die freie Modell-Entscheidung.
+COWORKER_AUTO_DISPATCH: bool = os.getenv("COWORKER_AUTO_DISPATCH", "true").lower() in {"1", "true", "yes", "y", "on"}
 COWORKER_SYSTEM_PROMPT: str = os.getenv(
     "COWORKER_SYSTEM_PROMPT",
     "You are a co-worker coding model acting as a subagent for planning, code "
@@ -795,6 +802,7 @@ def _apply_config_file() -> None:
     global COWORKER_FORK_JOIN, COWORKER_MAX_PARALLEL
     global COWORKER_DISPATCH_CAP, COWORKER_BG_TTL
     global COWORKER_SYSTEM_PROMPT, COWORKER_TEACH_DELEGATION
+    global COWORKER_AUTO_DISPATCH
     cw = tokens_cfg.get("coworker", {})
     if isinstance(cw, dict) and cw:
         COWORKER_ENABLED = bool(cw.get("enabled", COWORKER_ENABLED))
@@ -809,6 +817,7 @@ def _apply_config_file() -> None:
         COWORKER_DISPATCH_CAP = int(cw.get("dispatch_cap_per_request", COWORKER_DISPATCH_CAP))
         COWORKER_BG_TTL = float(cw.get("bg_ttl_seconds", COWORKER_BG_TTL))
         COWORKER_TEACH_DELEGATION = bool(cw.get("teach_delegation", COWORKER_TEACH_DELEGATION))
+        COWORKER_AUTO_DISPATCH = bool(cw.get("auto_dispatch", COWORKER_AUTO_DISPATCH))
         cw_prompt = cw.get("system_prompt", "")
         if cw_prompt:
             COWORKER_SYSTEM_PROMPT = str(cw_prompt)
@@ -3571,6 +3580,11 @@ class CoworkerTask:
 # einzelne Requests (das ist der Sinn der Sache — Hintergrund-Arbeit ist
 # groesser als ein Chat-Turn).
 _COWORKER_BG_TASKS: Dict[str, CoworkerTask] = {}
+# Duplikat-Schutz fuer die Auto-Verteilung: Hashes bereits verteilter
+# not-started Todo-Titel. Verhindert, dass dieselben Todos bei jeder
+# manage_todo_list-Aktualisierung erneut an den Co-Worker gehen. Begrenzt
+# (200) — bei Ueberlauf leeren (stale Eintraege raus).
+_COWORKER_AUTO_DISPATCHED: Set[str] = set()
 # Semaphore begrenzt die gleichzeitigen Co-Worker-Calls (Schutz der Spark-
 # Hardware). Lazy initialisiert, weil asyncio.Semaphore sich an das laufende
 # Event-Loop bindet.
@@ -3684,6 +3698,79 @@ def _register_bg_dispatch(tool_call: Dict[str, Any],
     return ct
 
 
+def _extract_not_started_todos(tool_calls: Optional[List[Dict[str, Any]]]) -> List[str]:
+    """Extrahiert die Titel aller 'not-started' Todos aus manage_todo_list-Calls.
+    Deterministischer Trigger fuer die Auto-Verteilung an den Co-Worker:
+    Sobald das Hauptmodell eine Task-Liste anlegt, sind die not-started
+    Eintraege die konkreten, delegierbaren Tasks."""
+    titles: List[str] = []
+    for tc in tool_calls or []:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        if str(fn.get("name", "")).strip() != "manage_todo_list":
+            continue
+        raw = fn.get("arguments", "{}")
+        try:
+            args = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except (json.JSONDecodeError, ValueError, TypeError):
+            args = {}
+        if not isinstance(args, dict):
+            continue
+        todo_list = args.get("todoList") or args.get("todo_list") or []
+        if not isinstance(todo_list, list):
+            continue
+        for item in todo_list:
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status", "")).strip().lower()
+            if status != "not-started":
+                continue
+            title = str(item.get("title", "") or "").strip()
+            if title:
+                titles.append(title)
+    return titles
+
+
+def _auto_dispatch_todos(titles: List[str], files_context: str,
+                         dispatch_count: int) -> Tuple[List[CoworkerTask], int]:
+    """Verteilt not-started Todos deterministisch an den Co-Worker (BG-Tasks).
+    Respektiert COWORKER_DISPATCH_CAP und den Duplikat-Schutz
+    (_COWORKER_AUTO_DISPATCHED). Returns (erstellte Tasks, Anzahl)."""
+    global _COWORKER_AUTO_DISPATCHED
+    created: List[CoworkerTask] = []
+    if len(_COWORKER_AUTO_DISPATCHED) > 200:
+        _COWORKER_AUTO_DISPATCHED.clear()
+    for title in titles:
+        if dispatch_count + len(created) >= COWORKER_DISPATCH_CAP:
+            break
+        h = _simple_hash(title.lower().strip())
+        if h in _COWORKER_AUTO_DISPATCHED:
+            continue
+        _COWORKER_AUTO_DISPATCHED.add(h)
+        task_text = (
+            f"Task: {title}\n\n"
+            "Execute this task autonomously and completely. Use the provided "
+            "tools (read_file, write_file, list_dir) to inspect and modify the "
+            "workspace as needed. The relevant file contents from the main "
+            "conversation are attached below for context. When finished, respond "
+            "with a concise summary of what you did, including any file paths "
+            "you created or modified."
+        )
+        tc = {
+            "id": f"call_{uuid.uuid4().hex[:12]}",
+            "type": "function",
+            "function": {
+                "name": _COWORKER_DISPATCH_TOOL_NAME,
+                "arguments": json.dumps({"task": task_text, "context": ""},
+                                        ensure_ascii=False),
+            },
+        }
+        ct = _register_bg_dispatch(tc, files_context)
+        created.append(ct)
+    return created, len(created)
+
+
 async def _await_bg_tasks(task_ids: Optional[List[str]],
                           timeout_seconds: float = 600.0) -> List[Dict[str, Any]]:
     """Join: wartet (max. timeout) auf die angegebenen Tasks (oder alle
@@ -3782,7 +3869,8 @@ def _coworker_status_line() -> Optional[str]:
         lines.append(f"- {icon} {t.task_id}: {t.preview}{detail}")
     if len(entries) > 8:
         lines.append(f"- … und {len(entries) - 8} weitere")
-    lines.append("Rufe collect_coworker auf, um Ergebnisse abzuholen.")
+    lines.append("Diese Tasks werden vom Co-Worker ausgeführt — führe sie NICHT selbst aus. "
+                 "Sammle die Ergebnisse mit collect_coworker, sobald sie fertig sind.")
     return "\n".join(lines)
 
 
@@ -3820,6 +3908,16 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
             return outcome  # fertig: keine Tool-Calls
         dispatch_calls, collect_calls, ask_calls, other_calls = _partition_tool_calls(tool_calls)
         coworker_calls = ask_calls
+        # ── Deterministische Verteilung: manage_todo_list → Co-Worker ──
+        if (COWORKER_AUTO_DISPATCH and COWORKER_ENABLED and COWORKER_FORK_JOIN
+                and _COWORKER_HEALTH_CACHE.get("reachable", False)):
+            todo_titles = _extract_not_started_todos(other_calls)
+            if todo_titles:
+                created, n = _auto_dispatch_todos(todo_titles, files_context, dispatch_count)
+                if n:
+                    dispatch_count += n
+                    ids = ", ".join(ct.task_id for ct in created)
+                    _log(f"Auto-Dispatch: {n} not-started Todo(s) an Co-Worker verteilt ({ids})")
         if not coworker_calls and not dispatch_calls and not collect_calls:
             return outcome  # nur VS-Code-Tools → normal durchreichen
 
@@ -6489,6 +6587,27 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
 
         dispatch_calls, collect_calls, ask_calls, other_calls = _partition_tool_calls(tool_calls)
         coworker_calls = ask_calls
+
+        # ── Deterministische Verteilung: manage_todo_list → Co-Worker ──
+        # Sobald das Hauptmodell eine Task-Liste anlegt, verteilt der Proxy
+        # alle 'not-started' Todos automatisch an den Co-Worker — unabhaengig
+        # von der (nicht-deterministischen) Modell-Entscheidung.
+        if (COWORKER_AUTO_DISPATCH and COWORKER_ENABLED and COWORKER_FORK_JOIN
+                and _COWORKER_HEALTH_CACHE.get("reachable", False)):
+            todo_titles = _extract_not_started_todos(other_calls)
+            if todo_titles:
+                created, n = _auto_dispatch_todos(todo_titles, files_context, dispatch_count)
+                if n:
+                    dispatch_count += n
+                    ids = ", ".join(ct.task_id for ct in created)
+                    _log(f"Auto-Dispatch: {n} not-started Todo(s) an Co-Worker verteilt ({ids})")
+                    yield _format_openai_stream_chunk(
+                        model,
+                        content=(f"\n\n[Proxy] {n} Task(s) automatisch an Co-Worker "
+                                 f"verteilt: {ids}. Diese Tasks führt der Co-Worker aus — "
+                                 "führe sie NICHT selbst aus, sammle per collect_coworker."),
+                        include_role=not state.get("role_sent"), chunk_id=stream_id)
+                    state["role_sent"] = True
 
         # ── Delegations-Limit: hart stoppen falls weiter delegiert wird ──
         if hard_limit and (coworker_calls or collect_calls):

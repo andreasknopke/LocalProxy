@@ -381,3 +381,150 @@ def test_register_bg_dispatch_real_semantics(monkeypatch):
         assert ct.status == "done"
         assert ct.result == "store-check"
     asyncio.run(run())
+
+
+# ── Deterministische Auto-Verteilung (manage_todo_list → Co-Worker) ────────
+
+def test_extract_not_started_todos():
+    """Extrahiert nur not-started Titel aus manage_todo_list-Calls."""
+    tcs = [
+        _tc("manage_todo_list", {"todoList": [
+            {"id": 1, "title": "Task A", "status": "not-started"},
+            {"id": 2, "title": "Task B", "status": "in-progress"},
+            {"id": 3, "title": "Task C", "status": "completed"},
+            {"id": 4, "title": "Task D", "status": "not-started"},
+        ]}),
+        _tc("read_file", {"path": "foo.py"}),  # anderes Tool → ignorieren
+    ]
+    titles = proxy._extract_not_started_todos(tcs)
+    assert titles == ["Task A", "Task D"]
+
+
+def test_extract_not_started_todos_empty():
+    assert proxy._extract_not_started_todos(None) == []
+    assert proxy._extract_not_started_todos([]) == []
+    assert proxy._extract_not_started_todos(
+        [_tc("manage_todo_list", {"todoList": [
+            {"id": 1, "title": "x", "status": "in-progress"}]})]) == []
+
+
+def test_auto_dispatch_creates_bg_tasks(monkeypatch):
+    """not-started Todos werden als BG-Tasks registriert (mit Duplikat-Schutz)."""
+    async def run():
+        store: Dict[str, proxy.CoworkerTask] = {}
+
+        async def fake_bg(task, args):
+            task.status = "done"
+            task.result = "ok"
+            task.finished_at = time.time()
+
+        monkeypatch.setattr(proxy, "_run_bg_coworker_task", fake_bg)
+        monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", store)
+        monkeypatch.setattr(proxy, "_COWORKER_AUTO_DISPATCHED", set())
+        monkeypatch.setattr(proxy, "COWORKER_DISPATCH_CAP", 12)
+
+        titles = ["Task A", "Task B"]
+        created, n = proxy._auto_dispatch_todos(titles, "ctx", 0)
+        assert n == 2
+        assert len(created) == 2
+        assert all(ct.task_id in store for ct in created)
+        # Duplikat-Schutz: gleiche Titel erneut → 0 neue Tasks
+        created2, n2 = proxy._auto_dispatch_todos(titles, "ctx", 0)
+        assert n2 == 0
+        assert created2 == []
+        for ct in created:
+            await asyncio.wait_for(ct.aio_task, timeout=1.0)
+            assert ct.status == "done"
+    asyncio.run(run())
+
+
+def test_auto_dispatch_respects_cap(monkeypatch):
+    """Dispatch-Cap begrenzt die Anzahl verteilter Tasks."""
+    async def run():
+        store: Dict[str, proxy.CoworkerTask] = {}
+
+        async def fake_bg(task, args):
+            task.status = "done"
+            task.result = "ok"
+            task.finished_at = time.time()
+
+        monkeypatch.setattr(proxy, "_run_bg_coworker_task", fake_bg)
+        monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", store)
+        monkeypatch.setattr(proxy, "_COWORKER_AUTO_DISPATCHED", set())
+        monkeypatch.setattr(proxy, "COWORKER_DISPATCH_CAP", 2)
+
+        # dispatch_count=1 + 3 neue → nur 1 darf noch rein
+        created, n = proxy._auto_dispatch_todos(
+            ["T1", "T2", "T3"], "ctx", dispatch_count=1)
+        assert n == 1
+        assert len(created) == 1
+    asyncio.run(run())
+
+
+def test_delegation_loop_auto_dispatch_on_todo(monkeypatch):
+    """_delegation_loop: manage_todo_list-Call → not-started Todos werden
+    automatisch an den Co-Worker verteilt (deterministisch)."""
+    async def run():
+        store: Dict[str, proxy.CoworkerTask] = {}
+        registered: List[str] = []
+
+        async def fake_bg(task, args):
+            task.status = "done"
+            task.result = "auto-ok"
+            task.finished_at = time.time()
+
+        def fake_register(tool_call, files_context):
+            import json as _json
+            args = _json.loads(tool_call["function"]["arguments"])
+            ct = proxy.CoworkerTask(
+                task_id=f"cw_test{len(registered)}",
+                preview=proxy._task_preview_from_args(args),
+                file_context=files_context or None,
+            )
+            ct.aio_task = asyncio.ensure_future(fake_bg(ct, args))
+            store[ct.task_id] = ct
+            registered.append(ct.task_id)
+            return ct
+
+        calls = {"n": 0}
+
+        async def fake_fallbacks(body, category, force_start_idx=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Modell plant per manage_todo_list (VS-Code-Tool)
+                return {"result": {"status": "ok", "content": "",
+                                   "tool_calls": [
+                                       _tc("manage_todo_list", {"todoList": [
+                                           {"id": 1, "title": "Refaktor A",
+                                            "status": "not-started"},
+                                           {"id": 2, "title": "Test B",
+                                            "status": "not-started"}]})]},
+                       "all_failed": False}
+            return {"result": {"status": "ok",
+                               "content": "fertig, tasks laufen beim Co-Worker"},
+                    "all_failed": False}
+
+        monkeypatch.setattr(proxy, "_run_bg_coworker_task", fake_bg)
+        monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", store)
+        monkeypatch.setattr(proxy, "_COWORKER_AUTO_DISPATCHED", set())
+        monkeypatch.setattr(proxy, "_register_bg_dispatch", fake_register)
+        monkeypatch.setattr(proxy, "_call_model_with_fallbacks", fake_fallbacks)
+        monkeypatch.setattr(proxy, "COWORKER_ENABLED", True)
+        monkeypatch.setattr(proxy, "COWORKER_FORK_JOIN", True)
+        monkeypatch.setattr(proxy, "COWORKER_AUTO_DISPATCH", True)
+        monkeypatch.setattr(proxy, "COWORKER_DISPATCH_CAP", 12)
+        monkeypatch.setattr(proxy, "_COWORKER_HEALTH_CACHE",
+                            {"reachable": True})
+
+        body = {"messages": [{"role": "user", "content": "mach den Plan"}]}
+        outcome = await proxy._delegation_loop(body, "local")
+        # 2 not-started Todos deterministisch verteilt
+        assert len(registered) == 2
+        assert all(tid in store for tid in registered)
+        # manage_todo_list-Call wird normal an den Client durchgereicht
+        # (Client führt es aus; im nächsten Request zeigt die Status-Notiz
+        # die offenen BG-Tasks)
+        tcs = outcome["result"]["tool_calls"] or []
+        assert any((tc.get("function") or {}).get("name") == "manage_todo_list"
+                   for tc in tcs)
+    asyncio.run(run())
