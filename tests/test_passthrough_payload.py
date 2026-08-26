@@ -1282,20 +1282,20 @@ def test_patch_local_sampling_sets_params():
 # ── Qwen-Anti-Loop-Sampling (qwen3.8-26b etc.) ─────────────────────────────
 
 def test_patch_qwen_anti_loop_sets_params():
-    """Qwen-Modell -> temp=0.3, presence_penalty=1.5, top_p=0.95 erzwungen."""
+    """Qwen-Modell -> temp=0.3, presence_penalty=0.5, top_p=0.95 erzwungen."""
     payload = {"temperature": 1.0, "top_p": 1.0, "presence_penalty": 0.0}
     proxy._patch_qwen_anti_loop_payload(payload, "qwen3.8-26b")
     assert payload["temperature"] == 0.3
-    assert payload["presence_penalty"] == 1.5
+    assert payload["presence_penalty"] == 0.5
     assert payload["top_p"] == 0.95
 
 
 def test_patch_qwen_anti_loop_idempotent():
     """Bereits korrekte Werte -> keine Aenderung, keine Fehler."""
-    payload = {"temperature": 0.3, "top_p": 0.95, "presence_penalty": 1.5}
+    payload = {"temperature": 0.3, "top_p": 0.95, "presence_penalty": 0.5}
     proxy._patch_qwen_anti_loop_payload(payload, "Qwen/Qwen3-Next-80B")
     assert payload["temperature"] == 0.3
-    assert payload["presence_penalty"] == 1.5
+    assert payload["presence_penalty"] == 0.5
     assert payload["top_p"] == 0.95
 
 
@@ -1315,7 +1315,7 @@ def test_build_passthrough_payload_qwen_anti_loop(monkeypatch):
             "temperature": 1.0, "top_p": 1.0, "presence_penalty": 0.0}
     payload = proxy._build_passthrough_payload(body, "local", 0)
     assert payload["temperature"] == 0.3
-    assert payload["presence_penalty"] == 1.5
+    assert payload["presence_penalty"] == 0.5
     assert payload["top_p"] == 0.95
 
 
@@ -1328,7 +1328,7 @@ def test_build_passthrough_payload_coworker_qwen_anti_loop(monkeypatch):
     payload = proxy._build_passthrough_payload(body, "coworker", 0)
     assert payload["model"] == "qwen3.8-26b"
     assert payload["temperature"] == 0.3
-    assert payload["presence_penalty"] == 1.5
+    assert payload["presence_penalty"] == 0.5
     assert payload["top_p"] == 0.95
 
 

@@ -2465,9 +2465,12 @@ def _patch_local_sampling_payload(payload: Dict[str, Any]) -> None:
 # Qwen-Reasoning-Modelle (z.B. qwen3.8-26b) neigen zu Endlos-Denkschleifen.
 # Als Anti-Loop-Strategie werden fuer Qwen-Modelle — lokal UND Coworker —
 # IMMER folgende Parameter erzwungen, egal was der VS-Code-Client sendet:
-#   temperature=0.3, presence_penalty=1.5, top_p=0.95
+#   temperature=0.3, presence_penalty=0.5, top_p=0.95
+# (presence_penalty=1.5 bestrafte strukturierte Tool-Call-JSON-Feldnamen
+#  wie "command"/"path"/"content" und fuehrte dazu, dass das Modell den Code
+#  im Reasoning-Block schrieb statt Tool-Calls zu emittieren → 0.5)
 _QWEN_ANTI_LOOP_TEMPERATURE: float = 0.3
-_QWEN_ANTI_LOOP_PRESENCE_PENALTY: float = 1.5
+_QWEN_ANTI_LOOP_PRESENCE_PENALTY: float = 0.5
 _QWEN_ANTI_LOOP_TOP_P: float = 0.95
 
 
@@ -2476,7 +2479,7 @@ def _patch_qwen_anti_loop_payload(payload: Dict[str, Any], model_name: str) -> N
 
     Wie der fruehere Moonshot-Patch: ueberschreibt die vom Client gesendeten
     Sampling-Parameter hart mit den Anti-Loop-Werten (temp=0.3,
-    presence_penalty=1.5, top_p=0.95) und loggt die Aenderungen.
+    presence_penalty=0.5, top_p=0.95) und loggt die Aenderungen.
     """
     if not _is_qwen_model(model_name):
         return
@@ -2531,7 +2534,7 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
 
     # Qwen-Anti-Loop: fuer Qwen-Modelle (local UND coworker) IMMER die
     # Loop-Schutz-Sampling-Parameter erzwingen (temp=0.3,
-    # presence_penalty=1.5, top_p=0.95).
+    # presence_penalty=0.5, top_p=0.95).
     _patch_qwen_anti_loop_payload(payload, cat["model_name"])
 
     messages = payload.get("messages", [])
@@ -2897,7 +2900,18 @@ _COWORKER_GUIDANCE_SYSTEM: str = (
     "doing everything yourself while machine B idles; delegating "
     "trivia.\n"
     "The proxy automatically attaches the files from this conversation to "
-    "every co-worker call — task/context can stay concise."
+    "every co-worker call — task/context can stay concise.\n"
+    "\n"
+    "[EXECUTION RULES]\n"
+    "- NEVER write the actual code/implementation in your thinking/reasoning "
+    "block: your reasoning is NOT delivered to the user and does not create "
+    "or modify any file. Code only becomes real once you emit the "
+    "write/edit tool calls.\n"
+    "- For any implementation task, stop planning early and emit the "
+    "write/edit/read/bash tool calls directly — one tool call per file "
+    "change. The user sees tool calls, not your reasoning.\n"
+    "- Do not re-plan or re-read files you already inspected unless a tool "
+    "result proves new information. Prefer acting over drafting."
 )
 
 _COWORKER_TOOL_DEF: Dict[str, Any] = {
