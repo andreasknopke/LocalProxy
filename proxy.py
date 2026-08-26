@@ -2574,6 +2574,12 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
     if category == "local":
         _inject_coworker_tool(payload)
 
+    # Tool-Execution-Guidance: [EXECUTION RULES] IMMER injizieren (auch ohne
+    # Co-Worker-Health-OK) — betrifft das generische write/edit-Tool-Calling
+    # des Hauptmodells, nicht die Delegation.
+    if payload.get("tools"):
+        _inject_tool_execution_guidance(payload)
+
     return _clean_payload(payload, keep_tools=True, keep_top_k=False)
 
 
@@ -2872,6 +2878,23 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
 
 _COWORKER_TOOL_NAME = "ask_coworker"
 
+# Tool-Calling-Regeln fuer das HAUPTMODELL — werden IMMER injiziert (auch ohne
+# Co-Worker-Health-OK, da sie das generische write/edit-Tool-Calling betreffen
+# und nicht die Delegation). Qwen-Reasoning-Modelle neigen dazu, den kompletten
+# Code im Reasoning-Block zu schreiben statt Tool-Calls zu emittieren.
+_TOOL_EXECUTION_GUIDANCE: str = (
+    "[EXECUTION RULES]\n"
+    "- NEVER write the actual code/implementation in your thinking/reasoning "
+    "block: your reasoning is NOT delivered to the user and does not create "
+    "or modify any file. Code only becomes real once you emit the "
+    "write/edit tool calls.\n"
+    "- For any implementation task, stop planning early and emit the "
+    "write/edit/read/bash tool calls directly — one tool call per file "
+    "change. The user sees tool calls, not your reasoning.\n"
+    "- Do not re-plan or re-read files you already inspected unless a tool "
+    "result proves new information. Prefer acting over drafting."
+)
+
 # System-Guidance, die das Hauptmodell bootstrapt, die Co-Worker-Tools
 # ueberhaupt zu nutzen. Wird als system-Message NACH der Client-System-Message
 # injiziert (nur wenn Tools injiziert wurden). Lehrt die Parallelitaets-
@@ -2900,18 +2923,7 @@ _COWORKER_GUIDANCE_SYSTEM: str = (
     "doing everything yourself while machine B idles; delegating "
     "trivia.\n"
     "The proxy automatically attaches the files from this conversation to "
-    "every co-worker call — task/context can stay concise.\n"
-    "\n"
-    "[EXECUTION RULES]\n"
-    "- NEVER write the actual code/implementation in your thinking/reasoning "
-    "block: your reasoning is NOT delivered to the user and does not create "
-    "or modify any file. Code only becomes real once you emit the "
-    "write/edit tool calls.\n"
-    "- For any implementation task, stop planning early and emit the "
-    "write/edit/read/bash tool calls directly — one tool call per file "
-    "change. The user sees tool calls, not your reasoning.\n"
-    "- Do not re-plan or re-read files you already inspected unless a tool "
-    "result proves new information. Prefer acting over drafting."
+    "every co-worker call — task/context can stay concise."
 )
 
 _COWORKER_TOOL_DEF: Dict[str, Any] = {
@@ -3122,6 +3134,40 @@ async def _coworker_health_loop() -> None:
             return
         except Exception:
             pass
+
+
+def _inject_tool_execution_guidance(payload: Dict[str, Any]) -> None:
+    """Injiziert die [EXECUTION RULES] IMMER in die System-Message — unabhaengig
+    vom Co-Worker-Health-Check. Die Regeln betreffen das generische
+    Tool-Calling des Hauptmodells (write/edit statt Code im Reasoning) und
+    duerfen nicht daran haengen, ob der Co-Worker erreichbar ist.
+
+    Merge in die BESTEHENDE System-Message (keine zusaetzliche system-Message —
+    Qwen-/Jinja-Templates erlauben system NUR als erste Message)."""
+    if not payload.get("tools"):
+        return
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return
+    has_exec = any(
+        isinstance(m, dict)
+        and m.get("role") == "system"
+        and "[EXECUTION RULES]" in str(m.get("content", ""))
+        for m in messages)
+    if has_exec:
+        return
+    first = messages[0] if isinstance(messages[0], dict) else None
+    if first is not None and first.get("role") == "system":
+        first["content"] = (
+            str(first.get("content") or "").rstrip()
+            + "\n\n" + _TOOL_EXECUTION_GUIDANCE
+        )
+    else:
+        messages.insert(0, {
+            "role": "system",
+            "content": _TOOL_EXECUTION_GUIDANCE,
+        })
+    _log("Tool-Execution-Guidance injiziert ([EXECUTION RULES])")
 
 
 def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
@@ -5115,6 +5161,7 @@ def io_trace_analyze(turn_id: str) -> Dict[str, Any]:
         "coworker_tools_on_wire": False,
         "coworker_tool_names_found": [],
         "guidance_in_system": False,
+        "execution_rules_in_system": False,
         "client_tool_names": [],
         "coworker_calls_seen": 0,
         "coworker_call_names": [],
@@ -5144,6 +5191,9 @@ def io_trace_analyze(turn_id: str) -> Dict[str, Any]:
                 if isinstance(m, dict) and m.get("role") == "system" \
                         and "[PROXY DELEGATION GUIDANCE]" in str(m.get("content", "")):
                     analysis["guidance_in_system"] = True
+                if isinstance(m, dict) and m.get("role") == "system" \
+                        and "[EXECUTION RULES]" in str(m.get("content", "")):
+                    analysis["execution_rules_in_system"] = True
         elif kind == "backend_resp":
             resp = ev.get("response")
             stacks: List[Any] = []
@@ -5256,9 +5306,9 @@ def io_trace_turn_list() -> List[Dict[str, Any]]:
             if not isinstance(analysis, dict):
                 analysis = io_trace_analyze(entry.name)
             for k in ("coworker_tools_on_wire", "guidance_in_system",
-                      "coworker_calls_seen", "client_tool_names",
-                      "coworker_tool_names_found", "outbound_models",
-                      "backend_error", "event_count"):
+                      "execution_rules_in_system", "coworker_calls_seen",
+                      "client_tool_names", "coworker_tool_names_found",
+                      "outbound_models", "backend_error", "event_count"):
                 info[k] = analysis.get(k)
             out.append(info)
     except Exception:
