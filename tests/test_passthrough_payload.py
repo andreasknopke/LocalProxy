@@ -1669,3 +1669,37 @@ def test_build_passthrough_payload_injects_execution_rules(monkeypatch):
     sys_content = payload["messages"][0]["content"]
     assert "[EXECUTION RULES]" in sys_content
     assert "[PROXY DELEGATION GUIDANCE]" not in sys_content  # Co-Worker nicht erreichbar
+
+
+def test_build_passthrough_payload_no_execution_rules_when_delegation_disabled(monkeypatch):
+    """BUGFIX: Bei ausgeschalteter Delegation (COWORKER_ENABLED=False) und
+    deaktiviertem Fork-Join (COWORKER_FORK_JOIN=False) werden die
+    [EXECUTION RULES] NICHT injiziert — der Prompt bleibt unveraendert
+    (pure passthrough)."""
+    monkeypatch.setitem(proxy._MODEL_CATEGORIES["local"], "model_name", "qwen3.8-26b")
+    monkeypatch.setattr(proxy, "COWORKER_ENABLED", False)
+    monkeypatch.setattr(proxy, "COWORKER_FORK_JOIN", False)
+    monkeypatch.setattr(proxy, "_COWORKER_HEALTH_CACHE", {"reachable": True,
+                                                          "last_error": ""})
+    body = {"model": "irrelevant", "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "write",
+                                                        "parameters": {}}}]}
+    payload = proxy._build_passthrough_payload(body, "local", 0)
+    assert all("[EXECUTION RULES]" not in str(m.get("content", ""))
+               for m in payload["messages"])
+    assert "[PROXY DELEGATION GUIDANCE]" not in payload["messages"][0]["content"]
+
+
+def test_build_passthrough_payload_execution_rules_when_delegation_enabled_no_fork_join(monkeypatch):
+    """Delegation AN, Fork-Join AUS: [EXECUTION RULES] werden weiterhin
+    injiziert — die Regeln haengen an COWORKER_ENABLED, nicht an Fork-Join."""
+    monkeypatch.setitem(proxy._MODEL_CATEGORIES["local"], "model_name", "qwen3.8-26b")
+    monkeypatch.setattr(proxy, "COWORKER_ENABLED", True)
+    monkeypatch.setattr(proxy, "COWORKER_FORK_JOIN", False)
+    monkeypatch.setattr(proxy, "_COWORKER_HEALTH_CACHE", {"reachable": False,
+                                                          "last_error": "noch nicht geprueft"})
+    body = {"model": "irrelevant", "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "write",
+                                                        "parameters": {}}}]}
+    payload = proxy._build_passthrough_payload(body, "local", 0)
+    assert "[EXECUTION RULES]" in payload["messages"][0]["content"]

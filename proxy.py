@@ -69,11 +69,26 @@ _LOG_HANDLER = logging.handlers.RotatingFileHandler(
 )
 _LOG_HANDLER.setFormatter(logging.Formatter("%(message)s"))
 
+# ── Debug-Logging-Master-Schalter ──────────────────────────────────────────
+# Steuert ALLE Debug-/Trace-Ausgaben:
+#   - proxy.log (Datei + stdout, via _log)
+#   - Payload-Dumps in data/debug/ (_dump_debug_payload)
+#   - I/O-Traces in data/io_traces/ (io_trace_active)
+#   - Debug-Ring (_register_debug_request)
+# AUS → es wird NICHTS mehr geschrieben; die Log-Anzeige im WebUI zeigt dann
+# nur noch die letzten Eintraege vor dem Abschalten (Anzeige selbst bleibt
+# unveraendert). Steuerbar via WebUI (tokens.debug_logging) oder Env
+# DEBUG_LOGGING (default an).
+DEBUG_LOGGING: bool = os.getenv("DEBUG_LOGGING", "1").lower() in {"1", "true", "yes", "on"}
+
 
 def _log(msg: str) -> None:
     """Schreibt eine Log-Zeile mit Timestamp in Datei + stdout.
     Faengt UnicodeEncodeError ab (z.B. wenn stdout ASCII-only ist in Docker/CI).
+    Bei DEBUG_LOGGING=False wird nichts geschrieben (Master-Schalter).
     """
+    if not DEBUG_LOGGING:
+        return
     timestamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {msg}"
     # Robustes stdout: fallback auf ASCII-safe print
@@ -823,6 +838,9 @@ def _apply_config_file() -> None:
         cw_prompt = cw.get("system_prompt", "")
         if cw_prompt:
             COWORKER_SYSTEM_PROMPT = str(cw_prompt)
+
+    global DEBUG_LOGGING
+    DEBUG_LOGGING = bool(tokens_cfg.get("debug_logging", DEBUG_LOGGING))
 
     global LOCAL_TEMPERATURE, LOCAL_TOP_P, LOCAL_TOP_K, LOCAL_MIN_P
     global LOCAL_DRY_MULTIPLIER, LOCAL_DRY_BASE, LOCAL_DRY_ALLOWED_LENGTH
@@ -2574,10 +2592,13 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
     if category == "local":
         _inject_coworker_tool(payload)
 
-    # Tool-Execution-Guidance: [EXECUTION RULES] IMMER injizieren (auch ohne
-    # Co-Worker-Health-OK) — betrifft das generische write/edit-Tool-Calling
-    # des Hauptmodells, nicht die Delegation.
-    if payload.get("tools"):
+    # Tool-Execution-Guidance: [EXECUTION RULES] nur injizieren, wenn die
+    # Co-Worker-Delegation aktiviert ist (COWORKER_ENABLED) — bei deaktivierter
+    # Delegation bleibt der Prompt unveraendert (pure passthrough). Vom
+    # Co-Worker-Health-Check ist sie bewusst UNABHAENGIG: die Regeln betreffen
+    # das generische write/edit-Tool-Calling des Hauptmodells, nicht die
+    # Delegation, und sollen nicht daran haengen, ob der Co-Worker erreichbar ist.
+    if payload.get("tools") and COWORKER_ENABLED:
         _inject_tool_execution_guidance(payload)
 
     return _clean_payload(payload, keep_tools=True, keep_top_k=False)
@@ -2878,10 +2899,13 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
 
 _COWORKER_TOOL_NAME = "ask_coworker"
 
-# Tool-Calling-Regeln fuer das HAUPTMODELL — werden IMMER injiziert (auch ohne
-# Co-Worker-Health-OK, da sie das generische write/edit-Tool-Calling betreffen
-# und nicht die Delegation). Qwen-Reasoning-Modelle neigen dazu, den kompletten
-# Code im Reasoning-Block zu schreiben statt Tool-Calls zu emittieren.
+# Tool-Calling-Regeln fuer das HAUPTMODELL — werden injiziert, solange die
+# Co-Worker-Delegation aktiviert ist (COWORKER_ENABLED), aber unabhaengig vom
+# Co-Worker-Health-OK (sie betreffen das generische write/edit-Tool-Calling
+# und nicht die Delegation). Bei deaktivierter Delegation wird NICHTS
+# injiziert — der Prompt bleibt dann unveraendert. Qwen-Reasoning-Modelle
+# neigen dazu, den kompletten Code im Reasoning-Block zu schreiben statt
+# Tool-Calls zu emittieren.
 _TOOL_EXECUTION_GUIDANCE: str = (
     "[EXECUTION RULES]\n"
     "- NEVER write the actual code/implementation in your thinking/reasoning "
@@ -3137,10 +3161,12 @@ async def _coworker_health_loop() -> None:
 
 
 def _inject_tool_execution_guidance(payload: Dict[str, Any]) -> None:
-    """Injiziert die [EXECUTION RULES] IMMER in die System-Message — unabhaengig
-    vom Co-Worker-Health-Check. Die Regeln betreffen das generische
-    Tool-Calling des Hauptmodells (write/edit statt Code im Reasoning) und
-    duerfen nicht daran haengen, ob der Co-Worker erreichbar ist.
+    """Injiziert die [EXECUTION RULES] in die System-Message — unabhaengig
+    vom Co-Worker-Health-Check, aber NUR solange die Co-Worker-Delegation
+    aktiviert ist (der Aufrufer prueft COWORKER_ENABLED; bei deaktivierter
+    Delegation bleibt der Prompt unveraendert). Die Regeln betreffen das
+    generische Tool-Calling des Hauptmodells (write/edit statt Code im
+    Reasoning) und duerfen nicht daran haengen, ob der Co-Worker erreichbar ist.
 
     Merge in die BESTEHENDE System-Message (keine zusaetzliche system-Message —
     Qwen-/Jinja-Templates erlauben system NUR als erste Message)."""
@@ -4843,7 +4869,7 @@ _ACTIVE_CALLS: Dict[str, Dict[str, Any]] = {}
 
 def _dump_debug_payload(req_id: str, phase: str, payload_to_dump: Dict[str, Any],
                          extra: Optional[Dict[str, Any]] = None) -> None:
-    if not DEBUG_ENABLED:
+    if not DEBUG_ENABLED or not DEBUG_LOGGING:
         return
     try:
         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
@@ -4929,6 +4955,8 @@ def _cleanup_old_debug_files() -> None:
 
 def _register_debug_request(req_id: str, info: Dict[str, Any]) -> None:
     global _DEBUG_RING
+    if not DEBUG_LOGGING:
+        return
     info = dict(info)
     info["req_id"] = req_id
     info["ts_iso"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -4981,7 +5009,10 @@ _IO_LOCK: threading.Lock = threading.Lock()
 _IO_LAST_ROTATE: float = 0.0
 
 def io_trace_active() -> bool:
-    """True wenn I/O-Tracing aktiv ist (Env-Gate + optionales Zeitfenster)."""
+    """True wenn I/O-Tracing aktiv ist (Master-Schalter + Env-Gate +
+    optionales Zeitfenster)."""
+    if not DEBUG_LOGGING:
+        return False
     if not IO_TRACE_ENABLED:
         return False
     if IO_TRACE_SECONDS > 0 and (time.time() - IO_TRACE_STARTED_AT) > IO_TRACE_SECONDS:

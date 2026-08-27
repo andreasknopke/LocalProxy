@@ -293,6 +293,12 @@ Alle 4 Kategorien konnen via Env-Vars konfiguriert werden (Prefix je Kategorie):
 - `DEFAULT_CATEGORY` — `light` (default)
 - `PROXY_PORT`, `PROXY_AUTH_ENABLED`, `PROXY_API_KEY`
 - `HINDSIGHT_ENABLED`, `QDRANT_URL`, ...
+- `DEBUG_LOGGING` — Master-Schalter für ALLE Debug-/Trace-Ausgaben
+  (1 = default): `proxy.log` (Datei + stdout), Payload-Dumps in
+  `data/debug/`, I/O-Traces in `data/io_traces/` und der Debug-Ring.
+  AUS → es wird nichts mehr geschrieben; die Log-Anzeige im WebUI zeigt
+  dann nur noch die letzten Einträge vor dem Abschalten. Auch in der
+  WebUI umschaltbar (Proxy → Debug-Logging, `tokens.debug_logging`).
 
 ### I/O-Stream-Tracing (`data/io_traces/`)
 

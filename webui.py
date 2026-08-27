@@ -15,7 +15,7 @@ import signal
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -31,8 +31,15 @@ _WEBUI_LOG_HANDLER = logging.handlers.RotatingFileHandler(
 )
 _WEBUI_LOG_HANDLER.setFormatter(logging.Formatter("%(message)s"))
 
+# Debug-Logging-Master-Schalter (Spiegel von proxy.DEBUG_LOGGING). Wird bei
+# jedem Config-Reload (_reload_proxy_config) mit dem Proxy-Wert synchronisiert;
+# der WebUI-eigene _log schreibt dann ebenfalls nichts mehr.
+_DEBUG_LOGGING: bool = True
+
 
 def _log(msg: str) -> None:
+    if not _DEBUG_LOGGING:
+        return
     import datetime as _dt
     timestamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] [webui] {msg}"
@@ -263,6 +270,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "tokens": {
         "tool_result_cap": 0,
+        "debug_logging": True,
         "read_loop_threshold": 3,
         "read_loop_intervention": "",
         "read_loop_file_threshold": 8,
@@ -324,6 +332,7 @@ _ENV_TO_CONFIG: Dict[str, Tuple[str, str]] = {
     "HINDSIGHT_RETAIN_DELAY_SECONDS": ("hindsight", "retain_delay_seconds"),
     "HINDSIGHT_DIR": ("hindsight", "dir"),
     "TOOL_RESULT_CAP": ("tokens", "tool_result_cap"),
+    "DEBUG_LOGGING": ("tokens", "debug_logging"),
     "READ_LOOP_THRESHOLD": ("tokens", "read_loop_threshold"),
     "READ_LOOP_INTERVENTION": ("tokens", "read_loop_intervention"),
     "SEARCH_LOOP_THRESHOLD": ("tokens", "search_loop_threshold"),
@@ -1256,6 +1265,14 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
       </div>
     </div>
     <div class="card">
+      <h3>🔍 Debug-Logging</h3>
+      <div class="toggle-row">
+        <span>Debug-Logs schreiben (proxy.log, Payload-Dumps, I/O-Traces)</span>
+        <label class="toggle"><input type="checkbox" id="debug_logging" checked><span class="slider"></span></label>
+      </div>
+      <div class="hint">Aus = es werden keine neuen Logs geschrieben — weder proxy.log (Datei + stdout) noch data/debug/ (Payload-Dumps) noch data/io_traces/ (I/O-Traces) noch der Debug-Ring. Die Log-Anzeige unten zeigt dann nur noch die letzten Einträge vor dem Ausschalten. Env-Var: DEBUG_LOGGING.</div>
+    </div>
+    <div class="card">
       <h3>Token-Schutz</h3>
       <div class="form-group">
         <label>Tool-Result-Cap (Zeichen, 0=aus)</label>
@@ -1383,6 +1400,9 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
   <!-- ====== SEKTION: LOGS ====== -->
   <section id="section-logs">
     <div class="card" style="padding:12px">
+      <div id="logDebugHint" style="display:none;margin-bottom:12px;padding:8px 12px;border:1px solid #d2991d;border-radius:6px;background:rgba(210,153,29,.08);color:#d2991d;font-size:0.8rem">
+        ⏸ Debug-Logging ist AUS — es werden keine neuen Logs geschrieben (Anzeige zeigt nur noch alte Einträge). Aktivieren unter <b>Proxy → Debug-Logging</b>.
+      </div>
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px">
         <h3 style="margin:0">Proxy-Logs <span style="font-size:0.75rem;color:var(--text2);font-weight:400" id="logFileLabel"></span></h3>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -1523,6 +1543,9 @@ async function loadConfig() {
     // Tokens
     const tk = cfg.tokens || {};
     document.getElementById('tool_result_cap').value = tk.tool_result_cap || 0;
+    document.getElementById('debug_logging').checked = tk.debug_logging !== false;
+    const logHint = document.getElementById('logDebugHint');
+    if (logHint) logHint.style.display = tk.debug_logging === false ? 'block' : 'none';
     document.getElementById('read_loop_threshold').value = tk.read_loop_threshold != null ? tk.read_loop_threshold : 3;
     document.getElementById('read_loop_intervention').value = tk.read_loop_intervention || '';
     document.getElementById('search_loop_threshold').value = tk.search_loop_threshold != null ? tk.search_loop_threshold : 3;
@@ -1645,6 +1668,7 @@ async function saveConfig() {
 
   cfg.tokens = {
     tool_result_cap: parseInt(document.getElementById('tool_result_cap').value) || 0,
+    debug_logging: document.getElementById('debug_logging').checked,
     read_loop_threshold: parseInt(document.getElementById('read_loop_threshold').value) || 0,
     read_loop_intervention: document.getElementById('read_loop_intervention').value || '',
     search_loop_threshold: parseInt(document.getElementById('search_loop_threshold').value) || 0,
@@ -1913,8 +1937,10 @@ document.querySelectorAll('input[type=password]').forEach(function(inp) {
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _reload_proxy_config() -> None:
+    global _DEBUG_LOGGING
     try:
-        from proxy import _apply_config_file
+        from proxy import _apply_config_file, DEBUG_LOGGING
+        _DEBUG_LOGGING = bool(DEBUG_LOGGING)
         _apply_config_file()
         _log("Proxy-Config aus config.json neu geladen (in-process)")
     except Exception as e:
