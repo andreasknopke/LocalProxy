@@ -1399,9 +1399,12 @@ def _setup_coworker_configured(monkeypatch, reachable: bool = True,
                                api_url: str = "http://localhost:9999/v1/chat/completions",
                                fork_join: bool = False):
     """Monkeypatch: coworker konfiguriert + Health-Cache gesetzt.
-    fork_join steuert explizit die Zahl der injizierten Tools (1 oder 3)."""
+    fork_join steuert explizit die Zahl der injizierten Tools (1 oder 3).
+    COWORKER_DRIVER_MODE wird auf False gepinnt: diese Tests pruefen die
+    Default-Guidance, und data/config.json kann driver_mode=true ausliefern."""
     monkeypatch.setattr(proxy, "COWORKER_ENABLED", True)
     monkeypatch.setattr(proxy, "COWORKER_FORK_JOIN", fork_join)
+    monkeypatch.setattr(proxy, "COWORKER_DRIVER_MODE", False)
     monkeypatch.setattr(proxy, "_MODEL_CATEGORIES", {
         **proxy._MODEL_CATEGORIES,
         "coworker": _coworker_def(api_url=api_url),

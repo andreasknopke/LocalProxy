@@ -512,6 +512,19 @@ COWORKER_BG_TTL: float = float(os.getenv("COWORKER_BG_TTL", "1800"))
 # es an den Co-Worker delegiert. Ohne diesen Hinweis delegiert das Modell in
 # der Praxis nie — Tool-Beschreibungen allein aendern das Verhalten nicht.
 COWORKER_TEACH_DELEGATION: bool = os.getenv("COWORKER_TEACH_DELEGATION", "true").lower() in {"1", "true", "yes", "y", "on"}
+# Praefix-Sharing: den automatisch angehaengten Datei-Kontext VOR die Task-
+# Instruction setzen. Parallele Co-Worker-Tasks teilen sich dann einen
+# byte-identischen Praefix (system + Dateien) und unterscheiden sich nur in
+# den letzten paar hundert Token -> SGLang RadixAttention / vLLM Prefix-Cache
+# rechnen den teuren Prefill EINMAL statt pro Task. Nur sinnvoll, wenn mehrere
+# Tasks denselben Datei-Kontext bekommen (dispatch-Fan-out innerhalb eines
+# Requests) — genau dort berechnet der Loop files_context ohnehin einmalig.
+COWORKER_FILES_FIRST: bool = os.getenv("COWORKER_FILES_FIRST", "true").lower() in {"1", "true", "yes", "y", "on"}
+# Driver/Experte-Rollenmodell: die Guidance bringt dem Hauptmodell bei, ALS
+# SCHNELLER TREIBER zu arbeiten (eigene Tools, viele Turns) und den teuren
+# Experten nur fuer dichten Code-Inhalt zu rufen. Ohne diesen Modus lehrt die
+# Guidance das Gegenteil (moeglichst viel delegieren).
+COWORKER_DRIVER_MODE: bool = os.getenv("COWORKER_DRIVER_MODE", "false").lower() in {"1", "true", "yes", "y", "on"}
 # Deterministische Verteilung: Sobald das Hauptmodell per manage_todo_list eine
 # Task-Liste anlegt, verteilt der Proxy alle 'not-started' Todos AUTOMATISCH an
 # den Co-Worker — unabhaengig davon, ob das Hauptmodell die Co-Worker-Tools
@@ -820,6 +833,7 @@ def _apply_config_file() -> None:
     global COWORKER_DISPATCH_CAP, COWORKER_BG_TTL
     global COWORKER_SYSTEM_PROMPT, COWORKER_TEACH_DELEGATION
     global COWORKER_AUTO_DISPATCH
+    global COWORKER_FILES_FIRST, COWORKER_DRIVER_MODE
     cw = tokens_cfg.get("coworker", {})
     if isinstance(cw, dict) and cw:
         COWORKER_ENABLED = bool(cw.get("enabled", COWORKER_ENABLED))
@@ -835,6 +849,8 @@ def _apply_config_file() -> None:
         COWORKER_BG_TTL = float(cw.get("bg_ttl_seconds", COWORKER_BG_TTL))
         COWORKER_TEACH_DELEGATION = bool(cw.get("teach_delegation", COWORKER_TEACH_DELEGATION))
         COWORKER_AUTO_DISPATCH = bool(cw.get("auto_dispatch", COWORKER_AUTO_DISPATCH))
+        COWORKER_FILES_FIRST = bool(cw.get("files_first", COWORKER_FILES_FIRST))
+        COWORKER_DRIVER_MODE = bool(cw.get("driver_mode", COWORKER_DRIVER_MODE))
         cw_prompt = cw.get("system_prompt", "")
         if cw_prompt:
             COWORKER_SYSTEM_PROMPT = str(cw_prompt)
@@ -2925,6 +2941,53 @@ _TOOL_EXECUTION_GUIDANCE: str = (
 # Regeln aus dem Fork-Join-Design (Skalier-Lektionen):
 #   triviales → selbst, 1 Task pro Datei/Aspekt im selben Turn, 4-8 fuer
 #   grosse Aufgahaben, dispatch → eigene Arbeit → collect.
+# Treiber/Experte-Variante der Guidance. Rollenbild: das HAUPTMODELL ist der
+# schnelle Treiber (kurze Latenz, hoher Prefill-Durchsatz, viele Tool-Turns),
+# der Co-Worker der langsame aber starke Experte (dichter Code-Content, keine
+# Tools). Die Guidance muss hier das GEGENTEIL lehren als im Default-Modus —
+# sonst delegiert der Treiber jede Kleinigkeit und verliert seinen Latenz-
+# Vorteil, oder er delegiert nie und der Experte idle.
+COWORKER_DRIVER_GUIDANCE_MARKER: str = "[PROXY DRIVER/EXPERT GUIDANCE]"
+
+_COWORKER_DRIVER_GUIDANCE_SYSTEM: str = (
+    COWORKER_DRIVER_GUIDANCE_MARKER + "\n"
+    "You are the FAST DRIVER of a two-model team. You run on fast hardware "
+    "with very low latency; the EXPERT model runs on separate hardware that is "
+    "much stronger at writing dense code but several times slower per token and "
+    "reached ONLY through the ask_coworker / dispatch_coworker / "
+    "collect_coworker tools.\n"
+    "DO YOURSELF (never delegate):\n"
+    "- Every tool call: reading files, searching, listing, running tests, "
+    "inspecting output. You are the only one with tool access — the expert has "
+    "NO tools and NO view of this conversation.\n"
+    "- Small edits, renames, config changes, one-line fixes, boilerplate.\n"
+    "- Deciding WHAT to do and in which order; integrating and reviewing what "
+    "comes back.\n"
+    "DELEGATE ONLY when the work is genuinely content-heavy:\n"
+    "- Writing a substantial new function, class or module from scratch.\n"
+    "- A non-trivial refactor where the target shape is already clear.\n"
+    "- Tricky algorithm, gnarly bug fix, or a design decision you are unsure of.\n"
+    "- Reviewing a large diff you just assembled.\n"
+    "HOW — keep the expert OFF the critical path:\n"
+    "- First gather context yourself (read the files). The proxy attaches them "
+    "to the delegation automatically, so the expert sees exactly what you saw.\n"
+    "- dispatch_coworker returns a task_id immediately and does NOT block. "
+    "Dispatch, then keep working: read more files, run tests, dispatch more.\n"
+    "- collect_coworker when you actually need the result. If you dispatched "
+    "early, it is already finished and you wait zero seconds.\n"
+    "- ask_coworker blocks until the answer arrives — use it only when you "
+    "cannot proceed without it.\n"
+    "- Batch independent delegations into ONE turn. The expert server batches "
+    "parallel requests and shares the prefix cache across them, so several "
+    "tasks in one turn cost far less than the same tasks spread over turns.\n"
+    "AFTER an expert answer: apply it with your own edit/write tools, then RUN "
+    "THE TESTS before reporting done. The expert cannot execute anything and "
+    "its code is unverified until you verify it.\n"
+    "Patterns to avoid: delegating file reads or edits you can do yourself; "
+    "dispatching one task per turn; blocking on ask_coworker when you had "
+    "something else to do meanwhile; trusting expert code without testing."
+)
+
 _COWORKER_GUIDANCE_SYSTEM: str = (
     "[PROXY DELEGATION GUIDANCE]\n"
     "You lead a two-machine team: you run on machine A; a Co-Worker model runs "
@@ -3229,24 +3292,34 @@ def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
     # must be at the beginning", sonst 500 vom Backend). Ohne Guidance nutzen
     # lokale Modelle die Co-Worker-Tools in der Praxis nicht.
     if COWORKER_TEACH_DELEGATION:
+        guidance_text = (_COWORKER_DRIVER_GUIDANCE_SYSTEM if COWORKER_DRIVER_MODE
+                         else _COWORKER_GUIDANCE_SYSTEM)
+        marker = (COWORKER_DRIVER_GUIDANCE_MARKER if COWORKER_DRIVER_MODE
+                  else "[PROXY DELEGATION GUIDANCE]")
+        other_marker = ("[PROXY DELEGATION GUIDANCE]" if COWORKER_DRIVER_MODE
+                        else COWORKER_DRIVER_GUIDANCE_MARKER)
         messages = payload.get("messages")
         if isinstance(messages, list):
+            # Einmalige Injektion: der eigene Marker, UND die Variante des
+            # anderen Modus, damit ein Umschalten von driver_mode nicht beide
+            # Anleitungen in dieselbe History schreibt.
             has_guidance = any(
                 isinstance(m, dict)
                 and m.get("role") == "system"
-                and "[PROXY DELEGATION GUIDANCE]" in str(m.get("content", ""))
+                and (marker in str(m.get("content", ""))
+                     or other_marker in str(m.get("content", "")))
                 for m in messages)
             if not has_guidance:
                 first = messages[0] if messages and isinstance(messages[0], dict) else None
                 if first is not None and first.get("role") == "system":
                     first["content"] = (
                         str(first.get("content") or "").rstrip()
-                        + "\n\n" + _COWORKER_GUIDANCE_SYSTEM
+                        + "\n\n" + guidance_text
                     )
                 else:
                     messages.insert(0, {
                         "role": "system",
-                        "content": _COWORKER_GUIDANCE_SYSTEM,
+                        "content": guidance_text,
                     })
     _log(f"Co-Worker-Tools injiziert (Health-OK"
          f"{', Fork-Join' if COWORKER_FORK_JOIN else ''}"
@@ -3344,6 +3417,32 @@ def _extract_conversation_files(messages: Optional[List[Dict[str, Any]]],
     return "\n\n".join(blocks)
 
 
+def _cw_join_files_and_task(files: str, task_block: str) -> str:
+    """Ordnet Datei-Kontext und Task-Block in der Reihenfolge an, die den
+    Praefix-Cache des Co-Worker-Servers maximiert.
+
+    COWORKER_FILES_FIRST (Default): Dateien ZUERST. Mehrere parallele Tasks
+    desselben Requests teilen denselben Datei-Kontext (der Loop extrahiert
+    files_context einmal pro Request) — mit Dateien am Anfang ist ihr
+    Praefix (system + Dateien) byte-identisch und der Server prefillt ihn
+    nur EINMAL (SGLang RadixAttention / vLLM Prefix-Cache). Bei 30k Token
+    Datei-Kontext spart das pro Parallel-Task den kompletten Prefill.
+    Sonst: Task zuerst (alter Aufbau, Praefix divergiert sofort).
+
+    Voraussetzung ist eine deterministische Dateireihenfolge — die liefert
+    _extract_conversation_files (History-Reihenfolge, kein set-Iteration)."""
+    if COWORKER_FILES_FIRST:
+        return (
+            "## Dateiinhalte aus dem Chat (vom Proxy automatisch angehaengt — "
+            "gehoeren zum aktuellen Kontext)\n" + files
+            + "\n\n## Aufgabe\n" + task_block
+        )
+    return task_block + (
+        "\n\n## Dateiinhalte aus dem Chat (vom Proxy automatisch "
+        "angehaengt — gehoeren zum aktuellen Kontext)\n" + files
+    )
+
+
 def _build_coworker_body(task: str, context: str,
                          extra_context: Optional[str] = None) -> Dict[str, Any]:
     """Baut eine frische, minimale Session fuer den Co-Worker.
@@ -3361,10 +3460,7 @@ def _build_coworker_body(task: str, context: str,
     if COWORKER_TASK_CAP > 0 and len(user_content) > COWORKER_TASK_CAP:
         user_content = user_content[:COWORKER_TASK_CAP] + "\n…[gekappt]"
     if extra:
-        user_content += (
-            "\n\n## Dateiinhalte aus dem Chat (vom Proxy automatisch "
-            "angehaengt — gehoeren zum aktuellen Kontext)\n" + extra
-        )
+        user_content = _cw_join_files_and_task(extra, user_content)
     messages: List[Dict[str, Any]] = []
     if COWORKER_SYSTEM_PROMPT.strip():
         messages.append({"role": "system", "content": COWORKER_SYSTEM_PROMPT})
@@ -3393,14 +3489,19 @@ async def _run_coworker_call(tool_call: Dict[str, Any],
     context = str(args.get("context", "") or "")
 
     started = time.perf_counter()
-    if COWORKER_AGENT_MODE:
-        # v4 Agent-Mode: agentischer Loop mit Tool-Zugriff (Runner-Relay)
-        result = await _run_coworker_agent(task, context, extra_context=extra_context)
-    else:
-        body = _build_coworker_body(task, context, extra_context=extra_context)
-        # inject_hindsight=False: kein Hindsight-Recall fuer Co-Worker-Calls
-        # (vermeidet Kontamination des Co-Worker-Sessions mit Haupt-History)
-        result = await _call_single_model(body, "coworker", 0, inject_hindsight=False)
+    # Semaphore AUCH hier: ask_coworker lief bisher am COWORKER_MAX_PARALLEL-
+    # Limit vorbei. Ein Server mit hartem max_running_requests (z. B. SGLang 4)
+    # kollidiert sonst mit parallel laufenden dispatch-Tasks — der eine wartet,
+    # ohne selbst zum Batch beizutragen.
+    async with _coworker_semaphore():
+        if COWORKER_AGENT_MODE:
+            # v4 Agent-Mode: agentischer Loop mit Tool-Zugriff (Runner-Relay)
+            result = await _run_coworker_agent(task, context, extra_context=extra_context)
+        else:
+            body = _build_coworker_body(task, context, extra_context=extra_context)
+            # inject_hindsight=False: kein Hindsight-Recall fuer Co-Worker-Calls
+            # (vermeidet Kontamination des Co-Worker-Sessions mit Haupt-History)
+            result = await _call_single_model(body, "coworker", 0, inject_hindsight=False)
     duration = time.perf_counter() - started
 
     if result.get("status") == "ok":
@@ -3594,11 +3695,13 @@ def _cw_session_new(task_text: str, context_text: str,
     user_content = (task_text or "").strip()
     if (context_text or "").strip():
         user_content += f"\n\n## Context\n{context_text.strip()}"
-    if extra_context:
-        user_content += ("\n\n## Dateiinhalte aus dem Chat (automatisch angehaengt)\n"
-                         + extra_context)
     if COWORKER_TASK_CAP > 0 and len(user_content) > COWORKER_TASK_CAP:
         user_content = user_content[:COWORKER_TASK_CAP] + "\n…[gekappt]"
+    if extra_context:
+        # Praefix-Sharing: Dateien vor der Task-Instruction (siehe
+        # _cw_join_files_and_task). Der Task-Block ist bereits gekappt, nur
+        # die Dateien koennen danach noch wachsen.
+        user_content = _cw_join_files_and_task(extra_context, user_content)
 
     sess: Dict[str, Any] = {
         "sid": uuid.uuid4().hex[:8],
@@ -3839,39 +3942,43 @@ async def _cw_stream_round(sess: Dict[str, Any], queue: asyncio.Queue,
             model, content=c, include_role=False, chunk_id=stream_id))
 
     try:
-        async for ev in _stream_single_model_events(body, "coworker", 0,
-                                                    inject_hindsight=False):
-            ev_type = ev.get("type") if isinstance(ev, dict) else None
-            if ev_type == "chunk":
-                choice = ev.get("choice") or {}
-                delta = choice.get("delta") or {}
-                rc = _extract_reasoning_from_delta(delta)
-                if rc:
-                    has_explicit_reasoning = True
-                    await push_reasoning(rc)
-                tcd = delta.get("tool_calls")
-                if isinstance(tcd, list) and tcd:
-                    _accumulate_stream_tool_calls(tc_state, tcd)
-                c = delta.get("content")
-                if isinstance(c, str) and c:
-                    if has_explicit_reasoning:
-                        content_parts.append(c)
-                        await push_content(c)
-                    else:
-                        rp, cp = _split_think_chunk(c, think_state)
-                        if rp:
-                            await push_reasoning(rp)
-                        if cp:
-                            content_parts.append(cp)
-                            await push_content(cp)
-            elif ev_type == "usage":
-                pass  # interne Co-Worker-Usage: nicht an den Client
-            elif ev_type == "done":
-                status = "ok"
-            elif ev_type == "error":
-                err_text = ev.get("content") or err_text
-                status = "failed"
-                break
+        # Eine Tunnel-Runde = ein laufender Request auf dem Co-Worker-Server.
+        # Das Semaphore zaehlt mit, damit parallele Sessions (und ask_coworker)
+        # das harte max_running_requests des Servers nicht ueberlaufen.
+        async with _coworker_semaphore():
+            async for ev in _stream_single_model_events(body, "coworker", 0,
+                                                        inject_hindsight=False):
+                ev_type = ev.get("type") if isinstance(ev, dict) else None
+                if ev_type == "chunk":
+                    choice = ev.get("choice") or {}
+                    delta = choice.get("delta") or {}
+                    rc = _extract_reasoning_from_delta(delta)
+                    if rc:
+                        has_explicit_reasoning = True
+                        await push_reasoning(rc)
+                    tcd = delta.get("tool_calls")
+                    if isinstance(tcd, list) and tcd:
+                        _accumulate_stream_tool_calls(tc_state, tcd)
+                    c = delta.get("content")
+                    if isinstance(c, str) and c:
+                        if has_explicit_reasoning:
+                            content_parts.append(c)
+                            await push_content(c)
+                        else:
+                            rp, cp = _split_think_chunk(c, think_state)
+                            if rp:
+                                await push_reasoning(rp)
+                            if cp:
+                                content_parts.append(cp)
+                                await push_content(cp)
+                elif ev_type == "usage":
+                    pass  # interne Co-Worker-Usage: nicht an den Client
+                elif ev_type == "done":
+                    status = "ok"
+                elif ev_type == "error":
+                    err_text = ev.get("content") or err_text
+                    status = "failed"
+                    break
         if think_state.get("pending"):
             pending = think_state.pop("pending", "")
             if think_state.get("in_think"):
@@ -5219,8 +5326,9 @@ def io_trace_analyze(turn_id: str) -> Dict[str, Any]:
             payload = ev.get("payload")
             msgs = payload.get("messages") if isinstance(payload, dict) else None
             for m in msgs or []:
-                if isinstance(m, dict) and m.get("role") == "system" \
-                        and "[PROXY DELEGATION GUIDANCE]" in str(m.get("content", "")):
+                if isinstance(m, dict) and m.get("role") == "system" and (
+                        "[PROXY DELEGATION GUIDANCE]" in str(m.get("content", ""))
+                        or COWORKER_DRIVER_GUIDANCE_MARKER in str(m.get("content", ""))):
                     analysis["guidance_in_system"] = True
                 if isinstance(m, dict) and m.get("role") == "system" \
                         and "[EXECUTION RULES]" in str(m.get("content", "")):

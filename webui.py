@@ -293,10 +293,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "health_interval_seconds": 60,
             "probe_timeout_seconds": 5,
             "enable_fork_join": True,
-            "max_parallel": 8,
+            "max_parallel": 3,
             "dispatch_cap_per_request": 12,
             "bg_ttl_seconds": 1800,
             "teach_delegation": True,
+            "files_first": True,
+            "driver_mode": True,
             "system_prompt": "You are a co-worker coding model acting as a subagent for planning, code review, brainstorming and parallel implementation tasks. You receive a self-contained task and optional context. Answer with concrete, actionable output: for planning give a step-by-step plan; for review list issues with file/line references and concrete fixes; for coding give complete, idiomatic code. You have NO access to tools, the conversation history or the workspace — work only from what is given to you.",
         },
         "local_sampling": {
@@ -789,11 +791,19 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
           <span>Delegations-Anleitung injizieren (system-Message: wann/wie Coworker-Tools nutzen)</span>
           <label class="toggle"><input type="checkbox" id="coworker_teach_delegation" checked><span class="slider"></span></label>
         </div>
+        <div class="toggle-row">
+          <span>Treiber/Experte-Rollenmodell (Hauptmodell = schneller Treiber, Coworker = teurer Experte nur für dichten Code)</span>
+          <label class="toggle"><input type="checkbox" id="coworker_driver_mode" checked><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+          <span>Dateikontext vor der Task-Injection (Praefix-Cache-Sharing über parallele Tasks)</span>
+          <label class="toggle"><input type="checkbox" id="coworker_files_first" checked><span class="slider"></span></label>
+        </div>
         <div class="row">
           <div class="form-group">
             <label>Max. parallele BG-Tasks (Semaphore)</label>
             <input type="number" id="coworker_max_parallel" min="1" max="32">
-            <div class="hint">Gleichzeitige Co-Worker-Calls im Hintergrund (DGX Spark: 8 = Sweet Spot).</div>
+            <div class="hint">Gleichzeitige Co-Worker-Calls — ask_coworker und dispatch zählen gemeinsam. Bei SGLang max_running_requests=4: 3 setzen, einen Slot frei lassen.</div>
           </div>
           <div class="form-group">
             <label>Dispatch-Cap pro Request</label>
@@ -1589,13 +1599,17 @@ async function loadConfig() {
     const cwFJEl = document.getElementById('coworker_fork_join');
     if (cwFJEl) cwFJEl.checked = cw.enable_fork_join !== false;
     const cwMPEl = document.getElementById('coworker_max_parallel');
-    if (cwMPEl) cwMPEl.value = cw.max_parallel != null ? cw.max_parallel : 8;
+    if (cwMPEl) cwMPEl.value = cw.max_parallel != null ? cw.max_parallel : 3;
     const cwDCEl = document.getElementById('coworker_dispatch_cap');
     if (cwDCEl) cwDCEl.value = cw.dispatch_cap_per_request != null ? cw.dispatch_cap_per_request : 12;
     const cwTTLEl = document.getElementById('coworker_bg_ttl');
     if (cwTTLEl) cwTTLEl.value = cw.bg_ttl_seconds != null ? cw.bg_ttl_seconds : 1800;
     const cwTDEl = document.getElementById('coworker_teach_delegation');
     if (cwTDEl) cwTDEl.checked = cw.teach_delegation !== false;
+    const cwDFEl = document.getElementById('coworker_files_first');
+    if (cwDFEl) cwDFEl.checked = cw.files_first !== false;
+    const cwDMEl = document.getElementById('coworker_driver_mode');
+    if (cwDMEl) cwDMEl.checked = cw.driver_mode !== false;
     const cwSPEl = document.getElementById('coworker_system_prompt');
     if (cwSPEl) cwSPEl.value = cw.system_prompt || '';
 
@@ -1687,10 +1701,12 @@ async function saveConfig() {
       health_interval_seconds: parseFloat(document.getElementById('coworker_health_interval')?.value) || 60,
       probe_timeout_seconds: parseFloat(document.getElementById('coworker_probe_timeout')?.value) || 5,
       enable_fork_join: document.getElementById('coworker_fork_join')?.checked ?? true,
-      max_parallel: parseInt(document.getElementById('coworker_max_parallel')?.value) || 8,
+      max_parallel: parseInt(document.getElementById('coworker_max_parallel')?.value) || 3,
       dispatch_cap_per_request: parseInt(document.getElementById('coworker_dispatch_cap')?.value) || 12,
       bg_ttl_seconds: parseFloat(document.getElementById('coworker_bg_ttl')?.value) || 1800,
       teach_delegation: document.getElementById('coworker_teach_delegation')?.checked ?? true,
+      files_first: document.getElementById('coworker_files_first')?.checked ?? true,
+      driver_mode: document.getElementById('coworker_driver_mode')?.checked ?? true,
       system_prompt: document.getElementById('coworker_system_prompt')?.value || '',
     },
     local_sampling: {
