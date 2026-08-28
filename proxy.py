@@ -525,6 +525,14 @@ COWORKER_FILES_FIRST: bool = os.getenv("COWORKER_FILES_FIRST", "true").lower() i
 # Experten nur fuer dichten Code-Inhalt zu rufen. Ohne diesen Modus lehrt die
 # Guidance das Gegenteil (moeglichst viel delegieren).
 COWORKER_DRIVER_MODE: bool = os.getenv("COWORKER_DRIVER_MODE", "false").lower() in {"1", "true", "yes", "y", "on"}
+# Deterministischer Zweitter Trigger neben manage_todo_list. Evidenz
+# (2026-08-28): ein 30B-Treiber hat einen Auftrag ("complete 3D horror game in
+# a single HTML file") ohne einen einzigen Tool-Call behandelt und den Code in
+# den Antwort-Text geschrieben. System-Praambel-Guidance wirkt bei solchen
+# Modellen nicht zuverlaessig — ein Hinweis DIREKT AN der User-Message steht am
+# Ende des Prompts und wiegt damit am meisten. Erkennung ist rein syntaktisch.
+COWORKER_BIG_BUILD_NUDGE: bool = os.getenv(
+    "COWORKER_BIG_BUILD_NUDGE", "true").lower() in {"1", "true", "yes", "y", "on"}
 # Deterministische Verteilung: Sobald das Hauptmodell per manage_todo_list eine
 # Task-Liste anlegt, verteilt der Proxy alle 'not-started' Todos AUTOMATISCH an
 # den Co-Worker — unabhaengig davon, ob das Hauptmodell die Co-Worker-Tools
@@ -834,6 +842,7 @@ def _apply_config_file() -> None:
     global COWORKER_SYSTEM_PROMPT, COWORKER_TEACH_DELEGATION
     global COWORKER_AUTO_DISPATCH
     global COWORKER_FILES_FIRST, COWORKER_DRIVER_MODE
+    global COWORKER_BIG_BUILD_NUDGE
     cw = tokens_cfg.get("coworker", {})
     if isinstance(cw, dict) and cw:
         COWORKER_ENABLED = bool(cw.get("enabled", COWORKER_ENABLED))
@@ -851,6 +860,7 @@ def _apply_config_file() -> None:
         COWORKER_AUTO_DISPATCH = bool(cw.get("auto_dispatch", COWORKER_AUTO_DISPATCH))
         COWORKER_FILES_FIRST = bool(cw.get("files_first", COWORKER_FILES_FIRST))
         COWORKER_DRIVER_MODE = bool(cw.get("driver_mode", COWORKER_DRIVER_MODE))
+        COWORKER_BIG_BUILD_NUDGE = bool(cw.get("big_build_nudge", COWORKER_BIG_BUILD_NUDGE))
         cw_prompt = cw.get("system_prompt", "")
         if cw_prompt:
             COWORKER_SYSTEM_PROMPT = str(cw_prompt)
@@ -2604,18 +2614,24 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
         }
         _log("Reasoning-Restart: enable_thinking=false fuer Folgeturn gesetzt")
 
+    # Reihenfolge ist Absicht: ERST [EXECUTION RULES], DANN die
+    # Delegations-Guidance. Beide werden in dieselbe System-Message gemergt, und
+    # am Ende einer Praembel wirkt die LETZTE Anweisung am staerksten — "emit
+    # the write/edit tool calls directly, prefer acting over drafting"
+    # widerspricht dem Delegieren, wenn es zuletzt steht. Evidenz (2026-08-28):
+    # mit EXECUTION RULES zuletzt hat das Treiber-Modell ein ganzes Spiel in den
+    # Antwort-Text geschrieben statt zu delegieren (0 tool_calls im Stream).
+    #
+    # [EXECUTION RULES] nur bei aktiver Delegation (COWORKER_ENABLED) — sonst
+    # pure passthrough. Vom Health-Check bewusst UNABHAENGIG: die Regeln
+    # betreffen das generische write/edit-Tool-Calling, nicht die Delegation.
+    if payload.get("tools") and COWORKER_ENABLED:
+        _inject_tool_execution_guidance(payload)
+
     # Co-Worker-Delegation: ask_coworker-Tool nur bei Kategorie=local + Health-OK
     if category == "local":
         _inject_coworker_tool(payload)
-
-    # Tool-Execution-Guidance: [EXECUTION RULES] nur injizieren, wenn die
-    # Co-Worker-Delegation aktiviert ist (COWORKER_ENABLED) — bei deaktivierter
-    # Delegation bleibt der Prompt unveraendert (pure passthrough). Vom
-    # Co-Worker-Health-Check ist sie bewusst UNABHAENGIG: die Regeln betreffen
-    # das generische write/edit-Tool-Calling des Hauptmodells, nicht die
-    # Delegation, und sollen nicht daran haengen, ob der Co-Worker erreichbar ist.
-    if payload.get("tools") and COWORKER_ENABLED:
-        _inject_tool_execution_guidance(payload)
+        _inject_coworker_nudge(payload)
 
     return _clean_payload(payload, keep_tools=True, keep_top_k=False)
 
@@ -2949,43 +2965,66 @@ _TOOL_EXECUTION_GUIDANCE: str = (
 # Vorteil, oder er delegiert nie und der Experte idle.
 COWORKER_DRIVER_GUIDANCE_MARKER: str = "[PROXY DRIVER/EXPERT GUIDANCE]"
 
+_COWORKER_NUDGE_MARKER: str = "[PROXY DELEGATION NUDGE]"
+# Syntaktische Erkennung eines Grossbau-Auftrags. ZWEI Achsen muessen
+# zusammentreffen (weniger False Positives als ein einzelnes Muster):
+#   Achse A (Pflicht): ein Schaffens-Verb
+#   Achse B (eine von beiden): ein Umfangs-Wort, oder ein Ganz-Artefakt-Noun
+#     in Verb-Naehe
+# "fix the typo" / "run the full test suite" fuellen Achse A nicht und feuern
+# nicht. Bewusst NICHT "file"/"class"/"tool"/"cli" als Noun — die stecken auch
+# in "rewrite this file", wo der Treiber selbst schreiben soll.
+_COWORKER_BUILD_VERB_RE: "re.Pattern[str]" = re.compile(
+    r"\b(build|create|implement|rewrite|generate|develop|author)\b", re.IGNORECASE)
+_COWORKER_SCOPE_WORD_RE: "re.Pattern[str]" = re.compile(
+    r"\b(complete|full[- ]scale|entire|whole|from scratch|production[- ]ready|"
+    r"all[- ]in[- ]one|thousands of lines)\b", re.IGNORECASE)
+_COWORKER_ARTIFACT_NEAR_VERB_RE: "re.Pattern[str]" = re.compile(
+    r"\b(build|create|implement|rewrite|generate|develop|author)\b.{0,60}"
+    r"\b(game|app|application|engine|framework|system|module|library|"
+    r"website|dashboard|suite|api)\b", re.IGNORECASE | re.DOTALL)
+_COWORKER_NUDGE_TEXT: str = (
+    "\n\n" + _COWORKER_NUDGE_MARKER + "\n"
+    "This request asks for a large body of code (a whole program, file or "
+    "module). Do NOT write it yourself. Call dispatch_coworker first — one "
+    "task per file or aspect, all in this one turn — then use your own tools "
+    "to read files, apply the expert's code and run tests. Writing this "
+    "directly into your answer text produces no file and is a failed turn."
+)
+
 _COWORKER_DRIVER_GUIDANCE_SYSTEM: str = (
     COWORKER_DRIVER_GUIDANCE_MARKER + "\n"
-    "You are the FAST DRIVER of a two-model team. You run on fast hardware "
-    "with very low latency; the EXPERT model runs on separate hardware that is "
-    "much stronger at writing dense code but several times slower per token and "
-    "reached ONLY through the ask_coworker / dispatch_coworker / "
-    "collect_coworker tools.\n"
-    "DO YOURSELF (never delegate):\n"
-    "- Every tool call: reading files, searching, listing, running tests, "
-    "inspecting output. You are the only one with tool access — the expert has "
-    "NO tools and NO view of this conversation.\n"
-    "- Small edits, renames, config changes, one-line fixes, boilerplate.\n"
-    "- Deciding WHAT to do and in which order; integrating and reviewing what "
-    "comes back.\n"
-    "DELEGATE ONLY when the work is genuinely content-heavy:\n"
-    "- Writing a substantial new function, class or module from scratch.\n"
-    "- A non-trivial refactor where the target shape is already clear.\n"
-    "- Tricky algorithm, gnarly bug fix, or a design decision you are unsure of.\n"
-    "- Reviewing a large diff you just assembled.\n"
-    "HOW — keep the expert OFF the critical path:\n"
-    "- First gather context yourself (read the files). The proxy attaches them "
-    "to the delegation automatically, so the expert sees exactly what you saw.\n"
+    "You are the FAST DRIVER of a two-model team. You run on fast hardware; "
+    "the EXPERT model runs on separate hardware, is much stronger at writing "
+    "large amounts of code, and is reached through ask_coworker / "
+    "dispatch_coworker / collect_coworker — the FIRST tools in your tool list. "
+    "Reaching for them is expected, good work, not an exception: two models "
+    "finish large work faster than you alone.\n"
+    "THE THRESHOLD — count the code you are about to produce:\n"
+    "- Under ~50 lines: write it yourself with your edit tools.\n"
+    "- Roughly 50-200 lines: your call — delegate if you are unsure of the "
+    "shape.\n"
+    "- Over ~200 lines of new or rewritten code: DELEGATE FIRST. A whole "
+    "program, game, module or class, a big refactor, or a 'build me a complete "
+    "X' request is always over this line.\n"
+    "- Several independent files or aspects: dispatch one task per file, all in "
+    "the SAME turn.\n"
+    "WHEN YOU DELEGATE, DO NOT ALSO WRITE THAT CODE YOURSELF. Delegate, then "
+    "use your own tools for what only you can do: read files, run tests, "
+    "inspect output, apply the expert's code. The expert has no tools and no "
+    "view of this conversation; the proxy hands it the files you have seen.\n"
+    "HOW:\n"
     "- dispatch_coworker returns a task_id immediately and does NOT block. "
-    "Dispatch, then keep working: read more files, run tests, dispatch more.\n"
-    "- collect_coworker when you actually need the result. If you dispatched "
-    "early, it is already finished and you wait zero seconds.\n"
-    "- ask_coworker blocks until the answer arrives — use it only when you "
-    "cannot proceed without it.\n"
-    "- Batch independent delegations into ONE turn. The expert server batches "
-    "parallel requests and shares the prefix cache across them, so several "
-    "tasks in one turn cost far less than the same tasks spread over turns.\n"
-    "AFTER an expert answer: apply it with your own edit/write tools, then RUN "
-    "THE TESTS before reporting done. The expert cannot execute anything and "
-    "its code is unverified until you verify it.\n"
-    "Patterns to avoid: delegating file reads or edits you can do yourself; "
-    "dispatching one task per turn; blocking on ask_coworker when you had "
-    "something else to do meanwhile; trusting expert code without testing."
+    "Dispatch first, then keep working — by the time you call collect_coworker "
+    "the answer is usually already there and you wait zero seconds.\n"
+    "- ask_coworker blocks until the answer arrives; use it when you cannot "
+    "continue without it.\n"
+    "- Put several independent delegations in ONE turn: the expert server "
+    "batches them and shares one prefix cache, so a batch costs far less than "
+    "the same tasks spread over turns.\n"
+    "AFTER an expert answer: apply it with your edit/write tools, then run the "
+    "tests. The expert cannot execute anything, so its code is unverified "
+    "until you verify it."
 )
 
 _COWORKER_GUIDANCE_SYSTEM: str = (
@@ -3259,6 +3298,65 @@ def _inject_tool_execution_guidance(payload: Dict[str, Any]) -> None:
     _log("Tool-Execution-Guidance injiziert ([EXECUTION RULES])")
 
 
+def _is_big_build_request(text: str) -> bool:
+    """True, wenn ein Auftrag nach einem Grossbau aussieht (siehe die drei
+    Regexe oben): Schaffens-Verb PLUS (Umfangs-Wort ODER Artefakt-Noun in
+    Verb-Naehe)."""
+    if not text or not _COWORKER_BUILD_VERB_RE.search(text):
+        return False
+    return bool(_COWORKER_SCOPE_WORD_RE.search(text)
+                or _COWORKER_ARTIFACT_NEAR_VERB_RE.search(text))
+
+
+def _inject_coworker_nudge(payload: Dict[str, Any]) -> bool:
+    """Haengt bei einem als GROSSBAU erkennbaren Auftrag einen kurzen
+    Delegations-Hinweis an die LETZTE User-Message. Returns True bei Injection.
+
+    Warum nicht im System-Prompt: die Guidance dort hat ein 30B-Modell in 65
+    getrackten Turns zu 0 Delegationen gefuehrt. Die User-Message steht am Ende
+    des Prompts — dort wirkt eine Anweisung am staerksten.
+
+    Voraussetzungen: die Co-Worker-Tools muessen wirklich am Backend sein
+    (Health-OK), sonst fuehrt der Hinweis zu einem Call ins Leere. Idempotent
+    ueber den Marker (Folgerunden derselben Conversation werden nicht
+    zugemuellt)."""
+    if not COWORKER_BIG_BUILD_NUDGE:
+        return False
+    tool_names = {str((t.get("function") or {}).get("name", ""))
+                  for t in payload.get("tools") or [] if isinstance(t, dict)}
+    if _COWORKER_TOOL_NAME not in tool_names:
+        return False
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return False
+    for m in reversed(messages):
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if isinstance(content, list):
+            text = "".join(str(p.get("text", "")) for p in content
+                           if isinstance(p, dict) and p.get("type") == "text")
+        elif isinstance(content, str):
+            text = content
+        else:
+            return False
+        if _COWORKER_NUDGE_MARKER in text:
+            return False
+        if not _is_big_build_request(text):
+            return False
+        if isinstance(content, list):
+            for p in reversed(content):
+                if isinstance(p, dict) and p.get("type") == "text":
+                    p["text"] = str(p.get("text", "")) + _COWORKER_NUDGE_TEXT
+                    _log("Co-Worker-Big-Build-Nudge injiziert (User-Message)")
+                    return True
+            return False
+        m["content"] = text + _COWORKER_NUDGE_TEXT
+        _log("Co-Worker-Big-Build-Nudge injiziert (User-Message)")
+        return True
+    return False
+
+
 def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
     """Injiziert die Co-Worker-Tools (ask_coworker; bei aktivem Fork-Join
     zusaetzlich dispatch_coworker + collect_coworker) in den Payload — NUR
@@ -3278,12 +3376,21 @@ def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
         payload["tools"] = tools
     existing = {str((t.get("function") or {}).get("name", "")) for t in tools if isinstance(t, dict)}
     if _COWORKER_TOOL_NAME not in existing:
-        tools.append(copy.deepcopy(_COWORKER_TOOL_DEF))
+        # AN DEN ANFANG der tools-Liste, nicht anhaengen. Evidenz (2026-08-28,
+        # 65 getrackte Turns): mit 56 Client-Tools standen die drei
+        # Delegationstools auf Index 56-58 von 59 — coworker_calls_seen war in
+        # ALLEN Turns 0. Ein kleines Treiber-Modell waehlt Werkzeuge aus dem
+        # Anfang der Liste; hinten angehaengt verlieren sie gegen jede
+        # VS-Code-Definition. Die index-Felder EMITTIERTER tool_calls sind
+        # davon unberuehrt (sie zaehlen pro Response, nicht gegen die
+        # tools-Liste) — Client-Ausfuehrung bleibt korrekt.
+        prepend: List[Dict[str, Any]] = [copy.deepcopy(_COWORKER_TOOL_DEF)]
         if COWORKER_FORK_JOIN:
             if _COWORKER_DISPATCH_TOOL_NAME not in existing:
-                tools.append(copy.deepcopy(_COWORKER_DISPATCH_TOOL_DEF))
+                prepend.append(copy.deepcopy(_COWORKER_DISPATCH_TOOL_DEF))
             if _COWORKER_COLLECT_TOOL_NAME not in existing:
-                tools.append(copy.deepcopy(_COWORKER_COLLECT_TOOL_DEF))
+                prepend.append(copy.deepcopy(_COWORKER_COLLECT_TOOL_DEF))
+        tools[:0] = prepend
         if "tool_choice" not in payload:
             payload["tool_choice"] = "auto"
     # Bootstrap-Guidance: an die BESTEHENDE System-Message anhaengen (merge),

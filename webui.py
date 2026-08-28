@@ -299,6 +299,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "teach_delegation": True,
             "files_first": True,
             "driver_mode": True,
+            "big_build_nudge": True,
             "system_prompt": "You are a co-worker coding model acting as a subagent for planning, code review, brainstorming and parallel implementation tasks. You receive a self-contained task and optional context. Answer with concrete, actionable output: for planning give a step-by-step plan; for review list issues with file/line references and concrete fixes; for coding give complete, idiomatic code. You have NO access to tools, the conversation history or the workspace — work only from what is given to you.",
         },
         "local_sampling": {
@@ -798,6 +799,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
         <div class="toggle-row">
           <span>Dateikontext vor der Task-Injection (Praefix-Cache-Sharing über parallele Tasks)</span>
           <label class="toggle"><input type="checkbox" id="coworker_files_first" checked><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+          <span>Big-Build-Nudge (bei "complete/build a …"-Aufträgen Delegations-Hinweis an die User-Message)</span>
+          <label class="toggle"><input type="checkbox" id="coworker_big_build_nudge" checked><span class="slider"></span></label>
         </div>
         <div class="row">
           <div class="form-group">
@@ -1610,6 +1615,8 @@ async function loadConfig() {
     if (cwDFEl) cwDFEl.checked = cw.files_first !== false;
     const cwDMEl = document.getElementById('coworker_driver_mode');
     if (cwDMEl) cwDMEl.checked = cw.driver_mode !== false;
+    const cwBBEl = document.getElementById('coworker_big_build_nudge');
+    if (cwBBEl) cwBBEl.checked = cw.big_build_nudge !== false;
     const cwSPEl = document.getElementById('coworker_system_prompt');
     if (cwSPEl) cwSPEl.value = cw.system_prompt || '';
 
@@ -1707,6 +1714,7 @@ async function saveConfig() {
       teach_delegation: document.getElementById('coworker_teach_delegation')?.checked ?? true,
       files_first: document.getElementById('coworker_files_first')?.checked ?? true,
       driver_mode: document.getElementById('coworker_driver_mode')?.checked ?? true,
+      big_build_nudge: document.getElementById('coworker_big_build_nudge')?.checked ?? true,
       system_prompt: document.getElementById('coworker_system_prompt')?.value || '',
     },
     local_sampling: {

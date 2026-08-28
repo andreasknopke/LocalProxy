@@ -133,7 +133,11 @@ def test_driver_mode_guidance_replaces_default(monkeypatch):
     assert proxy.COWORKER_DRIVER_GUIDANCE_MARKER in sys_c
     assert "[PROXY DELEGATION GUIDANCE]" not in sys_c
     assert "FAST DRIVER" in sys_c
-    assert "RUN THE TESTS" in sys_c
+    assert "DELEGATE FIRST" in sys_c
+    # Die Guidance muss erlauben, nicht verbieten — ein 30B-Treiber hoert
+    # "lieber nicht" und delegiert dann gar nicht (Evidenz 2026-08-28).
+    assert "expected, good work, not an exception" in sys_c
+    assert "Patterns to avoid" not in sys_c
 
 
 def test_default_mode_keeps_delegation_guidance(monkeypatch):
@@ -203,6 +207,137 @@ def test_io_trace_recognises_driver_marker(monkeypatch, tmp_path):
     proxy.io_end_turn()
     a = proxy.io_trace_analyze(turn_id)
     assert a["guidance_in_system"] is True
+
+
+# ── Position der Tools + Reihenfolge der Guidance ──────────────────────────
+
+def test_coworker_tools_are_prepended_not_appended(monkeypatch):
+    """Mit 56 Client-Tools standen die Delegationstools auf Index 56-58 und
+    wurden in 65 Turns NIE gewaehlt. Sie muessen vorn stehen."""
+    _setup_coworker_on(monkeypatch)
+    monkeypatch.setattr(proxy, "COWORKER_DRIVER_MODE", True)
+    client_tools = [{"type": "function",
+                     "function": {"name": f"vs_tool_{i}", "parameters": {}}}
+                    for i in range(56)]
+    payload = {"messages": [{"role": "user", "content": "hi"}],
+               "tools": client_tools}
+    assert proxy._inject_coworker_tool(payload) is True
+    names = [t["function"]["name"] for t in payload["tools"]]
+    assert names[:3] == ["ask_coworker", "dispatch_coworker", "collect_coworker"]
+    assert len(names) == 59  # nichts dupliziert/verloren
+
+
+def test_execution_rules_merged_before_delegation_guidance(monkeypatch):
+    """[EXECUTION RULES] ('prefer acting over drafting') darf NICHT zuletzt
+    stehen — es widerspricht dem Delegieren und hat das Modell im Test-Turn
+    zum Alleingang gebracht."""
+    _setup_coworker_on(monkeypatch)
+    monkeypatch.setattr(proxy, "COWORKER_DRIVER_MODE", True)
+    payload = {"messages": [{"role": "system", "content": "You are GitHub Copilot."}],
+               "tools": [{"type": "function",
+                          "function": {"name": "read_file", "parameters": {}}}]}
+    proxy._inject_tool_execution_guidance(payload)
+    proxy._inject_coworker_tool(payload)
+    sys_c = payload["messages"][0]["content"]
+    assert sys_c.index("[EXECUTION RULES]") < sys_c.index(
+        proxy.COWORKER_DRIVER_GUIDANCE_MARKER)
+
+
+# ── Big-Build-Nudge (deterministischer Zweitter Trigger) ────────────────────
+
+BIG_BUILD = ("Create a complete 3D horror game in a single HTML file, "
+             "incorporating RPG and roguelike elements.")
+
+
+def test_nudge_appended_to_user_message_on_big_build(monkeypatch):
+    _setup_coworker_on(monkeypatch)
+    monkeypatch.setattr(proxy, "COWORKER_DRIVER_MODE", True)
+    payload = {"messages": [{"role": "user", "content": BIG_BUILD}],
+               "tools": [{"type": "function",
+                          "function": {"name": "ask_coworker", "parameters": {}}}]}
+    assert proxy._inject_coworker_nudge(payload) is True
+    assert proxy._COWORKER_NUDGE_MARKER in payload["messages"][0]["content"]
+
+
+def test_nudge_idempotent(monkeypatch):
+    _setup_coworker_on(monkeypatch)
+    payload = {"messages": [{"role": "user", "content": BIG_BUILD}],
+               "tools": [{"type": "function",
+                          "function": {"name": "ask_coworker", "parameters": {}}}]}
+    proxy._inject_coworker_nudge(payload)
+    proxy._inject_coworker_nudge(payload)
+    assert payload["messages"][0]["content"].count(proxy._COWORKER_NUDGE_MARKER) == 1
+
+
+def test_nudge_skipped_for_small_request(monkeypatch):
+    _setup_coworker_on(monkeypatch)
+    payload = {"messages": [{"role": "user", "content": "fix the typo in README"}],
+               "tools": [{"type": "function",
+                          "function": {"name": "ask_coworker", "parameters": {}}}]}
+    assert proxy._inject_coworker_nudge(payload) is False
+    assert proxy._COWORKER_NUDGE_MARKER not in payload["messages"][0]["content"]
+
+
+def test_big_build_detector_two_axes():
+    """Beide Achsen muessen zusammentreffen — ein einzelnes Wort feuert nicht."""
+    yes = ["Create a complete 3D horror game in a single HTML file",
+           "build me a dashboard for the metrics",
+           "implement the auth module from scratch"]
+    no = ["fix the typo in README",
+          "run the full test suite",          # Umfangs-Wort, aber kein Schaffens-Verb
+          "what does this function do?",
+          "rename the variable in this file"]
+    for t in yes:
+        assert proxy._is_big_build_request(t), f"muesste Grossbau sein: {t}"
+    for t in no:
+        assert not proxy._is_big_build_request(t), f"darf kein Grossbau sein: {t}"
+
+
+def test_nudge_skipped_without_coworker_tools(monkeypatch):
+    """Ohne Tools am Backend wuerde der Hinweis ins Leere fuehren."""
+    _setup_coworker_on(monkeypatch)
+    payload = {"messages": [{"role": "user", "content": BIG_BUILD}],
+               "tools": [{"type": "function",
+                          "function": {"name": "read_file", "parameters": {}}}]}
+    assert proxy._inject_coworker_nudge(payload) is False
+
+
+def test_nudge_handles_content_parts(monkeypatch):
+    """VS Code schickt user-content als content-Array mit text-Parts."""
+    _setup_coworker_on(monkeypatch)
+    payload = {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": BIG_BUILD},
+        {"type": "file", "file": {"path": "a.py", "content": "x"}},
+    ]}], "tools": [{"type": "function",
+                    "function": {"name": "ask_coworker", "parameters": {}}}]}
+    assert proxy._inject_coworker_nudge(payload) is True
+    parts = payload["messages"][0]["content"]
+    assert proxy._COWORKER_NUDGE_MARKER in parts[0]["text"]
+    assert parts[1]["type"] == "file"  # file-Parts bleiben unangetastet
+
+
+def test_nudge_disabled_by_flag(monkeypatch):
+    _setup_coworker_on(monkeypatch)
+    monkeypatch.setattr(proxy, "COWORKER_BIG_BUILD_NUDGE", False)
+    payload = {"messages": [{"role": "user", "content": BIG_BUILD}],
+               "tools": [{"type": "function",
+                          "function": {"name": "ask_coworker", "parameters": {}}}]}
+    assert proxy._inject_coworker_nudge(payload) is False
+
+
+def test_nudge_fires_through_build_passthrough(monkeypatch):
+    """End-to-End ueber den echten Choke-Point: category=local + Health-OK +
+    Big-Build-Auftrag -> Nudge sitzt in der User-Message des Backend-Payloads."""
+    _setup_coworker_on(monkeypatch)
+    monkeypatch.setattr(proxy, "COWORKER_DRIVER_MODE", True)
+    body = {"model": "driver", "messages": [{"role": "user", "content": BIG_BUILD}],
+            "tools": [{"type": "function",
+                       "function": {"name": "read_file", "parameters": {}}}]}
+    out = proxy._build_passthrough_payload(body, "local")
+    user = [m for m in out["messages"] if m.get("role") == "user"][-1]
+    assert proxy._COWORKER_NUDGE_MARKER in user["content"]
+    names = [t["function"]["name"] for t in out["tools"]]
+    assert names[0] == "ask_coworker"
 
 
 # ── Semaphore-Gating (hartes Server-Limit) ─────────────────────────────────
@@ -284,6 +419,7 @@ def test_webui_defaults_expose_new_coworker_keys():
     cw = webui.DEFAULT_CONFIG["tokens"]["coworker"]
     assert cw["files_first"] is True
     assert cw["driver_mode"] is True
+    assert cw["big_build_nudge"] is True
     # SGLang max_running_requests=4 -> einen Slot frei lassen
     assert cw["max_parallel"] == 3
 
@@ -309,7 +445,10 @@ def test_apply_config_file_reads_new_keys(monkeypatch):
 def test_webui_defaults_expose_new_keys():
     src = (REPO_ROOT / "webui.py").read_text(encoding="utf-8")
     for needle in ('"files_first": True', '"driver_mode": True',
+                   '"big_build_nudge": True',
                    'id="coworker_files_first"', 'id="coworker_driver_mode"',
+                   'id="coworker_big_build_nudge"',
                    "files_first: document.getElementById",
-                   "driver_mode: document.getElementById"):
+                   "driver_mode: document.getElementById",
+                   "big_build_nudge: document.getElementById"):
         assert needle in src, f"WebUI-Oberflaeche fehlt: {needle}"
