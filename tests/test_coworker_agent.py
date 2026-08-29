@@ -54,6 +54,33 @@ def test_parse_tunnel_id_rejects_foreign_ids():
     assert proxy._cw_parse_tunnel_id("cws_") is None
 
 
+def test_readonly_filter_keeps_only_whitelisted_tools():
+    """Der Co-Worker ist read-only: Schreib-/Exec-Tools werden aus den
+    Client-Tools entfernt, Lesetools bleiben."""
+    tools = [
+        {"type": "function", "function": {"name": "read_file"}},
+        {"type": "function", "function": {"name": "grep_search"}},
+        {"type": "function", "function": {"name": "create_file"}},
+        {"type": "function", "function": {"name": "replace_string_in_file"}},
+        {"type": "function", "function": {"name": "run_in_terminal"}},
+    ]
+    out = proxy._cw_filter_readonly_tools(tools)
+    names = [t["function"]["name"] for t in out]
+    assert names == ["read_file", "grep_search"]
+    # Leere/None-Eingabe ist robust.
+    assert proxy._cw_filter_readonly_tools(None) == []
+    assert proxy._cw_filter_readonly_tools([]) == []
+
+
+def test_session_new_filters_client_tools_readonly():
+    """_cw_session_new filtert client_tools zentral auf read-only."""
+    sess = proxy._cw_session_new(
+        "task", "ctx",
+        client_tools=[{"type": "function", "function": {"name": "read_file"}},
+                      {"type": "function", "function": {"name": "create_file"}}])
+    assert [t["function"]["name"] for t in sess["client_tools"]] == ["read_file"]
+
+
 def test_map_tool_calls_out_assigns_tunnel_ids():
     sess = proxy._cw_session_new("task", "ctx", client_tools=[])
     calls = [{"id": "call_1", "type": "function",

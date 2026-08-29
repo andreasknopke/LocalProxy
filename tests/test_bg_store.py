@@ -600,7 +600,8 @@ def test_bg_task_with_client_tools_pauses_and_maps_session(monkeypatch):
         monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", {})
         monkeypatch.setattr(proxy, "io_log_bg_result", lambda *a, **k: None)
 
-        tools = [{"type": "function", "function": {"name": "create_file"}}]
+        tools = [{"type": "function", "function": {"name": "read_file"}},
+                 {"type": "function", "function": {"name": "create_file"}}]
         task = proxy.CoworkerTask(task_id="cw_tools", preview="p", created_at=time.time())
         task.file_context = "files"
         await proxy._run_bg_coworker_task(task, {"task": "schreibe file"},
@@ -609,7 +610,9 @@ def test_bg_task_with_client_tools_pauses_and_maps_session(monkeypatch):
         assert task.sid is not None
         sess = captured["sess"]
         assert sess["bg_task_id"] == "cw_tools"
-        assert sess["client_tools"] == tools
+        # Read-Only-Whitelist: create_file wird entfernt, read_file bleibt.
+        assert sess["client_tools"] == [
+            {"type": "function", "function": {"name": "read_file"}}]
         assert sess["extra_files"] if False else True  # extra_context wurde gesetzt
     asyncio.run(run())
 

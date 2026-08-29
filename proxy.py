@@ -3176,12 +3176,14 @@ _COWORKER_DISPATCH_TOOL_DEF: Dict[str, Any] = {
             "multi-file work; 4-8 parallel tasks for large refactors. Pattern: "
             "dispatch ALL independent sub-tasks in ONE turn (multiple "
             "dispatch_coworker calls), do your own work, then collect_coworker. "
-            "The co-worker runs with the SAME client tool definitions as you "
-            "(file edits, terminal etc.) and executes in the same workspace; "
-            "tool calls it makes are executed by the client and fed back "
-            "automatically. The proxy also appends conversation file contents "
-            "to each dispatched task. Task must be self-contained — the "
-            "co-worker does NOT see this conversation."
+            "The co-worker is READ-ONLY: it can inspect the workspace "
+            "(read_file, list_dir, grep_search, file_search, view_image, "
+            "fetch_webpage) but CANNOT write, edit, or run anything — YOU are "
+            "the only writer. It returns its findings and any complete file "
+            "content as TEXT, which you must then integrate yourself. The "
+            "proxy also appends conversation file contents to each dispatched "
+            "task. Task must be self-contained — the co-worker does NOT see "
+            "this conversation."
         ),
         "parameters": {
             "type": "object",
@@ -3729,15 +3731,19 @@ async def _run_coworker_call(tool_call: Dict[str, Any],
 # zurueck und werden per ID-Praefix zur Session geroutet.
 
 _COWORKER_AGENT_SYSTEM_PROMPT: str = (
-    "You are an autonomous coding subagent collaborating with the main agent "
-    "in the same workspace. You have access to the same tools as the main "
-    "agent (they are provided in the tools parameter of every request). "
-    "Work iteratively: call tools as needed, inspect results, and continue "
-    "until the task is fully done or blocked. When finished, respond with a "
-    "concise final summary of what you did (including created/modified "
-    "file paths). Be efficient: batch independent operations. Do NOT ask "
-    "the user questions and do NOT restate the task — your output goes "
-    "back to the main agent, not to a human."
+    "You are a READ-ONLY research and analysis subagent collaborating with a "
+    "main agent in the same workspace. You may ONLY inspect the workspace with "
+    "read-only tools (read_file, list_dir, grep_search, file_search, view_image, "
+    "fetch_webpage, etc.). You have NO write, edit, create, delete, or terminal "
+    "execution tools — the main agent is the ONLY writer. Do NOT attempt to "
+    "modify files. Work iteratively: read/inspect as needed, then return your "
+    "result as TEXT. When the task asks for code or file content, output the "
+    "COMPLETE, ready-to-paste content in fenced code blocks with the exact "
+    "target file path stated above each block, so the main agent can write it. "
+    "When the task is analysis, return a concise, concrete report. Be "
+    "efficient: batch independent reads. Do NOT ask the user questions and do "
+    "NOT restate the task — your output goes back to the main agent, not to a "
+    "human."
 )
 
 _COWORKER_PLAIN_PROMPT: str = (
@@ -3867,15 +3873,49 @@ def _cw_strip_tunnel_from_messages(messages: List[Dict[str, Any]]) -> int:
     return removed
 
 
+# Read-Only-Whitelist fuer Co-Worker-Sessions: Der Co-Worker ist ein reiner
+# Leser/Analyst. Er darf Dateien untersuchen und Inhalt/Analyse zurueckgeben,
+# aber NICHTS schreiben oder ausfuehren — der Worker bleibt einziger Schreiber
+# (Single-Writer-Prinzip). Damit kann der Worker die Co-Worker-Leistung nicht
+# uebersehen: sie landet als Tool-Ergebnis in seinem Kontext. Alles ausserhalb
+# dieser Whitelist wird aus den Client-Tools entfernt.
+_COWORKER_READONLY_TOOLS: Set[str] = {
+    "read_file", "list_dir", "grep_search", "file_search", "view_image",
+    "fetch_webpage", "github_repo", "github_text_search", "get_vscode_api",
+    "copilot_getNotebookSummary", "read_notebook_cell_output", "get_errors",
+    "terminal_last_command", "terminal_selection", "get_task_output",
+    "get_terminal_output", "screenshot_page", "read_page",
+    "vscode_listCodeUsages", "session_store_sql",
+    "vscode_searchExtensions_internal",
+}
+
+
+def _cw_filter_readonly_tools(
+        client_tools: Optional[List[Dict[str, Any]]]
+) -> List[Dict[str, Any]]:
+    """Laesst nur die Read-Only-Tools der Whitelist durch (Name aus
+    tool.function.name). Schreib-/Exec-Tools werden entfernt."""
+    if not client_tools:
+        return []
+    out: List[Dict[str, Any]] = []
+    for t in client_tools:
+        name = ((t or {}).get("function") or {}).get("name")
+        if name in _COWORKER_READONLY_TOOLS:
+            out.append(t)
+    return out
+
+
 def _cw_session_new(task_text: str, context_text: str,
                     extra_context: Optional[str] = None,
                     client_tools: Optional[List[Dict[str, Any]]] = None,
                     system_prompt: Optional[str] = None,
                     group: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Startet eine frische Co-Worker-Tunnel-Session. client_tools sind die
-    ORIGINAL-Tool-Definitionen aus dem Client-Request — der Co-Worker erhaelt
-    exakt die Werkzeuge, die der Client sowieso ausfuehren kann."""
+    ORIGINAL-Tool-Definitionen aus dem Client-Request; sie werden zentral auf
+    die Read-Only-Whitelist gefiltert — der Co-Worker wird zum Leser/Analysten,
+    der Inhalt zurueckgibt statt selbst zu schreiben."""
     _cw_sessions_cleanup()
+    client_tools = _cw_filter_readonly_tools(client_tools)
 
     user_content = (task_text or "").strip()
     if (context_text or "").strip():
@@ -4633,20 +4673,24 @@ def _auto_dispatch_todos(titles: List[str], files_context: str,
         if h in _COWORKER_AUTO_DISPATCHED:
             continue
         _COWORKER_AUTO_DISPATCHED.add(h)
-        tool_hint = ("The client tool definitions are attached to your request — "
-                     "use them (read_file, write/edit tools, terminal tools, "
-                     "etc.) to inspect and modify the workspace EXACTLY like the "
-                     "main agent does."
-                     if client_tools else
+        _cw_tools = _cw_filter_readonly_tools(client_tools)
+        tool_hint = ("You may INSPECT the workspace with the read-only tools "
+                     "attached to your request (read_file, list_dir, "
+                     "grep_search, file_search, view_image, etc.). You CANNOT "
+                     "write, edit, or run anything — the main agent is the only "
+                     "writer. "
+                     if _cw_tools else
                      "The relevant file contents from the main conversation are "
                      "attached below for context (you have no tool access in "
-                     "this mode).")
+                     "this mode). ")
         task_text = (
             f"Task: {title}\n\n"
             "Execute this task autonomously and completely. "
             + tool_hint +
-            " When finished, respond with a concise summary of what you did, "
-            "including any file paths you created or modified."
+            "Return your result as TEXT: for code/file work, output the "
+            "COMPLETE ready-to-paste content in fenced code blocks, each "
+            "preceded by its exact target file path; for analysis, a concise "
+            "concrete report. The main agent will write the files itself."
         )
         tc = {
             "id": f"call_{uuid.uuid4().hex[:12]}",
