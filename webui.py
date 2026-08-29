@@ -300,6 +300,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "files_first": True,
             "driver_mode": True,
             "big_build_nudge": True,
+            "thinking_off": False,
             "system_prompt": "You are a co-worker coding model acting as a subagent for planning, code review, brainstorming and parallel implementation tasks. You receive a self-contained task and optional context. Answer with concrete, actionable output: for planning give a step-by-step plan; for review list issues with file/line references and concrete fixes; for coding give complete, idiomatic code. You have NO access to tools, the conversation history or the workspace — work only from what is given to you.",
         },
         "local_sampling": {
@@ -315,6 +316,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "enable_thinking": True,
             "preserve_thinking": True,
             "thinking_mode": "none",
+            "thinking_off": False,
             "anti_loop_system_prompt": "",
         },
     },
@@ -803,6 +805,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
         <div class="toggle-row">
           <span>Big-Build-Nudge (bei "complete/build a …"-Aufträgen Delegations-Hinweis an die User-Message)</span>
           <label class="toggle"><input type="checkbox" id="coworker_big_build_nudge" checked><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+          <span>Thinking OFF erzwingen (Experte antwortet ohne Reasoning — überschreibt reasoning_effort und enable_thinking auf allen Coworker-Pfaden)</span>
+          <label class="toggle"><input type="checkbox" id="coworker_thinking_off"><span class="slider"></span></label>
         </div>
         <div class="row">
           <div class="form-group">
@@ -1404,6 +1410,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
         </select>
         <div class="hint">Wird in den ausgehenden Request als reasoning_effort gepatcht (none = Feld entfernt)</div>
       </div>
+      <div class="toggle-row">
+        <span>Thinking OFF erzwingen (Worker — überschreibt Client-Request, Thinking Mode und Reasoning-Restart)</span>
+        <label class="toggle"><input type="checkbox" id="local_thinking_off"><span class="slider"></span></label>
+      </div>
       <div class="form-group">
         <label>Anti-Loop-System-Prompt (optional)</label>
         <textarea id="local_anti_loop_system_prompt" rows="4" placeholder="Leer = Standard-Anti-Loop-Prompt"></textarea>
@@ -1583,6 +1593,8 @@ async function loadConfig() {
     document.getElementById('local_enable_thinking').checked = ls.enable_thinking !== false;
     document.getElementById('local_preserve_thinking').checked = ls.preserve_thinking !== false;
     document.getElementById('local_thinking_mode').value = ls.thinking_mode || 'none';
+    const lsTOEl = document.getElementById('local_thinking_off');
+    if (lsTOEl) lsTOEl.checked = ls.thinking_off === true;
     document.getElementById('local_anti_loop_system_prompt').value = ls.anti_loop_system_prompt || '';
 
     // Co-Worker-Delegation Settings
@@ -1617,6 +1629,8 @@ async function loadConfig() {
     if (cwDMEl) cwDMEl.checked = cw.driver_mode !== false;
     const cwBBEl = document.getElementById('coworker_big_build_nudge');
     if (cwBBEl) cwBBEl.checked = cw.big_build_nudge !== false;
+    const cwTOEl = document.getElementById('coworker_thinking_off');
+    if (cwTOEl) cwTOEl.checked = cw.thinking_off === true;
     const cwSPEl = document.getElementById('coworker_system_prompt');
     if (cwSPEl) cwSPEl.value = cw.system_prompt || '';
 
@@ -1715,6 +1729,7 @@ async function saveConfig() {
       files_first: document.getElementById('coworker_files_first')?.checked ?? true,
       driver_mode: document.getElementById('coworker_driver_mode')?.checked ?? true,
       big_build_nudge: document.getElementById('coworker_big_build_nudge')?.checked ?? true,
+      thinking_off: document.getElementById('coworker_thinking_off')?.checked ?? false,
       system_prompt: document.getElementById('coworker_system_prompt')?.value || '',
     },
     local_sampling: {
@@ -1730,6 +1745,7 @@ async function saveConfig() {
       enable_thinking: document.getElementById('local_enable_thinking').checked,
       preserve_thinking: document.getElementById('local_preserve_thinking').checked,
       thinking_mode: document.getElementById('local_thinking_mode').value || 'none',
+      thinking_off: document.getElementById('local_thinking_off')?.checked ?? false,
       anti_loop_system_prompt: document.getElementById('local_anti_loop_system_prompt').value || '',
     },
   };

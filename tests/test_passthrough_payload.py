@@ -1279,10 +1279,10 @@ def test_patch_local_sampling_sets_params():
     assert payload["chat_template_kwargs"]["preserve_thinking"] == proxy.LOCAL_PRESERVE_THINKING
 
 
-# ── Qwen-Anti-Loop-Sampling (qwen3.8-26b etc.) ─────────────────────────────
+# ── Qwen-Anti-Loop-Sampling (NUR qwen3.8-26b) ──────────────────────────────
 
 def test_patch_qwen_anti_loop_sets_params():
-    """Qwen-Modell -> temp=0.3, presence_penalty=0.5, top_p=0.95 erzwungen."""
+    """qwen3.8-26b -> temp=0.3, presence_penalty=0.5, top_p=0.95 erzwungen."""
     payload = {"temperature": 1.0, "top_p": 1.0, "presence_penalty": 0.0}
     proxy._patch_qwen_anti_loop_payload(payload, "qwen3.8-26b")
     assert payload["temperature"] == 0.3
@@ -1293,7 +1293,7 @@ def test_patch_qwen_anti_loop_sets_params():
 def test_patch_qwen_anti_loop_idempotent():
     """Bereits korrekte Werte -> keine Aenderung, keine Fehler."""
     payload = {"temperature": 0.3, "top_p": 0.95, "presence_penalty": 0.5}
-    proxy._patch_qwen_anti_loop_payload(payload, "Qwen/Qwen3-Next-80B")
+    proxy._patch_qwen_anti_loop_payload(payload, "qwen3.8-26b")
     assert payload["temperature"] == 0.3
     assert payload["presence_penalty"] == 0.5
     assert payload["top_p"] == 0.95
@@ -1306,6 +1306,109 @@ def test_patch_qwen_anti_loop_ignores_non_qwen():
     assert payload["temperature"] == 1.0
     assert payload["top_p"] == 1.0
     assert payload["presence_penalty"] == 0.0
+
+
+def test_patch_qwen_anti_loop_ignores_other_qwen_models():
+    """BUG-FIX: andere Qwen-Modelle durfen NICHT die Anti-Loop-Parameter bekommen.
+
+    Vorher matchte das Muster pauschal "qwen" und patchte qwen3-coder,
+    Qwen/Qwen3-Next-80B etc. mit — die Parameter sind eine Massnahme gegen
+    Endlos-Denkschleifen des qwen3.8-26b, nicht der ganzen Familie.
+    """
+    for name in ("Qwen/Qwen3-Next-80B", "qwen3-coder", "Qwen3.8-Flash-Next",
+                 "qwen3.5-27b", "qwen2.5-coder-32b", "Qwen/Qwen3-VL-30B"):
+        payload = {"temperature": 1.0, "top_p": 1.0, "presence_penalty": 0.0}
+        proxy._patch_qwen_anti_loop_payload(payload, name)
+        assert payload == {"temperature": 1.0, "top_p": 1.0, "presence_penalty": 0.0}, name
+
+
+def test_is_qwen_anti_loop_model_matches_26b_spelling_variants():
+    """Schreibvarianten des 26b treffen, artverwandte Namen nicht."""
+    for name in ("qwen3.8-26b", "Qwen3.8_26B", "qwen 3.8 26b", "dgx-qwen3.8-26b-nvfp4"):
+        assert proxy._is_qwen_anti_loop_model(name), name
+    for name in ("qwen3.8-27b", "qwen3.8-flash-next", "qwen3-next-80b", "", "gpt-4.1"):
+        assert not proxy._is_qwen_anti_loop_model(name), name
+
+
+# ── Thinking-OFF-Schalter (Worker / Co-Worker) ─────────────────────────────
+
+def _thinking_off_body():
+    return {"messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+            "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True}}
+
+
+def test_local_thinking_off_overrides_everything(monkeypatch):
+    """Worker-Schalter: kein reasoning_effort, enable_thinking=false — egal
+    was Client-Request oder LOCAL_THINKING_MODE sagen."""
+    monkeypatch.setattr(proxy, "LOCAL_THINKING_OFF", True)
+    monkeypatch.setattr(proxy, "LOCAL_THINKING_MODE", "high")
+    p = proxy._build_passthrough_payload(_thinking_off_body(), "local", 0)
+    assert "reasoning_effort" not in p
+    assert p["chat_template_kwargs"]["enable_thinking"] is False
+    assert p["chat_template_kwargs"]["preserve_thinking"] is False
+
+
+def test_local_thinking_off_does_not_touch_coworker(monkeypatch):
+    """Der Worker-Schalter gilt NUR fuer Kategorie local."""
+    monkeypatch.setattr(proxy, "LOCAL_THINKING_OFF", True)
+    monkeypatch.setattr(proxy, "COWORKER_THINKING_OFF", False)
+    monkeypatch.setattr(proxy, "LOCAL_THINKING_MODE", "")
+    monkeypatch.setitem(proxy._MODEL_CATEGORIES["coworker"], "api_url",
+                        "http://localhost:9999/v1/chat/completions")
+    p = proxy._build_passthrough_payload(_thinking_off_body(), "coworker", 0)
+    assert p.get("reasoning_effort") == "high"
+    assert p["chat_template_kwargs"]["enable_thinking"] is True
+
+
+def test_coworker_thinking_off_applies_on_coworker_category(monkeypatch):
+    """Co-Worker-Schalter: greift auf Kategorie coworker (Tunnel, ask_coworker
+    und dispatch laufen alle ueber diesen Payload-Builder)."""
+    monkeypatch.setattr(proxy, "COWORKER_THINKING_OFF", True)
+    monkeypatch.setattr(proxy, "LOCAL_THINKING_OFF", False)
+    monkeypatch.setitem(proxy._MODEL_CATEGORIES["coworker"], "api_url",
+                        "http://localhost:9999/v1/chat/completions")
+    p = proxy._build_passthrough_payload(_thinking_off_body(), "coworker", 0)
+    assert "reasoning_effort" not in p
+    assert p["chat_template_kwargs"]["enable_thinking"] is False
+    assert p["chat_template_kwargs"]["preserve_thinking"] is False
+
+
+def test_coworker_thinking_off_off_by_default(monkeypatch):
+    """Beide Schalter aus -> Thinking-Parameter bleiben unveraendert."""
+    monkeypatch.setattr(proxy, "COWORKER_THINKING_OFF", False)
+    monkeypatch.setattr(proxy, "LOCAL_THINKING_OFF", False)
+    monkeypatch.setattr(proxy, "LOCAL_THINKING_MODE", "")
+    p = proxy._build_passthrough_payload(_thinking_off_body(), "local", 0)
+    assert p["reasoning_effort"] == "high"
+    assert p["chat_template_kwargs"]["enable_thinking"] is True
+
+
+def test_force_thinking_off_helper_creates_chat_template_kwargs():
+    """Helper erzeugt chat_template_kwargs, wenn der Client keine mitschickt."""
+    payload = {"reasoning": {"effort": "high"}}
+    proxy._force_thinking_off_payload(payload, "test")
+    assert "reasoning" not in payload and "reasoning_effort" not in payload
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False,
+                                               "preserve_thinking": False}
+
+
+def test_apply_config_file_reads_thinking_off_keys(monkeypatch):
+    """_apply_config_file muss tokens.local_sampling.thinking_off und
+    tokens.coworker.thinking_off lesen."""
+    cfg = {"tokens": {"local_sampling": {"thinking_off": True},
+                      "coworker": {"thinking_off": True}}}
+    monkeypatch.setattr(proxy, "_WEBUI_AVAILABLE", True)
+    monkeypatch.setattr(proxy, "_webui_load_config", lambda: cfg)
+    old_local = proxy.LOCAL_THINKING_OFF
+    old_cw = proxy.COWORKER_THINKING_OFF
+    try:
+        proxy._apply_config_file()
+        assert proxy.LOCAL_THINKING_OFF is True
+        assert proxy.COWORKER_THINKING_OFF is True
+    finally:
+        proxy.LOCAL_THINKING_OFF = old_local
+        proxy.COWORKER_THINKING_OFF = old_cw
 
 
 def test_build_passthrough_payload_qwen_anti_loop(monkeypatch):

@@ -385,6 +385,12 @@ LOCAL_PRESERVE_THINKING: bool = os.getenv("LOCAL_PRESERVE_THINKING", "true").low
 # originalen VSCode-Request. "none" = kein Reasoning (Feld wird entfernt).
 LOCAL_THINKING_MODE: str = os.getenv("LOCAL_THINKING_MODE", "none").strip().lower()
 _VALID_THINKING_MODES = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+# Thinking-OFF-Schalter Worker (Kategorie 'local'): ignoriert ALLE Thinking-
+# Parameter aus dem Client-Request UND der LOCAL_THINKING_MODE-Konfiguration
+# und erzwingt Reasoning AUS (reasoning_effort entfernt,
+# chat_template_kwargs.enable_thinking=false). Der Schalter steht ueber allem,
+# damit ein Denk-Modell auf Zuruf deterministisch stumm antwortet.
+LOCAL_THINKING_OFF: bool = os.getenv("LOCAL_THINKING_OFF", "false").lower() in {"1", "true", "yes", "y", "on"}
 # Anti-Loop-System-Prompt: wird als zusaetzliche System-Message injiziert
 LOCAL_ANTI_LOOP_SYSTEM_PROMPT: str = os.getenv(
     "LOCAL_ANTI_LOOP_SYSTEM_PROMPT",
@@ -561,6 +567,13 @@ COWORKER_SYSTEM_PROMPT: str = os.getenv(
 # Session geroutet. Kein Runner, keine Relay-Queue: alles durch den Stream.
 COWORKER_AGENT_MODE: bool = os.getenv("COWORKER_AGENT_MODE", "true").lower() in {"1", "true", "yes", "y", "on"}
 COWORKER_AGENT_MAX_ROUNDS: int = int(os.getenv("COWORKER_AGENT_MAX_ROUNDS", "24"))
+# Thinking-OFF-Schalter Co-Worker: gilt fuer ALLE Co-Worker-Pfade (Tunnel-
+# Runden, ask_coworker/Agent-Loop, dispatch-Hintergrund-Tasks) — erzwingt
+# Reasoning AUS unabhaengig davon, was der Client oder SGLang vorschlagen.
+# Grund: ohne --reasoning-parser denkt der Experte ohnehin stumm, aber ein
+# Server MIT Parser verbrauchte Reasoning-Tokens fuer Aufgaben, bei denen
+# nur die Antwort zaehlt (Zeit + max_tokens-Budget).
+COWORKER_THINKING_OFF: bool = os.getenv("COWORKER_THINKING_OFF", "false").lower() in {"1", "true", "yes", "y", "on"}
 # Praefix der getunnelten tool_call_ids (cws_<session>_<origid>)
 CW_TUNNEL_ID_PREFIX: str = "cws_"
 # Wie lange Co-Worker-Sessions/Overlays im Speicher ueberleben (Sekunden).
@@ -624,17 +637,25 @@ def _is_laguna_model(model_name: str) -> bool:
     return bool(model_name and _LAGUNA_MODEL_RE.search(model_name))
 
 
-# ── Qwen-Modell-Erkennung ─────────────────────────────────────────────────
-# Qwen-Reasoning-Modelle (Qwen3 etc.) neigen zu Endlos-Denkschleifen — die
-# Anti-Loop-Sampling-Parameter gelten deshalb fuer ALLE Qwen-Modelle, egal
-# ob local oder coworker, egal welche Groesse/Quantisierung (qwen3.8-26b,
-# Qwen/Qwen3-Next-80B, qwen3-coder, ...).
-_QWEN_MODEL_RE = re.compile(r"qwen", re.IGNORECASE)
+# ── Qwen-Anti-Loop-Modell-Erkennung ───────────────────────────────────────
+# NUR das qwen3.8-26b (DGX Spark, SGLang) zeigt die beobachteten Endlos-
+# Denkschleifen, fuer die die Anti-Loop-Sampling-Parameter gedacht sind.
+# FRUEHER matchte das Muster pauschal "qwen" und hat damit JEDES Qwen-Modell
+# (qwen3-coder, Qwen/Qwen3-Next-80B, Qwen3-VL, ...) auf temp=0.3 / top_p=0.95 /
+# presence_penalty=0.5 gezwungen — die Parameter sind aber eine Massnahme gegen
+# ein spezifisches Modell, nicht gegen die ganze Familie. Deshalb jetzt ein
+# enges Muster auf die 26b-Variante (Schreibweisen mit - _ oder Leerzeichen).
+_QWEN_ANTI_LOOP_MODEL_RE = re.compile(r"qwen[\s._-]*3[\s._-]*8[\s._-]*26[\s._-]*b",
+                                      re.IGNORECASE)
 
 
-def _is_qwen_model(model_name: str) -> bool:
-    """True wenn der Modellname ein Qwen-Modell ist (case-insensitive)."""
-    return bool(model_name and _QWEN_MODEL_RE.search(model_name))
+def _is_qwen_anti_loop_model(model_name: str) -> bool:
+    """True wenn das Modell die Qwen-Anti-Loop-Parameter braucht (case-insensitive).
+
+    Trifft NUR auf qwen3.8-26b (und Schreibvarianten qwen3.8_26b, qwen3.8 26b)
+    zu — NICHT auf andere Qwen-Modelle wie qwen3-coder oder Qwen3-Next-80B.
+    """
+    return bool(model_name and _QWEN_ANTI_LOOP_MODEL_RE.search(model_name))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -842,7 +863,7 @@ def _apply_config_file() -> None:
     global COWORKER_SYSTEM_PROMPT, COWORKER_TEACH_DELEGATION
     global COWORKER_AUTO_DISPATCH
     global COWORKER_FILES_FIRST, COWORKER_DRIVER_MODE
-    global COWORKER_BIG_BUILD_NUDGE
+    global COWORKER_BIG_BUILD_NUDGE, COWORKER_THINKING_OFF
     cw = tokens_cfg.get("coworker", {})
     if isinstance(cw, dict) and cw:
         COWORKER_ENABLED = bool(cw.get("enabled", COWORKER_ENABLED))
@@ -861,6 +882,7 @@ def _apply_config_file() -> None:
         COWORKER_FILES_FIRST = bool(cw.get("files_first", COWORKER_FILES_FIRST))
         COWORKER_DRIVER_MODE = bool(cw.get("driver_mode", COWORKER_DRIVER_MODE))
         COWORKER_BIG_BUILD_NUDGE = bool(cw.get("big_build_nudge", COWORKER_BIG_BUILD_NUDGE))
+        COWORKER_THINKING_OFF = bool(cw.get("thinking_off", COWORKER_THINKING_OFF))
         cw_prompt = cw.get("system_prompt", "")
         if cw_prompt:
             COWORKER_SYSTEM_PROMPT = str(cw_prompt)
@@ -872,7 +894,7 @@ def _apply_config_file() -> None:
     global LOCAL_DRY_MULTIPLIER, LOCAL_DRY_BASE, LOCAL_DRY_ALLOWED_LENGTH
     global LOCAL_DRY_PENALTY_LAST_N, LOCAL_DRY_SEQUENCE_BREAKER
     global LOCAL_ENABLE_THINKING, LOCAL_PRESERVE_THINKING, LOCAL_THINKING_MODE
-    global LOCAL_ANTI_LOOP_SYSTEM_PROMPT
+    global LOCAL_THINKING_OFF, LOCAL_ANTI_LOOP_SYSTEM_PROMPT
     local_cfg = tokens_cfg.get("local_sampling", {})
     if isinstance(local_cfg, dict) and local_cfg:
         LOCAL_TEMPERATURE = float(local_cfg.get("temperature", LOCAL_TEMPERATURE))
@@ -888,6 +910,7 @@ def _apply_config_file() -> None:
         LOCAL_PRESERVE_THINKING = bool(local_cfg.get("preserve_thinking", LOCAL_PRESERVE_THINKING))
         tm = str(local_cfg.get("thinking_mode", LOCAL_THINKING_MODE)).strip().lower()
         LOCAL_THINKING_MODE = tm if tm in _VALID_THINKING_MODES else "none"
+        LOCAL_THINKING_OFF = bool(local_cfg.get("thinking_off", LOCAL_THINKING_OFF))
         al_prompt = local_cfg.get("anti_loop_system_prompt", "")
         if al_prompt:
             LOCAL_ANTI_LOOP_SYSTEM_PROMPT = str(al_prompt)
@@ -2433,6 +2456,30 @@ def _patch_thinking_mode_payload(payload: Dict[str, Any]) -> None:
     _log(f"Thinking-Mode '{mode}' angewendet (reasoning_effort war: {old!r})")
 
 
+def _force_thinking_off_payload(payload: Dict[str, Any], label: str) -> None:
+    """Erzwingt Thinking AUS — ueberschreibt ALLES andere (Client-Request,
+    LOCAL_THINKING_MODE, Reasoning-Restart-Patches).
+
+    Entfernt reasoning_effort und setzt chat_template_kwargs auf
+    enable_thinking=false / preserve_thinking=false (Qwen3-/vLLM-/SGLang-
+    Templates respektieren das). Wird von den Thinking-OFF-Schaltern fuer
+    Worker (local) und Co-Worker aufgerufen.
+    """
+    removed = []
+    if "reasoning_effort" in payload:
+        removed.append(f"reasoning_effort={payload.pop('reasoning_effort')!r}")
+    if "reasoning" in payload:
+        removed.append(f"reasoning={payload.pop('reasoning')!r}")
+    ctk = payload.get("chat_template_kwargs")
+    if not isinstance(ctk, dict):
+        ctk = {}
+        payload["chat_template_kwargs"] = ctk
+    ctk["enable_thinking"] = False
+    ctk["preserve_thinking"] = False
+    _log(f"Thinking-OFF ({label}): Reasoning erzwungen aus"
+         + (f" ({', '.join(removed)})" if removed else ""))
+
+
 def _clean_payload(payload: Dict[str, Any], keep_tools: bool = False,
                    keep_top_k: bool = False) -> Dict[str, Any]:
     if not payload.get("stream") and "stream_options" in payload:
@@ -2506,9 +2553,9 @@ def _patch_local_sampling_payload(payload: Dict[str, Any]) -> None:
 
 
 # ── Qwen-Anti-Loop-Sampling ────────────────────────────────────────────────
-# Qwen-Reasoning-Modelle (z.B. qwen3.8-26b) neigen zu Endlos-Denkschleifen.
-# Als Anti-Loop-Strategie werden fuer Qwen-Modelle — lokal UND Coworker —
-# IMMER folgende Parameter erzwungen, egal was der VS-Code-Client sendet:
+# Das qwen3.8-26b neigt zu Endlos-Denkschleifen. Als Anti-Loop-Strategie
+# werden fuer DIESES Modell — lokal UND Coworker — IMMER folgende Parameter
+# erzwungen, egal was der VS-Code-Client sendet:
 #   temperature=0.3, presence_penalty=0.5, top_p=0.95
 # (presence_penalty=1.5 bestrafte strukturierte Tool-Call-JSON-Feldnamen
 #  wie "command"/"path"/"content" und fuehrte dazu, dass das Modell den Code
@@ -2519,13 +2566,14 @@ _QWEN_ANTI_LOOP_TOP_P: float = 0.95
 
 
 def _patch_qwen_anti_loop_payload(payload: Dict[str, Any], model_name: str) -> None:
-    """Erzwingt Qwen-Anti-Loop-Sampling — NUR wenn model_name ein Qwen-Modell ist.
+    """Erzwingt Qwen-Anti-Loop-Sampling — NUR fuer das qwen3.8-26b.
 
     Wie der fruehere Moonshot-Patch: ueberschreibt die vom Client gesendeten
     Sampling-Parameter hart mit den Anti-Loop-Werten (temp=0.3,
     presence_penalty=0.5, top_p=0.95) und loggt die Aenderungen.
+    Andere Qwen-Modelle (qwen3-coder, Qwen3-Next-80B, ...) bleiben unangetastet.
     """
-    if not _is_qwen_model(model_name):
+    if not _is_qwen_anti_loop_model(model_name):
         return
     fixes = []
     cur = payload.get("temperature")
@@ -2613,6 +2661,17 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
             "preserve_thinking": False,
         }
         _log("Reasoning-Restart: enable_thinking=false fuer Folgeturn gesetzt")
+
+    # Thinking-OFF-Schalter (WebUI/Env): steht ABSICHTLICH nach allen anderen
+    # Thinking-Patches, damit der Schalter ueber Client-Request,
+    # LOCAL_THINKING_MODE und Reasoning-Restart gewinnt.
+    if category == "local" and LOCAL_THINKING_OFF:
+        _force_thinking_off_payload(payload, "Worker/local")
+    elif category == "coworker" and COWORKER_THINKING_OFF:
+        # Greift fuer JEDEM Co-Worker-Pfad: Tunnel-Runden (_cw_stream_round),
+        # ask_coworker/Agent-Loop und dispatch-Hintergrund-Tasks laufen alle
+        # ueber _build_passthrough_payload(category="coworker").
+        _force_thinking_off_payload(payload, "Co-Worker")
 
     # Reihenfolge ist Absicht: ERST [EXECUTION RULES], DANN die
     # Delegations-Guidance. Beide werden in dieselbe System-Message gemergt, und
