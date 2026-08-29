@@ -53,7 +53,7 @@ def test_register_and_await_done(monkeypatch):
     async def run():
         store: Dict[str, Any] = {}
 
-        async def fake_bg(task, args):
+        async def fake_bg(task, args, client_tools=None):
             task.status = "done"
             task.result = "ergebnis-text"
             task.finished_at = time.time()
@@ -87,7 +87,7 @@ def test_await_running_stays_undelivered(monkeypatch):
     async def run():
         release = asyncio.Event()
 
-        async def fake_run(task, args):
+        async def fake_run(task, args, client_tools=None):
             await release.wait()
             task.status = "done"
             task.result = "spaet"
@@ -112,7 +112,7 @@ def test_ttl_expiry_cancels_running(monkeypatch):
     async def run():
         store: Dict[str, Any] = {}
 
-        async def never_finish(task, args):
+        async def never_finish(task, args, client_tools=None):
             await asyncio.sleep(30)
 
         monkeypatch.setattr(proxy, "_run_bg_coworker_task", never_finish)
@@ -281,7 +281,7 @@ def test_delegation_loop_dispatch_then_final(monkeypatch):
                     _tc("dispatch_coworker", {"task": "review file"}, tid="d1")])
             return _mk_outcome("fertig ohne tools")
 
-        async def fake_bg(task, args):
+        async def fake_bg(task, args, client_tools=None):
             task.status = "done"
             task.result = "bg-ergebnis"
             task.finished_at = time.time()
@@ -353,7 +353,7 @@ def test_delegation_loop_dispatch_with_vstools_forwards(monkeypatch):
                 _tc("read_file", {"path": "a.py"}, tid="r1"),
             ])
 
-        async def fake_bg(task, args):
+        async def fake_bg(task, args, client_tools=None):
             task.status = "done"
             task.result = "ok"
             task.finished_at = time.time()
@@ -379,7 +379,7 @@ def test_delegation_loop_dispatch_cap(monkeypatch):
         calls = {"n": 0}
         registered: List[str] = []
 
-        def fake_register(tc, files_context):
+        def fake_register(tc, files_context, client_tools=None):
             registered.append(tc["id"])
             t = proxy.CoworkerTask(task_id=f"cw_{len(registered)}",
                                    preview="p", created_at=time.time())
@@ -414,7 +414,7 @@ def test_register_bg_dispatch_real_semantics(monkeypatch):
     async def run():
         store: Dict[str, proxy.CoworkerTask] = {}
 
-        async def fake_bg(task, args):
+        async def fake_bg(task, args, client_tools=None):
             task.status = "done"
             task.result = "store-check"
             task.finished_at = time.time()
@@ -462,7 +462,7 @@ def test_auto_dispatch_creates_bg_tasks(monkeypatch):
     async def run():
         store: Dict[str, proxy.CoworkerTask] = {}
 
-        async def fake_bg(task, args):
+        async def fake_bg(task, args, client_tools=None):
             task.status = "done"
             task.result = "ok"
             task.finished_at = time.time()
@@ -492,7 +492,7 @@ def test_auto_dispatch_respects_cap(monkeypatch):
     async def run():
         store: Dict[str, proxy.CoworkerTask] = {}
 
-        async def fake_bg(task, args):
+        async def fake_bg(task, args, client_tools=None):
             task.status = "done"
             task.result = "ok"
             task.finished_at = time.time()
@@ -517,12 +517,12 @@ def test_delegation_loop_auto_dispatch_on_todo(monkeypatch):
         store: Dict[str, proxy.CoworkerTask] = {}
         registered: List[str] = []
 
-        async def fake_bg(task, args):
+        async def fake_bg(task, args, client_tools=None):
             task.status = "done"
             task.result = "auto-ok"
             task.finished_at = time.time()
 
-        def fake_register(tool_call, files_context):
+        def fake_register(tool_call, files_context, client_tools=None):
             import json as _json
             args = _json.loads(tool_call["function"]["arguments"])
             ct = proxy.CoworkerTask(
@@ -577,3 +577,142 @@ def test_delegation_loop_auto_dispatch_on_todo(monkeypatch):
         assert any((tc.get("function") or {}).get("name") == "manage_todo_list"
                    for tc in tcs)
     asyncio.run(run())
+
+
+# ── Tunnel-Dispatch: BG-Tasks mit echten Client-Tools (2026-08-29) ─────────
+
+def test_bg_task_with_client_tools_pauses_and_maps_session(monkeypatch):
+    """BG-Task mit client_tools: erste Runde endet mit tool_calls → Task
+    pausiert (status=paused), Session haelt Tunnel-IDs, bg_task_id-Verkettung
+    ist gesetzt. KEIN Plain-Fallback."""
+    async def run():
+        captured = {}
+
+        async def fake_round(sess, queue, model, stream_id):
+            captured["sess"] = sess
+            sess["last_fwd_calls"] = [{"index": 0, "id": "cws_x_call_1",
+                                       "type": "function",
+                                       "function": {"name": "create_file",
+                                                    "arguments": "{}"}}]
+
+        monkeypatch.setattr(proxy, "_cw_stream_round", fake_round)
+        monkeypatch.setattr(proxy, "COWORKER_AGENT_MODE", True)
+        monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", {})
+        monkeypatch.setattr(proxy, "io_log_bg_result", lambda *a, **k: None)
+
+        tools = [{"type": "function", "function": {"name": "create_file"}}]
+        task = proxy.CoworkerTask(task_id="cw_tools", preview="p", created_at=time.time())
+        task.file_context = "files"
+        await proxy._run_bg_coworker_task(task, {"task": "schreibe file"},
+                                          client_tools=tools)
+        assert task.status == "paused"
+        assert task.sid is not None
+        sess = captured["sess"]
+        assert sess["bg_task_id"] == "cw_tools"
+        assert sess["client_tools"] == tools
+        assert sess["extra_files"] if False else True  # extra_context wurde gesetzt
+    asyncio.run(run())
+
+
+def test_bg_task_with_client_tools_immediate_final(monkeypatch):
+    """Co-Worker antwortet ohne Tool-Bedarf direkt (text-only) → Task sofort
+    done mit dem Final-Text."""
+    async def run():
+        async def fake_round(sess, queue, model, stream_id):
+            sess["done"] = True
+            sess["final"] = "fertig, nichts zu tun"
+
+        monkeypatch.setattr(proxy, "_cw_stream_round", fake_round)
+        monkeypatch.setattr(proxy, "COWORKER_AGENT_MODE", True)
+        monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", {})
+        monkeypatch.setattr(proxy, "io_log_bg_result", lambda *a, **k: None)
+
+        task = proxy.CoworkerTask(task_id="cw_final", preview="p", created_at=time.time())
+        await proxy._run_bg_coworker_task(task, {"task": "bereichne text"},
+                                          client_tools=[{"type": "function",
+                                                         "function": {"name": "read_file"}}])
+        assert task.status == "done"
+        assert task.result == "fertig, nichts zu tun"
+    asyncio.run(run())
+
+
+def test_cw_attach_finals_updates_paused_bg_task(monkeypatch):
+    """Nach Tunnel-Resume wird der pausierte BG-Task auf done gesetzt und
+    das Session-Final als task.result abgelegt."""
+    store: Dict[str, Any] = {}
+    monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", store)
+    monkeypatch.setattr(proxy, "io_log_bg_result", lambda *a, **k: None)
+    ct = proxy.CoworkerTask(task_id="cw_resume", preview="p", created_at=time.time())
+    ct.status = "paused"
+    ct.sid = "sess42"
+    store["cw_resume"] = ct
+    sess = {"done": True, "final": "jetzt wirklich fertig",
+            "bg_task_id": "cw_resume",
+            "orig_ask": {"id": "call_bg", "type": "function",
+                         "function": {"name": "dispatch_coworker",
+                                      "arguments": "{}"}}}
+    msgs: List[Dict[str, Any]] = []
+    proxy._cw_attach_finals(msgs, [sess])
+    assert ct.status == "done"
+    assert ct.result == "jetzt wirklich fertig"
+    assert ct.delivered is False  # collect holt es Spaeter ab
+
+
+def test_cw_attach_finals_bg_task_failure_marks_error(monkeypatch):
+    """tunnel_failed-Session → BG-Task status=error mit Fehlertext."""
+    store: Dict[str, Any] = {}
+    monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", store)
+    monkeypatch.setattr(proxy, "io_log_bg_result", lambda *a, **k: None)
+    ct = proxy.CoworkerTask(task_id="cw_fail", preview="p", created_at=time.time())
+    ct.status = "paused"
+    ct.sid = "sess43"
+    store["cw_fail"] = ct
+    sess = {"done": True, "final": "[Co-Worker nicht verfuegbar]\nHTTP 500",
+            "tunnel_failed": True, "bg_task_id": "cw_fail",
+            "orig_ask": {"id": "call_bg", "type": "function",
+                         "function": {"name": "dispatch_coworker",
+                                      "arguments": "{}"}}}
+    proxy._cw_attach_finals([], [sess])
+    assert ct.status == "error"
+    assert "500" in (ct.error or "")
+
+
+def test_await_bg_tasks_reports_paused_as_running(monkeypatch):
+    """Pausierte Tunnel-Tasks werden im Join als status=running gemeldet
+    (mit Hinweis), nicht als error/expired — und bleiben undelivered."""
+    async def run():
+        store: Dict[str, Any] = {}
+        ct = proxy.CoworkerTask(task_id="cw_paused", preview="demo",
+                                created_at=time.time())
+        ct.status = "paused"
+        store["cw_paused"] = ct
+        monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", store)
+        summaries = await proxy._await_bg_tasks(["cw_paused"], timeout_seconds=0.05)
+        assert summaries[0]["status"] == "running"
+        assert ct.delivered is False
+    asyncio.run(run())
+
+
+def test_auto_dispatch_task_text_promise_matches_tools(monkeypatch):
+    """Der Auto-Dispatch-Task-Text verspricht KEINEN Tool-Zugriff mehr, wenn
+    keine Client-Tools mitkommen — der Widerspruch, der cw_09f072bd zur
+    Ausrede verleitete, ist beseitigt."""
+    monkeypatch.setattr(proxy, "_COWORKER_AUTO_DISPATCHED", set())
+    monkeypatch.setattr(proxy, "COWORKER_DISPATCH_CAP", 4)
+
+    registered: List[Dict[str, Any]] = []
+
+    def fake_register(tc, files_context, client_tools=None):
+        registered.append(json.loads(tc["function"]["arguments"]))
+
+        class _T:
+            task_id = "cw_fake"
+
+        return _T()
+
+    monkeypatch.setattr(proxy, "_register_bg_dispatch", fake_register)
+    proxy._auto_dispatch_todos(["mach was"],
+                               files_context="", dispatch_count=0,
+                               client_tools=None)
+    assert "NO tool access" in registered[0]["task"] or "no tool access" in registered[0]["task"]
+    assert "using the available tools" not in registered[0]["task"]

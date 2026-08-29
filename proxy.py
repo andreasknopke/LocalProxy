@@ -3176,9 +3176,12 @@ _COWORKER_DISPATCH_TOOL_DEF: Dict[str, Any] = {
             "multi-file work; 4-8 parallel tasks for large refactors. Pattern: "
             "dispatch ALL independent sub-tasks in ONE turn (multiple "
             "dispatch_coworker calls), do your own work, then collect_coworker. "
-            "The proxy AUTOMATICALLY appends conversation file contents to "
-            "each dispatched task. Task must be fully self-contained — the "
-            "co-worker has NO access to tools or this conversation."
+            "The co-worker runs with the SAME client tool definitions as you "
+            "(file edits, terminal etc.) and executes in the same workspace; "
+            "tool calls it makes are executed by the client and fed back "
+            "automatically. The proxy also appends conversation file contents "
+            "to each dispatched task. Task must be self-contained — the "
+            "co-worker does NOT see this conversation."
         ),
         "parameters": {
             "type": "object",
@@ -4207,6 +4210,7 @@ async def _cw_stream_round(sess: Dict[str, Any], queue: asyncio.Queue,
         pass
     sess["done"] = True
     sess["final"] = err_display
+    sess["tunnel_failed"] = True
 
 
 async def _stream_coworker_tunnel_phase(sessions: List[Dict[str, Any]],
@@ -4279,6 +4283,27 @@ def _cw_attach_finals(msgs: List[Dict[str, Any]],
     done = [s for s in sessions if s.get("done")]
     if not done:
         return
+    # BG-Dispatch-Tasks, deren Tunnel-Session jetzt final ist: paused → done/error
+    for s in done:
+        bg_id = s.get("bg_task_id")
+        if not bg_id:
+            continue
+        ct = _COWORKER_BG_TASKS.get(bg_id)
+        if ct is None or ct.status not in ("paused", "running"):
+            continue
+        final_text = s.get("final") or ""
+        if s.get("tunnel_failed"):
+            ct.status = "error"
+            ct.error = _safe_str(final_text) or "Co-Worker-Runde fehlgeschlagen"
+            io_log_bg_result(ct.task_id, "error", ct.error)
+        else:
+            if COWORKER_RESULT_CAP > 0 and len(final_text) > COWORKER_RESULT_CAP:
+                final_text = final_text[:COWORKER_RESULT_CAP] + "\n…[gekappt]"
+            ct.status = "done"
+            ct.result = final_text
+            ct.finished_at = time.time()
+            io_log_bg_result(ct.task_id, "done", final_text)
+        _log(f"BG-Task {bg_id} nach Tunnel-Resume: {ct.status}")
     asks = [s.get("orig_ask") for s in done]
     asks = [a for a in asks if isinstance(a, dict)]
     if not asks:
@@ -4339,7 +4364,7 @@ async def _run_coworker_agent(task_text: str, context_text: str,
 class CoworkerTask:
     task_id: str
     preview: str                       # 60-Zeichen-Task-Vorschau (Status-Zeile)
-    status: str = "running"            # running | done | error | expired
+    status: str = "running"            # running | paused | done | error | expired
     result: Optional[str] = None       # Co-Worker-Antwort (bei done)
     error: Optional[str] = None        # Fehlertext (bei error/expired)
     created_at: float = field(default_factory=time.time)
@@ -4347,6 +4372,7 @@ class CoworkerTask:
     delivered: bool = False            # True sobald per collect abgeliefert
     file_context: Optional[str] = None # Datei-Kontext zum Dispatch-Zeitpunkt
     aio_task: Optional[asyncio.Task] = None  # der laufende Hintergrund-Task
+    sid: Optional[str] = None          # Tunnel-Session (Client-Tools-Modus)
 
     def summary(self) -> Dict[str, Any]:
         """Kompakte JSON-Repraesentation fuer tool-results / Status-Zeilen."""
@@ -4400,42 +4426,104 @@ def _coworker_fit(task: CoworkerTask, result: str) -> str:
     return result
 
 
-async def _run_bg_coworker_task(task: CoworkerTask, tool_call_args: Dict[str, Any]) -> None:
-    """Coroutine eines Hintergrund-Tasks: baut die minimale Sub-Session und
-    ruft den Co-Worker NON-streaming auf (kein Client-Queue vorhanden — das
-    Live-Streaming der content entfaellt, Reasoning faellt weg). Ergebnis
-    landet in task.result; Fehler in task.error mit status=error."""
+async def _run_bg_coworker_task(task: CoworkerTask, tool_call_args: Dict[str, Any],
+                                client_tools: Optional[List[Dict[str, Any]]] = None) -> None:
+    """Coroutine eines Hintergrund-Tasks. Zwei Modi:
+
+    * client_tools mitgegeben (NEU, Standardueber alle Dispatch-Call-Sites):
+      Der Co-Worker bekommt die ORIGINALEN Client-Tool-Definitionen (VS-Code-
+      Tools) und arbeitet damit im Workspace wie das Hauptmodell. Endet die
+      erste Runde mit tool_calls, pausiert der Task (status=paused) und
+      merkt sich die Tunnel-Session — die tool_calls werden beim naechsten
+      Client-Request dem Hauptmodell vorgelegt (Tunnel-Resume, ID-Format
+      cws_<sid>_<orig>), VS Code fuehrt sie aus, die Results kommen in den
+      Folgerequest zurueck in die Session. Erst wenn die Session final ist,
+      ist der Task done und collect_coworker liefert echten Arbeitstext.
+    * client_tools leer/None (Fallback): nicht-streamender Plain-Call wie
+      bisher (niemals echter Workspace-Zugriff).
+
+    Ergebnis landet in task.result; Fehler in task.error mit status=error."""
     started = time.perf_counter()
     task_text = str(tool_call_args.get("task", "") or "")
     context_text = str(tool_call_args.get("context", "") or "")
     try:
         if COWORKER_AGENT_MODE:
-            # v4 Agent-Mode: agentischer Loop mit Tool-Zugriff
-            async with _coworker_semaphore():
+            if client_tools:
+                # Tunnel-Session mit echten Client-Tools starten (eine Runde).
+                # Der Rest des agentischen Loops laeuft ueber Tunnel-Resume
+                # (Folgerequest). KEIN externes Semaphore hier: _cw_stream_round
+                # acquired selbst (asyncio.Semaphore ist nicht reentrant —
+                # Nested-Acquire bei max_parallel=1 waere ein Deadlock).
+                sess = _cw_session_new(task_text, context_text,
+                                       extra_context=task.file_context,
+                                       client_tools=client_tools)
+                sess["bg_task_id"] = task.task_id
+                task.sid = sess["sid"]
+                q: asyncio.Queue = asyncio.Queue()
+                await _cw_stream_round(sess, q, "local", f"cwq-bg-{uuid.uuid4().hex[:8]}")
+                if sess.get("done"):
+                    content = sess.get("final") or ""
+                    if COWORKER_RESULT_CAP > 0 and len(content) > COWORKER_RESULT_CAP:
+                        content = content[:COWORKER_RESULT_CAP] + "\n…[gekappt]"
+                    task.result = content
+                    task.status = "done"
+                    task.finished_at = time.time()
+                    io_log_bg_result(task.task_id, "done", content)
+                    _log(f"BG-Task {task.task_id} OK (Tunnel, sofort final) "
+                         f"duration={time.perf_counter() - started:.1f}s len={len(content)}")
+                elif sess.get("last_fwd_calls"):
+                    # Pausiert: tool_calls warten auf Ausfuehrung durch VS Code
+                    # via Tunnel-Resume im naechsten Client-Request.
+                    task.status = "paused"
+                    io_log_bg_result(task.task_id, "bg_paused",
+                                     "%d tool call(s) waiting" % len(sess["last_fwd_calls"]))
+                    _log(f"BG-Task {task.task_id} PAUSIERT — {len(sess['last_fwd_calls'])} "
+                         f"tool_call(s) fwd zum Client (Session {sess['sid']})")
+                else:
+                    # Weder final noch pausiert → Runde fehlgeschlagen.
+                    task.error = sess.get("final") or "Co-Worker-Runde fehlgeschlagen"
+                    task.status = "error"
+                    task.finished_at = time.time()
+                    io_log_bg_result(task.task_id, "error", task.error)
+                    _log(f"BG-Task {task.task_id} TUNNEL-FEHLER: {str(task.error)[:200]}")
+            else:
                 result = await _run_coworker_agent(task_text, context_text,
                                                    extra_context=task.file_context,
                                                    task_id=task.task_id)
+                if result.get("status") == "ok":
+                    content = result.get("content", "") or ""
+                    if COWORKER_RESULT_CAP > 0 and len(content) > COWORKER_RESULT_CAP:
+                        content = content[:COWORKER_RESULT_CAP] + "\n…[gekappt]"
+                    task.result = content
+                    task.status = "done"
+                    io_log_bg_result(task.task_id, "done", content)
+                    _log(f"BG-Task {task.task_id} OK duration={time.perf_counter() - started:.1f}s "
+                         f"len={len(content)}")
+                else:
+                    err = result.get("content") or "unbekannter Fehler"
+                    task.error = _safe_str(err)
+                    task.status = "error"
+                    io_log_bg_result(task.task_id, "error", task.error)
+                    _COWORKER_HEALTH_CACHE["reachable"] = False
         else:
             body = _build_coworker_body(task_text, context_text, extra_context=task.file_context)
             # Begrenzung der parallelen Co-Worker-Calls passiert HIER, vor dem Call
             async with _coworker_semaphore():
                 result = await _call_single_model(body, "coworker", 0, inject_hindsight=False)
-        duration = time.perf_counter() - started
-        if result.get("status") == "ok":
-            content = result.get("content", "") or ""
-            if COWORKER_RESULT_CAP > 0 and len(content) > COWORKER_RESULT_CAP:
-                content = content[:COWORKER_RESULT_CAP] + "\n…[gekappt]"
-            task.result = content
-            task.status = "done"
-            io_log_bg_result(task.task_id, "done", content)
-            _log(f"BG-Task {task.task_id} OK duration={duration:.1f}s len={len(content)}")
-        else:
-            err = result.get("content") or "unbekannter Fehler"
-            task.error = _safe_str(err)
-            task.status = "error"
-            io_log_bg_result(task.task_id, "error", task.error)
-            _COWORKER_HEALTH_CACHE["reachable"] = False
-            _log(f"BG-Task {task.task_id} FEHLER duration={duration:.1f}s: {task.error[:200]}")
+            if result.get("status") == "ok":
+                content = result.get("content", "") or ""
+                if COWORKER_RESULT_CAP > 0 and len(content) > COWORKER_RESULT_CAP:
+                    content = content[:COWORKER_RESULT_CAP] + "\n…[gekappt]"
+                task.result = content
+                task.status = "done"
+                io_log_bg_result(task.task_id, "done", content)
+                _log(f"BG-Task {task.task_id} OK duration={time.perf_counter() - started:.1f}s")
+            else:
+                err = result.get("content") or "unbekannter Fehler"
+                task.error = _safe_str(err)
+                task.status = "error"
+                io_log_bg_result(task.task_id, "error", task.error)
+                _COWORKER_HEALTH_CACHE["reachable"] = False
     except asyncio.CancelledError:
         # Zwei Gruende fuer Cancel: TTL-Cleanup (_cleanup_bg_tasks) oder Prozess-
         # Shutdown (WebUI-Neustart / SIGTERM). Beides bisher als "TTL/Shutdown"
@@ -4462,9 +4550,13 @@ def _task_preview_from_args(args: Dict[str, Any], max_chars: int = 60) -> str:
 
 
 def _register_bg_dispatch(tool_call: Dict[str, Any],
-                          files_context: str) -> CoworkerTask:
+                          files_context: str,
+                          client_tools: Optional[List[Dict[str, Any]]] = None) -> CoworkerTask:
     """Legt einen neuen Hintergrund-Task an und startet die Coroutine
-    (fire-and-forget, non-blocking). Caller prueft cap/limits VOR dem Aufruf."""
+    (fire-and-forget, non-blocking). Caller prueft cap/limits VOR dem Aufruf.
+    client_tools = Original-Client-Tool-Definitionen → der BG-Co-Worker
+    arbeitet damit im Workspace (Tunnel-Pause/Resume); ohne Tools der
+    Plain-Fallback wie bisher."""
     tool_call_id = tool_call.get("id") or f"call_{uuid.uuid4().hex[:12]}"
     args_raw = (tool_call.get("function") or {}).get("arguments", "{}")
     try:
@@ -4479,10 +4571,11 @@ def _register_bg_dispatch(tool_call: Dict[str, Any],
         preview=_task_preview_from_args(args),
         file_context=files_context or None,
     )
-    aio = asyncio.ensure_future(_run_bg_coworker_task(ct, args))
+    aio = asyncio.ensure_future(_run_bg_coworker_task(ct, args, client_tools))
     ct.aio_task = aio
     _COWORKER_BG_TASKS[task_id] = ct
-    _log(f"BG-Dispatch {task_id} (tool_call={tool_call_id}): {ct.preview}")
+    _log(f"BG-Dispatch {task_id} (tool_call={tool_call_id}, tools={len(client_tools or [])}): "
+         f"{ct.preview}")
     return ct
 
 
@@ -4521,10 +4614,14 @@ def _extract_not_started_todos(tool_calls: Optional[List[Dict[str, Any]]]) -> Li
 
 
 def _auto_dispatch_todos(titles: List[str], files_context: str,
-                         dispatch_count: int) -> Tuple[List[CoworkerTask], int]:
+                         dispatch_count: int,
+                         client_tools: Optional[List[Dict[str, Any]]] = None
+                         ) -> Tuple[List[CoworkerTask], int]:
     """Verteilt not-started Todos deterministisch an den Co-Worker (BG-Tasks).
     Respektiert COWORKER_DISPATCH_CAP und den Duplikat-Schutz
-    (_COWORKER_AUTO_DISPATCHED). Returns (erstellte Tasks, Anzahl)."""
+    (_COWORKER_AUTO_DISPATCHED). Returns (erstellte Tasks, Anzahl).
+    client_tools wird durchgereicht → BG-Co-Worker arbeitet mit echten
+    Client-Tools im Workspace statt tool-los code-in-Text zu liefern."""
     global _COWORKER_AUTO_DISPATCHED
     created: List[CoworkerTask] = []
     if len(_COWORKER_AUTO_DISPATCHED) > 200:
@@ -4536,14 +4633,20 @@ def _auto_dispatch_todos(titles: List[str], files_context: str,
         if h in _COWORKER_AUTO_DISPATCHED:
             continue
         _COWORKER_AUTO_DISPATCHED.add(h)
+        tool_hint = ("The client tool definitions are attached to your request — "
+                     "use them (read_file, write/edit tools, terminal tools, "
+                     "etc.) to inspect and modify the workspace EXACTLY like the "
+                     "main agent does."
+                     if client_tools else
+                     "The relevant file contents from the main conversation are "
+                     "attached below for context (you have no tool access in "
+                     "this mode).")
         task_text = (
             f"Task: {title}\n\n"
-            "Execute this task autonomously and completely using the "
-            "available tools to inspect and modify the workspace as needed. "
-            "The relevant file contents from the main conversation are "
-            "attached below for context. When finished, respond with a "
-            "concise summary of what you did, including any file paths "
-            "you created or modified."
+            "Execute this task autonomously and completely. "
+            + tool_hint +
+            " When finished, respond with a concise summary of what you did, "
+            "including any file paths you created or modified."
         )
         tc = {
             "id": f"call_{uuid.uuid4().hex[:12]}",
@@ -4554,7 +4657,7 @@ def _auto_dispatch_todos(titles: List[str], files_context: str,
                                         ensure_ascii=False),
             },
         }
-        ct = _register_bg_dispatch(tc, files_context)
+        ct = _register_bg_dispatch(tc, files_context, client_tools)
         created.append(ct)
     return created, len(created)
 
@@ -4602,6 +4705,16 @@ async def _await_bg_tasks(task_ids: Optional[List[str]],
         out.append({"task_id": tid, "status": "unknown",
                     "error": "Task-ID nicht gefunden (bereits abgeliefert oder abgelaufen)"})
     for t in selected:
+        if t.status == "paused":
+            # Tunnel-Session wartet auf VS-Code-Tool-Ausfuehrung (Resume im
+            # Folgerequest) — kein Fehler, aber auch noch kein Ergebnis. Der
+            # Task bleibt undelivered; die Status-Notiz erzaehlt dem Modell
+            # weiter, dass arbeitet wird. KEIN wait sinnvoll hier.
+            out.append({"task_id": t.task_id, "status": "running",
+                        "preview": t.preview,
+                        "note": "Co-Worker arbeitet mit Client-Tools; Teil-Ergebnisse "
+                                "kommen nach der Tool-Ausfuehrung im naechsten Turn"})
+            continue
         out.append(t.summary())
         if t.status in ("done", "error", "expired"):
             t.delivered = True
@@ -4734,7 +4847,9 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
                 and _COWORKER_HEALTH_CACHE.get("reachable", False)):
             todo_titles = _extract_not_started_todos(other_calls)
             if todo_titles:
-                created, n = _auto_dispatch_todos(todo_titles, files_context, dispatch_count)
+                created, n = _auto_dispatch_todos(todo_titles, files_context,
+                                                  dispatch_count,
+                                                  client_tools=body.get("tools"))
                 if n:
                     dispatch_count += n
                     ids = ", ".join(ct.task_id for ct in created)
@@ -4779,7 +4894,8 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
                              "tool_calls": dispatch_norm})
                 mini_results: List[Dict[str, Any]] = []
                 for tc in dispatch_norm:
-                    ct = _register_bg_dispatch(tc, files_context)
+                    ct = _register_bg_dispatch(tc, files_context,
+                                               client_tools=body.get("tools"))
                     mini_results.append({
                         "role": "tool",
                         "tool_call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
@@ -7315,7 +7431,9 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
                 and _COWORKER_HEALTH_CACHE.get("reachable", False)):
             todo_titles = _extract_not_started_todos(other_calls)
             if todo_titles:
-                created, n = _auto_dispatch_todos(todo_titles, files_context, dispatch_count)
+                created, n = _auto_dispatch_todos(todo_titles, files_context,
+                                                  dispatch_count,
+                                                  client_tools=body.get("tools"))
                 if n:
                     dispatch_count += n
                     ids = ", ".join(ct.task_id for ct in created)
@@ -7381,7 +7499,8 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
                          "tool_calls": dispatch_norm})
             dispatched_note = ["\n\n[Proxy] Co-Worker dispatched:"]
             for tc in dispatch_norm:
-                ct = _register_bg_dispatch(tc, files_context)
+                ct = _register_bg_dispatch(tc, files_context,
+                                           client_tools=body.get("tools"))
                 msgs.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
