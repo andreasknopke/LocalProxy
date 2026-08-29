@@ -697,6 +697,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
           <span>Vision (image_url Support)</span>
           <label class="toggle"><input type="checkbox" id="local_is_vision"><span class="slider"></span></label>
         </div>
+        <div class="toggle-row">
+          <span>Thinking OFF erzwingen (Reasoning deaktivieren — überschreibt Client-Request, Thinking Mode und Reasoning-Restart)</span>
+          <label class="toggle"><input type="checkbox" id="local_thinking_off"><span class="slider"></span></label>
+        </div>
         <button class="btn btn-primary" onclick="testCategory('local')" style="margin-top:8px">Test-Endpunkt</button>
         <div class="status-line" id="local_test_status"></div>
       </div>
@@ -1409,10 +1413,6 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
           <option value="max">max</option>
         </select>
         <div class="hint">Wird in den ausgehenden Request als reasoning_effort gepatcht (none = Feld entfernt)</div>
-      </div>
-      <div class="toggle-row">
-        <span>Thinking OFF erzwingen (Worker — überschreibt Client-Request, Thinking Mode und Reasoning-Restart)</span>
-        <label class="toggle"><input type="checkbox" id="local_thinking_off"><span class="slider"></span></label>
       </div>
       <div class="form-group">
         <label>Anti-Loop-System-Prompt (optional)</label>
