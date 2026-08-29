@@ -169,6 +169,55 @@ def test_status_line_empty(monkeypatch):
     assert proxy._coworker_status_line() is None
 
 
+def test_status_line_noted_once_per_task_status(monkeypatch):
+    """Die Status-Notiz darf das Hauptmodell nicht in jedem Folge-Turn mit
+    derselben Meldung beschallen — pro (task_id, status) genau einmal."""
+    store: Dict[str, Any] = {}
+    monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", store)
+    monkeypatch.setattr(proxy, "_COWORKER_STATUS_NOTED", set())
+
+    t = proxy.CoworkerTask(task_id="cw_once", preview="ein task",
+                           created_at=time.time())
+    t.status = "running"
+    store["cw_once"] = t
+
+    assert proxy._coworker_status_line() is not None      # 1. Turn: Notiz
+    assert proxy._coworker_status_line() is None          # 2. Turn: keine
+    assert proxy._coworker_status_line() is None          # 3. Turn: keine
+
+    # Statuswechsel ist neue Information -> Notiz erscheint erneut
+    t.status = "done"
+    line = proxy._coworker_status_line()
+    assert line is not None and "cw_once" in line
+    assert proxy._coworker_status_line() is None
+
+
+def test_bg_task_shutdown_cancel_note(monkeypatch):
+    """Cancel durch Prozess-Shutdown muss als Neustart gemeldet werden, nicht
+    als TTL-Ablauf — sonst liest das Hauptmodell einen Restart als Task-Timeout."""
+    import asyncio as _aio
+
+    async def run():
+        async def boom(*a, **k):
+            raise _aio.CancelledError()
+
+        monkeypatch.setattr(proxy, "_run_coworker_agent", boom)
+        monkeypatch.setattr(proxy, "COWORKER_AGENT_MODE", True)
+        monkeypatch.setattr(proxy, "_SHUTTING_DOWN", True)
+        monkeypatch.setattr(proxy, "io_log_bg_result", lambda *a, **k: None)
+
+        task = proxy.CoworkerTask(task_id="cw_sd", preview="p", created_at=time.time())
+        task.file_context = "ctx"
+        try:
+            await proxy._run_bg_coworker_task(task, {"task": "t", "context": ""})
+        except _aio.CancelledError:
+            pass
+        assert task.status == "expired"
+        assert "NEUSTART" in task.error and "TTL" not in task.error
+
+    _aio.run(run())
+
+
 # ── Injektion ──────────────────────────────────────────────────────────────
 
 def test_partition_four_buckets_real_proxy():

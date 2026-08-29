@@ -496,7 +496,10 @@ RESPONSE_LOOP_REDIRECT_TEXT: str = os.getenv(
 COWORKER_ENABLED: bool = os.getenv("COWORKER_ENABLED", "true").lower() in {"1", "true", "yes", "y", "on"}
 COWORKER_MAX_DELEGATIONS: int = int(os.getenv("COWORKER_MAX_DELEGATIONS", "2"))
 COWORKER_TASK_CAP: int = int(os.getenv("COWORKER_TASK_CAP", "8000"))
-COWORKER_RESULT_CAP: int = int(os.getenv("COWORKER_RESULT_CAP", "12000"))
+# Ergebnis-Cap: 0 = aus. DEFAULT AUS (Evidenz 2026-08-29): bei Code-Auftraegen
+# kappte 12000 die Lieferung mitten in der Zeile (len=12011, '…[gekappt]') —
+# fuer das Hauptmodell unbrauchbar, fuehrte zu Nachfragen statt Weiterarbeit.
+COWORKER_RESULT_CAP: int = int(os.getenv("COWORKER_RESULT_CAP", "0"))
 # Automatisch angehaengter Datei-Kontext (VS-Code-Attachments + Tool-Ergebnisse)
 # fuer ask_coworker-Calls: Budget in Zeichen, 0 = deaktiviert.
 COWORKER_FILES_CAP: int = int(os.getenv("COWORKER_FILES_CAP", "60000"))
@@ -545,7 +548,13 @@ COWORKER_BIG_BUILD_NUDGE: bool = os.getenv(
 # selbst aufruft. Prompt-Injection allein ist NICHT deterministisch (lokale
 # Modelle delegieren in der Praxis nie); der Trigger ist hier ein parsebarer
 # Tool-Call (manage_todo_list), nicht die freie Modell-Entscheidung.
-COWORKER_AUTO_DISPATCH: bool = os.getenv("COWORKER_AUTO_DISPATCH", "true").lower() in {"1", "true", "yes", "y", "on"}
+# DEFAULT AUS (Evidenz 2026-08-29, proxy.opnwork.de): der Trigger ist zu stumpf —
+# er verteilt auch unmoegliche Tasks ('Browser playtest', 'Headless smoke test')
+# an einen Tool-losen Co-Worker (client_tools=0), erzeugt Duplikate bei leicht
+# abweichenden Titeln und beschallt das Hauptmodell mit Status-Notizen. Der
+# Co-Worker antwortet dann mit Ausreden statt Code. Explizit aktivieren via
+# COWORKER_AUTO_DISPATCH=true bzw. WebUI-Toggle.
+COWORKER_AUTO_DISPATCH: bool = os.getenv("COWORKER_AUTO_DISPATCH", "false").lower() in {"1", "true", "yes", "y", "on"}
 COWORKER_SYSTEM_PROMPT: str = os.getenv(
     "COWORKER_SYSTEM_PROMPT",
     "You are a co-worker coding model acting as a subagent for planning, code "
@@ -3226,6 +3235,13 @@ _COWORKER_HEALTH_CACHE: Dict[str, Any] = {
     "last_error": "noch nicht geprueft",
 }
 
+# Shutdown-Signal fuer BG-Tasks: True, waehrend der Prozess faehrt. Erlaubt es
+# _run_bg_coworker_task, "Neustart" von "TTL abgelaufen" zu unterscheiden.
+_SHUTTING_DOWN: bool = False
+_SHUTDOWN_CANCEL_NOTE: str = (
+    "Co-Worker-Task wurde durch einen PROXY-NEUSTART abgebrochen — nicht wegen "
+    "Timeout. Der Task war noch in Arbeit; bei Bedarf erneut dispatchen.")
+
 
 def _coworker_configured() -> bool:
     """True wenn die coworker-Kategorie eine gueltige Definition hat."""
@@ -4421,8 +4437,14 @@ async def _run_bg_coworker_task(task: CoworkerTask, tool_call_args: Dict[str, An
             _COWORKER_HEALTH_CACHE["reachable"] = False
             _log(f"BG-Task {task.task_id} FEHLER duration={duration:.1f}s: {task.error[:200]}")
     except asyncio.CancelledError:
+        # Zwei Gruende fuer Cancel: TTL-Cleanup (_cleanup_bg_tasks) oder Prozess-
+        # Shutdown (WebUI-Neustart / SIGTERM). Beides bisher als "TTL/Shutdown"
+        # gemeldet → das Hauptmodell konnte nicht unterscheiden, ob der Task
+        # wirklich abgelaufen ist oder nur einem Restart zum Opfer fiel
+        # (beobachtet 2026-08-29: 10 Tasks gleichzeitig verloren).
         task.status = "expired"
-        task.error = "abgebrochen (TTL/Shutdown)"
+        task.error = (_SHUTDOWN_CANCEL_NOTE if _SHUTTING_DOWN
+                      else "abgebrochen (TTL)")
         io_log_bg_result(task.task_id, "expired", task.error)
         raise
     except Exception as exc:
@@ -4616,18 +4638,31 @@ def _cleanup_bg_tasks() -> None:
                 _COWORKER_BG_TASKS.pop(t.task_id, None)
 
 
+# Notierte (task_id, status)-Kombinationen: die Status-Notiz darf pro Task und
+# Status genau EINMAL ins Gespraech — nicht in jedem Folge-Turn.
+_COWORKER_STATUS_NOTED: Set[str] = set()
+
+
 def _coworker_status_line() -> Optional[str]:
     """Baut die kompakte Status-Notiz fuer undelivered Tasks ( None = keine
     offenen Tasks). Format:
     [Proxy] 2 Co-Worker Hintergrund-Tasks offen:
     - ✅ cw_ab12cd: review proxy.py lines 100-200…
     - ⏳ cw_ef34gh: refactor tools/auth.py…
-    """
-    entries = [t for t in _COWORKER_BG_TASKS.values() if not t.delivered]
+
+    Returns NUR Notizen fuer Tasks/Status, die noch nicht notiert wurden
+    (_COWORKER_STATUS_NOTED). Ein Task, der von running → done wechselt, wird
+    erneut erwaehnt — das ist die Information, die das Hauptmodell braucht."""
+    global _COWORKER_STATUS_NOTED
+    if len(_COWORKER_STATUS_NOTED) > 400:
+        _COWORKER_STATUS_NOTED.clear()
+    entries = [t for t in _COWORKER_BG_TASKS.values()
+               if not t.delivered and f"{t.task_id}:{t.status}" not in _COWORKER_STATUS_NOTED]
     if not entries:
         return None
     lines = [f"[Proxy] {len(entries)} Co-Worker Hintergrund-Task(s) aktiv:"]
     for t in entries[:8]:
+        _COWORKER_STATUS_NOTED.add(f"{t.task_id}:{t.status}")
         icon = {"done": "✅", "error": "❌", "expired": "⏱️"}.get(t.status, "⏳")
         detail = ""
         if t.status in ("error", "expired"):
@@ -5849,6 +5884,12 @@ async def _lifespan(app: FastAPI):
 
     yield
 
+    global _SHUTTING_DOWN
+    _SHUTTING_DOWN = True
+    n_running = sum(1 for t in _COWORKER_BG_TASKS.values() if t.status == "running")
+    if n_running:
+        _log(f"Shutdown: {n_running} laufende Co-Worker BG-Task(s) werden abgebrochen "
+             "(kein Ergebnis — bei erneutem Dispatch erneut beauftragen).")
     _log("LocalProxy shutting down.")
 
 
@@ -6000,16 +6041,27 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     #         _log(f"Loop-Intervention: history truncated + appended "
     #              f"(read={read_hit}, search={search_hit}, generic={generic_hit})")
 
-    # Co-Worker-Health-Cache frisch halten (nicht-blockierend): Wenn der Cache
-    # aelter als das Health-Intervall ist, Probe im Hintergrund anstossen, damit
-    # der naechste Request den aktuellen Zustand sieht.
+    # Co-Worker-Health-Cache frisch halten: Wenn der Cache aelter als das
+    # Health-Intervall ist, Probe im Hintergrund anstossen. EXCEPTION: war die
+    # Probe noch NIE erfolgreich ausgefuehrt (Cold-Start nach Restart), warten
+    # wir einmalig bis max. Probe-Timeout — sonst laeuft der erste Request ohne
+    # Co-Worker-Tools, obwohl der Co-Worker erreichbar ist (beobachtet:
+    # 2026-08-29 09:01 'Health-Check nicht bestanden (noch nicht geprueft)').
     if category == "local" and COWORKER_ENABLED and _coworker_configured():
-        if time.time() - float(_COWORKER_HEALTH_CACHE.get("checked_at", 0.0)) > COWORKER_HEALTH_INTERVAL:
+        if float(_COWORKER_HEALTH_CACHE.get("checked_at", 0.0)) <= 0.0:
+            await _probe_coworker()
+            _log(f"Co-Worker Cold-Start-Probe: "
+                 f"{'erreichbar' if _COWORKER_HEALTH_CACHE.get('reachable') else 'UNREACHABLE (' + str(_COWORKER_HEALTH_CACHE.get('last_error', '?')) + ')'}")
+        elif time.time() - float(_COWORKER_HEALTH_CACHE.get("checked_at", 0.0)) > COWORKER_HEALTH_INTERVAL:
             _spawn(_probe_coworker())
 
     # Fork-Join: Status offener Hintergrund-Tasks als kompakte user-Notiz
     # ans Ende der History haengen (nach Kategorie-Detection — beeinflusst
     # weder Flag-Extraktion noch Tool-Continuation-Erkennung).
+    # NICHT jeden Turn wiederholen — sonst wird das Hauptmodell mit derselben
+    # Notiz beschallt und kann seine eigene Todo-Kette nicht mehr abarbeiten
+    # (beobachtet 2026-08-29: 839 chars in JEDEM Turn, Turns 09:13-09:20).
+    # Notiz erscheint pro (task_id, status)-Kombination genau einmal.
     if (category == "local" and COWORKER_ENABLED and COWORKER_FORK_JOIN
             and _COWORKER_BG_TASKS):
         status = _coworker_status_line()

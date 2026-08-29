@@ -288,7 +288,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "enabled": True,
             "max_delegations_per_request": 2,
             "task_cap_chars": 8000,
-            "result_cap_chars": 12000,
+            "result_cap_chars": 0,
             "files_cap_chars": 60000,
             "health_interval_seconds": 60,
             "probe_timeout_seconds": 5,
@@ -297,6 +297,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "dispatch_cap_per_request": 12,
             "bg_ttl_seconds": 1800,
             "teach_delegation": True,
+            "auto_dispatch": False,
             "files_first": True,
             "driver_mode": True,
             "big_build_nudge": True,
@@ -771,7 +772,8 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
           </div>
           <div class="form-group">
             <label>Result-Cap (Zeichen)</label>
-            <input type="number" id="coworker_result_cap" min="100" max="100000">
+            <input type="number" id="coworker_result_cap" min="0" max="1000000">
+            <div class="hint">Kürzt Co-Worker-Ergebnisse vor der Rückgabe an das Hauptmodell — 0 = aus (Code-Lieferungen nicht abschneiden).</div>
           </div>
           <div class="form-group">
             <label>Datei-Kontext-Cap (Zeichen)</label>
@@ -801,6 +803,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
         <div class="toggle-row">
           <span>Treiber/Experte-Rollenmodell (Hauptmodell = schneller Treiber, Coworker = teurer Experte nur für dichten Code)</span>
           <label class="toggle"><input type="checkbox" id="coworker_driver_mode" checked><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+          <span>Auto-Dispatch von Todos (verteilt ALLE not-started manage_todo_list-Einträge automatisch an den Coworker — ohne Tool-Zugriff, erzeugt Duplikate; nur mit Fork-Join wirksam)</span>
+          <label class="toggle"><input type="checkbox" id="coworker_auto_dispatch"><span class="slider"></span></label>
         </div>
         <div class="toggle-row">
           <span>Dateikontext vor der Task-Injection (Praefix-Cache-Sharing über parallele Tasks)</span>
@@ -1606,7 +1612,7 @@ async function loadConfig() {
     const cwTaskEl = document.getElementById('coworker_task_cap');
     if (cwTaskEl) cwTaskEl.value = cw.task_cap_chars != null ? cw.task_cap_chars : 8000;
     const cwResultEl = document.getElementById('coworker_result_cap');
-    if (cwResultEl) cwResultEl.value = cw.result_cap_chars != null ? cw.result_cap_chars : 12000;
+    if (cwResultEl) cwResultEl.value = cw.result_cap_chars != null ? cw.result_cap_chars : 0;
     const cwFilesEl = document.getElementById('coworker_files_cap');
     if (cwFilesEl) cwFilesEl.value = cw.files_cap_chars != null ? cw.files_cap_chars : 60000;
     const cwHIntEl = document.getElementById('coworker_health_interval');
@@ -1627,6 +1633,8 @@ async function loadConfig() {
     if (cwDFEl) cwDFEl.checked = cw.files_first !== false;
     const cwDMEl = document.getElementById('coworker_driver_mode');
     if (cwDMEl) cwDMEl.checked = cw.driver_mode !== false;
+    const cwADEl = document.getElementById('coworker_auto_dispatch');
+    if (cwADEl) cwADEl.checked = cw.auto_dispatch === true;
     const cwBBEl = document.getElementById('coworker_big_build_nudge');
     if (cwBBEl) cwBBEl.checked = cw.big_build_nudge !== false;
     const cwTOEl = document.getElementById('coworker_thinking_off');
@@ -1717,7 +1725,7 @@ async function saveConfig() {
       enabled: document.getElementById('coworker_enabled')?.checked ?? true,
       max_delegations_per_request: parseInt(document.getElementById('coworker_max_delegations')?.value) || 2,
       task_cap_chars: parseInt(document.getElementById('coworker_task_cap')?.value) || 8000,
-      result_cap_chars: parseInt(document.getElementById('coworker_result_cap')?.value) || 12000,
+      result_cap_chars: (v => Number.isFinite(v) && v >= 0 ? v : 0)(parseInt(document.getElementById('coworker_result_cap')?.value, 10)),
       files_cap_chars: parseInt(document.getElementById('coworker_files_cap')?.value) ?? 60000,
       health_interval_seconds: parseFloat(document.getElementById('coworker_health_interval')?.value) || 60,
       probe_timeout_seconds: parseFloat(document.getElementById('coworker_probe_timeout')?.value) || 5,
@@ -1726,6 +1734,7 @@ async function saveConfig() {
       dispatch_cap_per_request: parseInt(document.getElementById('coworker_dispatch_cap')?.value) || 12,
       bg_ttl_seconds: parseFloat(document.getElementById('coworker_bg_ttl')?.value) || 1800,
       teach_delegation: document.getElementById('coworker_teach_delegation')?.checked ?? true,
+      auto_dispatch: document.getElementById('coworker_auto_dispatch')?.checked ?? false,
       files_first: document.getElementById('coworker_files_first')?.checked ?? true,
       driver_mode: document.getElementById('coworker_driver_mode')?.checked ?? true,
       big_build_nudge: document.getElementById('coworker_big_build_nudge')?.checked ?? true,

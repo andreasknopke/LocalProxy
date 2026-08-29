@@ -193,8 +193,20 @@ Slot frei wird.
 | `max_parallel` | `8` | Gleichzeitige Hintergrund-Tasks (Semaphore) |
 | `dispatch_cap_per_request` | `12` | Max. dispatches pro User-Request (Kreislaufschutz) |
 | `bg_ttl_seconds` | `1800` | Task-Lebensdauer; laufende Tasks > TTL werden expired + gecancelt |
+| `auto_dispatch` | `false` | Verteilt `not-started` Todos aus `manage_todo_list` automatisch an den Co-Worker. **Aus**, weil der Trigger auch Tool-lose, unmoegliche Tasks verteilt und Duplikate erzeugt (Evidenz 2026-08-29) |
+| `result_cap_chars` | `0` (=aus) | Kuerzt Co-Worker-Ergebnisse vor der Rueckgabe. Nicht auf ~12000 setzen, wenn Code-Lieferungen erwartet werden — das schneidet mitten in der Zeile ab |
 
-- Env-Vars: `COWORKER_FORK_JOIN`, `COWORKER_MAX_PARALLEL`, `COWORKER_DISPATCH_CAP`, `COWORKER_BG_TTL` (zu den bestehenden Co-Worker-Vars hinzu)
+- Env-Vars: `COWORKER_FORK_JOIN`, `COWORKER_MAX_PARALLEL`, `COWORKER_DISPATCH_CAP`, `COWORKER_BG_TTL`, `COWORKER_AUTO_DISPATCH`, `COWORKER_RESULT_CAP` (zu den bestehenden Co-Worker-Vars hinzu)
+
+**Status-Notiz:** die Notiz „N Co-Worker Tasks aktiv — fuehre sie NICHT selbst
+aus" erscheint pro `(task_id, status)`-Kombination genau **einmal**, nicht in
+jedem Folge-Turn — frueher wurde das Hauptmodell in jedem Turn damit beschallt
+und konnte seine eigene Todo-Kette nicht mehr abarbeiten (2026-08-29).
+
+**Proxy-Neustart:** laufende BG-Tasks werden beim Shutdown als
+`PROXY-NEUSTART abgebrochen` gemeldet, nicht als TTL-Ablauf — das Hauptmodell
+kann so unterscheiden, ob ein Task wirklich abgelaufen oder nur einem Restart
+zum Opfer gefallen ist.
 
 **Voraussetzung:** `coworker`-Kategorie (single-dict wie `local`) muss auf den
 DGX-Spark-Endpoint zeigen (`api_url` + `model_name` setzen) — ohne Konfiguration
