@@ -266,3 +266,69 @@ def test_run_coworker_agent_fallback_no_config(monkeypatch):
     monkeypatch.setattr(proxy, "_MODEL_CATEGORIES", {})
     res = asyncio.run(proxy._run_coworker_agent("task", ""))
     assert res["status"] == "error"
+
+
+# ── Health-Probe Busy-False-Positive ──────────────────────────────────────
+
+def _make_running_task(task_id="cw_busy"):
+    import time as _t
+    ct = proxy.CoworkerTask(task_id=task_id, preview="p", created_at=_t.time())
+    ct.status = "running"
+    return ct
+
+
+def test_probe_keeps_reachable_when_busy(monkeypatch):
+    """Ein Co-Worker mit max_parallel=1 ist waehrend ein Task laeuft nicht
+    anpingbar. Der Probe darf reachable NICHT auf False setzen, solange ein
+    BG-Task laeuft — sonst verschwindet collect_coworker aus der Worker-Liste."""
+    _model_defs_fixture(monkeypatch)
+    monkeypatch.setattr(proxy, "_COWORKER_HEALTH_CACHE",
+                        {"reachable": True, "checked_at": 0.0, "last_error": ""})
+    monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS",
+                        {"cw_busy": _make_running_task()})
+
+    class BoomClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None, headers=None):
+            raise RuntimeError("connect timeout")
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", BoomClient)
+    ok = asyncio.run(proxy._probe_coworker())
+    assert ok is True
+    assert proxy._COWORKER_HEALTH_CACHE["reachable"] is True
+    assert "busy" in proxy._COWORKER_HEALTH_CACHE["last_error"]
+
+
+def test_probe_marks_unreachable_when_idle(monkeypatch):
+    """Ohne laufende BG-Tasks darf ein fehlgeschlagener Probe reachable auf
+    False setzen (echter Ausfall)."""
+    _model_defs_fixture(monkeypatch)
+    monkeypatch.setattr(proxy, "_COWORKER_HEALTH_CACHE",
+                        {"reachable": True, "checked_at": 0.0, "last_error": ""})
+    monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", {})
+
+    class BoomClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None, headers=None):
+            raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", BoomClient)
+    ok = asyncio.run(proxy._probe_coworker())
+    assert ok is False
+    assert proxy._COWORKER_HEALTH_CACHE["reachable"] is False

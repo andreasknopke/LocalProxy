@@ -3336,6 +3336,21 @@ async def _probe_coworker() -> bool:
         })
         return reachable
     except Exception as exc:
+        # Busy-False-Positive vermeiden: ein Co-Worker mit niedriger
+        # Concurrency (z. B. max_parallel=1) ist waehrend ein Task laeuft fuer
+        # den Ping nicht durchlaessig — Timeout/ConnectError heisst dann
+        # "beschaeftigt", NICHT "abgestuerzt". Solange BG-Tasks laufen,
+        # reachable auf True halten, sonst verschwinden dispatch/collect aus
+        # der Worker-Tool-Liste, genau wenn er collecten will (Schnittstellen-
+        # bug, beobachtet 2026-08-29 18:58: Task laeuft, collect-Tool weg).
+        busy = any(t.status in ("running", "paused")
+                   for t in _COWORKER_BG_TASKS.values())
+        if busy and _COWORKER_HEALTH_CACHE.get("reachable", False):
+            _COWORKER_HEALTH_CACHE.update({
+                "checked_at": time.time(),
+                "last_error": f"busy ({_safe_str(exc)[:60]}) — reachable gehalten",
+            })
+            return True
         _COWORKER_HEALTH_CACHE.update({
             "reachable": False,
             "checked_at": time.time(),
@@ -3345,9 +3360,13 @@ async def _probe_coworker() -> bool:
 
 
 async def _coworker_health_loop() -> None:
-    """Periodischer Health-Check fuer den Co-Worker (Startup-Probe + Intervall).
-    Laeuft NUR wenn COWORKER_ENABLED aktiv ist — bei deaktiviertem Co-Worker
-    wird kein Ping ans andere System geschickt."""
+    """Startup-Probe + TTL-Cleanup-Schleife. Der Health-Check laeuft NUR
+    einmal beim Start (kein periodisches Re-Probing): ein Co-Worker mit
+    niedriger Concurrency (max_parallel=1) ist waehrend ein Task laeuft nicht
+    anpingbar, ein periodischer Probe wuerde reachable=False setzen und damit
+    dispatch/collect aus der Worker-Tool-Liste reissen, genau wenn der Worker
+    collecten will. Die Schleife bleibt fuer das TTL-Cleanup offener
+    Hintergrund-Tasks. Laeuft NUR wenn COWORKER_ENABLED aktiv ist."""
     if not COWORKER_ENABLED:
         _COWORKER_HEALTH_CACHE.update({"reachable": False, "last_error": "Co-Worker deaktiviert"})
         return
@@ -3371,10 +3390,8 @@ async def _coworker_health_loop() -> None:
             if not _coworker_configured():
                 _COWORKER_HEALTH_CACHE.update({"reachable": False, "last_error": "nicht konfiguriert"})
                 continue
-            await _probe_coworker()
-            state = ("erreichbar" if _COWORKER_HEALTH_CACHE.get("reachable")
-                     else f"UNREACHABLE ({_COWORKER_HEALTH_CACHE.get('last_error', '?')})")
-            _log(f"Co-Worker Health-Check: {state}")
+            # KEIN periodischer Probe (siehe Docstring). Nur TTL-Cleanup der
+            # Hintergrund-Tasks, damit abgelaufene running-Tasks geraeumt werden.
             # Fork-Join: TTL-Cleanup der Hintergrund-Tasks mit inline ziehen
             if COWORKER_FORK_JOIN and _COWORKER_BG_TASKS:
                 _cleanup_bg_tasks()
@@ -6253,19 +6270,19 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     #         _log(f"Loop-Intervention: history truncated + appended "
     #              f"(read={read_hit}, search={search_hit}, generic={generic_hit})")
 
-    # Co-Worker-Health-Cache frisch halten: Wenn der Cache aelter als das
-    # Health-Intervall ist, Probe im Hintergrund anstossen. EXCEPTION: war die
-    # Probe noch NIE erfolgreich ausgefuehrt (Cold-Start nach Restart), warten
+    # Co-Worker-Health-Cache: NUR beim Cold-Start (noch nie geprueft) warten
     # wir einmalig bis max. Probe-Timeout — sonst laeuft der erste Request ohne
     # Co-Worker-Tools, obwohl der Co-Worker erreichbar ist (beobachtet:
     # 2026-08-29 09:01 'Health-Check nicht bestanden (noch nicht geprueft)').
+    # KEIN periodisches Re-Probing pro Request: ein Co-Worker mit niedriger
+    # Concurrency (max_parallel=1) ist waehrend ein Task laeuft nicht anpingbar;
+    # ein Re-Probe wuerde reachable=False setzen und dispatch/collect aus der
+    # Worker-Tool-Liste reissen, genau wenn der Worker collecten will.
     if category == "local" and COWORKER_ENABLED and _coworker_configured():
         if float(_COWORKER_HEALTH_CACHE.get("checked_at", 0.0)) <= 0.0:
             await _probe_coworker()
             _log(f"Co-Worker Cold-Start-Probe: "
                  f"{'erreichbar' if _COWORKER_HEALTH_CACHE.get('reachable') else 'UNREACHABLE (' + str(_COWORKER_HEALTH_CACHE.get('last_error', '?')) + ')'}")
-        elif time.time() - float(_COWORKER_HEALTH_CACHE.get("checked_at", 0.0)) > COWORKER_HEALTH_INTERVAL:
-            _spawn(_probe_coworker())
 
     # Fork-Join: Status offener Hintergrund-Tasks als kompakte user-Notiz
     # ans Ende der History haengen (nach Kategorie-Detection — beeinflusst
