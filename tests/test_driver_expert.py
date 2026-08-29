@@ -122,6 +122,38 @@ def _setup_coworker_on(monkeypatch):
     monkeypatch.setattr(proxy, "_COWORKER_HEALTH_CACHE", {"reachable": True})
 
 
+def test_capacity_note_reflects_max_parallel(monkeypatch):
+    """Die Kapazitaets-Info nennt die ECHTE Concurrency. Bei max_parallel=1
+    warnt sie ausdruecklich vor falschem Fan-out (kein Speedup, queue)."""
+    monkeypatch.setattr(proxy, "COWORKER_MAX_PARALLEL", 1)
+    monkeypatch.setattr(proxy, "COWORKER_DISPATCH_CAP", 12)
+    note = proxy._coworker_capacity_note()
+    assert "at most 1 task" in note
+    assert "NO speedup" in note
+    assert "READ-ONLY" in note
+    monkeypatch.setattr(proxy, "COWORKER_MAX_PARALLEL", 4)
+    note4 = proxy._coworker_capacity_note()
+    assert "at most 4 task" in note4
+    assert "run in parallel" in note4
+
+
+def test_inject_appends_capacity_note_to_dispatch_and_guidance(monkeypatch):
+    """Die Kapazitaets-Info landet sowohl in der Dispatch-Tool-Beschreibung
+    als auch in der Guidance-System-Message."""
+    _setup_coworker_on(monkeypatch)
+    monkeypatch.setattr(proxy, "COWORKER_DRIVER_MODE", True)
+    monkeypatch.setattr(proxy, "COWORKER_MAX_PARALLEL", 1)
+    payload = {"messages": [{"role": "system", "content": "You are Copilot."}],
+               "tools": []}
+    assert proxy._inject_coworker_tool(payload) is True
+    names = [t["function"]["name"] for t in payload["tools"]]
+    disp = next(t for t in payload["tools"]
+                if t["function"]["name"] == "dispatch_coworker")
+    assert "[CO-WORKER CAPACITY & PIPELINE]" in disp["function"]["description"]
+    assert "at most 1 task" in disp["function"]["description"]
+    assert "[CO-WORKER CAPACITY & PIPELINE]" in payload["messages"][0]["content"]
+
+
 def test_driver_mode_guidance_replaces_default(monkeypatch):
     """Im Driver-Mode lehrt die Guidance das Treiber-Rollenbild, nicht das
     Delegations-Rollenbild (sonst delegiert der schnelle Treiber alles)."""

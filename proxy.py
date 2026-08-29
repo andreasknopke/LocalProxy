@@ -3075,21 +3075,25 @@ _COWORKER_DRIVER_GUIDANCE_SYSTEM: str = (
     "- Over ~200 lines of new or rewritten code: DELEGATE FIRST. A whole "
     "program, game, module or class, a big refactor, or a 'build me a complete "
     "X' request is always over this line.\n"
-    "- Several independent files or aspects: dispatch one task per file, all in "
-    "the SAME turn.\n"
+    "- Several independent files or aspects: dispatch them together in the "
+    "SAME turn (subject to the CAPACITY note below — do not dispatch more "
+    "than actually run in parallel).\n"
     "WHEN YOU DELEGATE, DO NOT ALSO WRITE THAT CODE YOURSELF. Delegate, then "
     "use your own tools for what only you can do: read files, run tests, "
-    "inspect output, apply the expert's code. The expert has no tools and no "
-    "view of this conversation; the proxy hands it the files you have seen.\n"
+    "inspect output, apply the expert's code. The expert is READ-ONLY (it can "
+    "inspect the workspace but cannot write) and has no view of this "
+    "conversation; the proxy hands it the files you have seen. It returns "
+    "complete file content as TEXT — you write it.\n"
     "HOW:\n"
     "- dispatch_coworker returns a task_id immediately and does NOT block. "
     "Dispatch first, then keep working — by the time you call collect_coworker "
     "the answer is usually already there and you wait zero seconds.\n"
     "- ask_coworker blocks until the answer arrives; use it when you cannot "
     "continue without it.\n"
-    "- Put several independent delegations in ONE turn: the expert server "
-    "batches them and shares one prefix cache, so a batch costs far less than "
-    "the same tasks spread over turns.\n"
+    "- Put several independent delegations in ONE turn — but only as many as "
+    "actually run in parallel (see the CAPACITY note below); extra tasks just "
+    "queue and you wait sequentially. A batch also shares one prefix cache, so "
+    "it costs less than the same tasks spread over turns.\n"
     "AFTER an expert answer: apply it with your edit/write tools, then run the "
     "tests. The expert cannot execute anything, so its code is unverified "
     "until you verify it."
@@ -3098,14 +3102,15 @@ _COWORKER_DRIVER_GUIDANCE_SYSTEM: str = (
 _COWORKER_GUIDANCE_SYSTEM: str = (
     "[PROXY DELEGATION GUIDANCE]\n"
     "You lead a two-machine team: you run on machine A; a Co-Worker model runs "
-    "on a SEPARATE machine B (own hardware, ~6-10 parallel sessions). It is "
-    "reachable ONLY via the ask_coworker / dispatch_coworker / collect_coworker "
-    "tools. Using it well makes the team much faster — this is expected "
-    "behavior, not an exception.\n"
+    "on a SEPARATE machine B (own hardware). It is reachable ONLY via the "
+    "ask_coworker / dispatch_coworker / collect_coworker tools. Using it well "
+    "makes the team much faster — this is expected behavior, not an exception.\n"
+    "The Co-Worker is READ-ONLY: it inspects the workspace and returns its "
+    "complete file content / analysis as TEXT; YOU are the only writer.\n"
     "WHEN to delegate:\n"
-    "- Multi-file or multi-aspect work: dispatch ONE task per "
-    "file/aspect — all in the SAME turn, not sequentially.\n"
-    "- Large explore/review/refactor jobs: fan out 4-8 tasks, then integrate.\n"
+    "- Multi-file or multi-aspect work: dispatch the independent tasks "
+    "together in the SAME turn (subject to the CAPACITY note below).\n"
+    "- Large explore/review/refactor jobs: fan out tasks, then integrate.\n"
     "- Trivial single-file questions: do them yourself.\n"
     "- A long read/search list: hand the files to the Co-Worker and keep only "
     "a small set for yourself.\n"
@@ -3114,8 +3119,8 @@ _COWORKER_GUIDANCE_SYSTEM: str = (
     "task_id immediately), then do your OWN work, then collect_coworker.\n"
     "- Need the answer before continuing → ask_coworker (blocking).\n"
     "- Patterns to avoid: dispatching one task per turn sequentially; "
-    "doing everything yourself while machine B idles; delegating "
-    "trivia.\n"
+    "doing everything yourself while machine B idles; dispatching more tasks "
+    "than actually run in parallel and then waiting; delegating trivia.\n"
     "The proxy automatically attaches the files from this conversation to "
     "every co-worker call — task/context can stay concise."
 )
@@ -3157,6 +3162,44 @@ _COWORKER_TOOL_DEF: Dict[str, Any] = {
 _COWORKER_DISPATCH_TOOL_NAME = "dispatch_coworker"
 _COWORKER_COLLECT_TOOL_NAME = "collect_coworker"
 
+
+def _coworker_capacity_note() -> str:
+    """Wahrheitsgetreue Kapazitaets- und Pipeline-Info fuer den Worker, die
+    zur Injektionszeit die ECHTE Concurrency (COWORKER_MAX_PARALLEL) nennt.
+    Der Worker soll nicht blind 4-8 Tasks dispatchen, wenn nur einer parallel
+    laeuft — und verstehen, dass der Coworker read-only ist und Code im Stream
+    zurueckgibt, den der Worker selbst schreibt."""
+    n = max(1, COWORKER_MAX_PARALLEL)
+    cap = COWORKER_DISPATCH_CAP
+    if n == 1:
+        para = (
+            "Only ONE co-worker task runs at a time, so dispatching several "
+            "tasks gives NO speedup — they just queue and you end up waiting "
+            "sequentially. With a single slot the ONLY useful pattern is: "
+            "dispatch ONE substantial task, then IMMEDIATELY do your own work "
+            "in parallel (read files, plan, write the parts only you must "
+            "touch) so the co-worker's time OVERLAPS yours, then "
+            "collect_coworker. Do NOT dispatch multiple tasks expecting them to "
+            "run in parallel — they will not."
+        )
+    else:
+        para = (
+            f"Up to {n} co-worker tasks run in parallel, so dispatch "
+            f"independent tasks together in ONE turn to overlap them. Do not "
+            f"dispatch more than {n} at once expecting more concurrency — the "
+            f"extra tasks queue."
+        )
+    return (
+        "\n\n[CO-WORKER CAPACITY & PIPELINE] "
+        f"The co-worker runs at most {n} task(s) concurrently "
+        f"(dispatch cap {cap} per request). " + para +
+        " The co-worker is READ-ONLY: it inspects the workspace and returns "
+        "its COMPLETE file content / analysis as TEXT in the stream — it "
+        "never writes files. YOU are the only writer: take its returned code "
+        "and write it yourself. Delegating pays off only when the co-worker's "
+        "work overlaps with your own; pure sequential waiting saves no time."
+    )
+
 # Für io_trace_analyze: alle Co-Worker-Tool-Namen (nach Definition gesetzt)
 _COWORKER_TOOL_NAMES = (_COWORKER_TOOL_NAME, _COWORKER_DISPATCH_TOOL_NAME,
                         _COWORKER_COLLECT_TOOL_NAME)
@@ -3171,11 +3214,10 @@ _COWORKER_DISPATCH_TOOL_DEF: Dict[str, Any] = {
             "a task_id (e.g. \"cw_ab12cd\") — the co-worker keeps computing "
             "in the background while you CONTINUE YOUR OWN WORK (call VS-Code "
             "tools, edit files, think). The next client turn will remind you "
-            "of running/done tasks until you collect them. Fan-out scaling: "
-            "trivial sub-task → just do it yourself; one task per file for "
-            "multi-file work; 4-8 parallel tasks for large refactors. Pattern: "
-            "dispatch ALL independent sub-tasks in ONE turn (multiple "
-            "dispatch_coworker calls), do your own work, then collect_coworker. "
+            "of running/done tasks until you collect them. Pattern: dispatch "
+            "independent sub-tasks, then do your own work while they run, then "
+            "collect_coworker. See the CAPACITY note appended below for how "
+            "many tasks actually run at once. "
             "The co-worker is READ-ONLY: it can inspect the workspace "
             "(read_file, list_dir, grep_search, file_search, view_image, "
             "fetch_webpage) but CANNOT write, edit, or run anything — YOU are "
@@ -3467,7 +3509,14 @@ def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
         prepend: List[Dict[str, Any]] = [copy.deepcopy(_COWORKER_TOOL_DEF)]
         if COWORKER_FORK_JOIN:
             if _COWORKER_DISPATCH_TOOL_NAME not in existing:
-                prepend.append(copy.deepcopy(_COWORKER_DISPATCH_TOOL_DEF))
+                d = copy.deepcopy(_COWORKER_DISPATCH_TOOL_DEF)
+                # Wahrheitsgetreue Kapazitaets-/Pipeline-Info an die
+                # Dispatch-Beschreibung haengen (zaehlt die echte Concurrency).
+                try:
+                    d["function"]["description"] += _coworker_capacity_note()
+                except (KeyError, TypeError):
+                    pass
+                prepend.append(d)
             if _COWORKER_COLLECT_TOOL_NAME not in existing:
                 prepend.append(copy.deepcopy(_COWORKER_COLLECT_TOOL_DEF))
         tools[:0] = prepend
@@ -3481,6 +3530,9 @@ def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
     if COWORKER_TEACH_DELEGATION:
         guidance_text = (_COWORKER_DRIVER_GUIDANCE_SYSTEM if COWORKER_DRIVER_MODE
                          else _COWORKER_GUIDANCE_SYSTEM)
+        # Kapazitaets-/Pipeline-Wahrheit an die Guidance haengen, damit der
+        # Worker die echte Concurrency kennt und nicht blind fan-out betreibt.
+        guidance_text = guidance_text + _coworker_capacity_note()
         marker = (COWORKER_DRIVER_GUIDANCE_MARKER if COWORKER_DRIVER_MODE
                   else "[PROXY DELEGATION GUIDANCE]")
         other_marker = ("[PROXY DELEGATION GUIDANCE]" if COWORKER_DRIVER_MODE
