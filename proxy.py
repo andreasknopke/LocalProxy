@@ -3193,11 +3193,14 @@ def _coworker_capacity_note() -> str:
         "\n\n[CO-WORKER CAPACITY & PIPELINE] "
         f"The co-worker runs at most {n} task(s) concurrently "
         f"(dispatch cap {cap} per request). " + para +
-        " The co-worker is READ-ONLY: it inspects the workspace and returns "
-        "its COMPLETE file content / analysis as TEXT in the stream — it "
-        "never writes files. YOU are the only writer: take its returned code "
-        "and write it yourself. Delegating pays off only when the co-worker's "
-        "work overlaps with your own; pure sequential waiting saves no time."
+        " The co-worker is READ-ONLY and TOOL-LESS: it works in a SINGLE pass "
+        "from the file context the proxy attaches to each dispatched task (plus "
+        "the task/context you provide) and returns its COMPLETE file content / "
+        "analysis as TEXT — it never writes files and cannot browse the "
+        "workspace live. YOU are the only writer: take its returned code and "
+        "write it yourself. Make the task self-contained and attach the files "
+        "it needs. Delegating pays off only when the co-worker's work overlaps "
+        "with your own; pure sequential waiting saves no time."
     )
 
 # Für io_trace_analyze: alle Co-Worker-Tool-Namen (nach Definition gesetzt)
@@ -3218,14 +3221,15 @@ _COWORKER_DISPATCH_TOOL_DEF: Dict[str, Any] = {
             "independent sub-tasks, then do your own work while they run, then "
             "collect_coworker. See the CAPACITY note appended below for how "
             "many tasks actually run at once. "
-            "The co-worker is READ-ONLY: it can inspect the workspace "
-            "(read_file, list_dir, grep_search, file_search, view_image, "
-            "fetch_webpage) but CANNOT write, edit, or run anything — YOU are "
-            "the only writer. It returns its findings and any complete file "
-            "content as TEXT, which you must then integrate yourself. The "
-            "proxy also appends conversation file contents to each dispatched "
-            "task. Task must be self-contained — the co-worker does NOT see "
-            "this conversation."
+            "The co-worker is READ-ONLY and TOOL-LESS: it works in a SINGLE "
+            "pass from the file context the proxy attaches to each dispatched "
+            "task (plus the task/context you provide) and returns its COMPLETE "
+            "file content / analysis as TEXT — it never writes files and "
+            "cannot browse the workspace live. YOU are the only writer: take "
+            "its returned code and write it yourself. The proxy appends the "
+            "conversation's file contents to each dispatched task, so make the "
+            "task self-contained and name the files it needs — the co-worker "
+            "does NOT see this conversation otherwise."
         ),
         "parameters": {
             "type": "object",
@@ -3816,11 +3820,14 @@ _COWORKER_AGENT_SYSTEM_PROMPT: str = (
 )
 
 _COWORKER_PLAIN_PROMPT: str = (
-    "You are a helpful assistant supporting a main agent as a delegated "
-    "subagent. Answer the given task concisely and technically, purely "
-    "from the provided context (you have NO tool access in this mode). "
-    "If information is missing, say so explicitly and give the best "
-    "possible answer from what you have."
+    "You are a READ-ONLY research and analysis subagent supporting a main "
+    "agent. You have NO tool access in this mode: work purely from the "
+    "provided task and file context, in a SINGLE pass. The main agent is the "
+    "ONLY writer of files. For code/file work, return the COMPLETE "
+    "ready-to-paste content in fenced code blocks, each preceded by its exact "
+    "target file path — do not truncate or summarize code. For analysis, give "
+    "a concise, concrete report. If information is missing from the context, "
+    "say so explicitly and give the best possible answer from what you have."
 )
 
 # ── Tunnel-Session-Store ──────────────────────────────────────────────────
@@ -4596,9 +4603,12 @@ async def _run_bg_coworker_task(task: CoworkerTask, tool_call_args: Dict[str, An
                     io_log_bg_result(task.task_id, "error", task.error)
                     _log(f"BG-Task {task.task_id} TUNNEL-FEHLER: {str(task.error)[:200]}")
             else:
-                result = await _run_coworker_agent(task_text, context_text,
-                                                   extra_context=task.file_context,
-                                                   task_id=task.task_id)
+                # Tool-los/Single-Shot (Standard): Semaphore respektiert
+                # COWORKER_MAX_PARALLEL (lokales Modell hat nur 1 Concurrency).
+                async with _coworker_semaphore():
+                    result = await _run_coworker_agent(task_text, context_text,
+                                                       extra_context=task.file_context,
+                                                       task_id=task.task_id)
                 if result.get("status") == "ok":
                     content = result.get("content", "") or ""
                     if COWORKER_RESULT_CAP > 0 and len(content) > COWORKER_RESULT_CAP:
@@ -4680,10 +4690,18 @@ def _register_bg_dispatch(tool_call: Dict[str, Any],
         preview=_task_preview_from_args(args),
         file_context=files_context or None,
     )
-    aio = asyncio.ensure_future(_run_bg_coworker_task(ct, args, client_tools))
+    # Steering-Modell (2026-08-29): BG-Dispatch laeuft IMMER tool-los als
+    # Single-Shot aus dem angehaengten Datei-Kontext. Der asynchrone
+    # Tunnel-Rueckkanal (Client-Tools -> Pause -> cws_-Resume im Folgerequest)
+    # hat sich als die Hauptfehlerquelle erwiesen: der Co-Worker pausiert bei
+    # Read-Calls und das Resume liefert das Ergebnis nie beim Worker ab.
+    # Ohne Tools arbeitet der Co-Worker in EINEM Durchgang aus dem Kontext und
+    # gibt den kompletten Inhalt als Text zurueck -> collect_coworker liefert
+    # synchron echten Arbeitstext. client_tools wird daher bewusst ignoriert.
+    aio = asyncio.ensure_future(_run_bg_coworker_task(ct, args, None))
     ct.aio_task = aio
     _COWORKER_BG_TASKS[task_id] = ct
-    _log(f"BG-Dispatch {task_id} (tool_call={tool_call_id}, tools={len(client_tools or [])}): "
+    _log(f"BG-Dispatch {task_id} (tool_call={tool_call_id}, tool-los/Single-Shot): "
          f"{ct.preview}")
     return ct
 

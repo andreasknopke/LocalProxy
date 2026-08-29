@@ -268,6 +268,40 @@ def test_run_coworker_agent_fallback_no_config(monkeypatch):
     assert res["status"] == "error"
 
 
+# ── Steering-Modell: BG-Dispatch ist tool-los / Single-Shot ───────────────
+
+def test_register_bg_dispatch_ignores_client_tools(monkeypatch):
+    """Steering-Modell: dispatch_coworker laeuft IMMER tool-los, auch wenn der
+    Aufrufer client_tools mitgibt. Der asynchrone Tunnel-Rueckkanal war die
+    Hauptfehlerquelle; der Co-Worker arbeitet stattdessen Single-Shot aus dem
+    angehaengten Datei-Kontext."""
+    seen = {}
+
+    async def _fake_bg(task, args, client_tools=None):
+        seen["client_tools"] = client_tools
+        seen["args"] = args
+
+    monkeypatch.setattr(proxy, "_run_bg_coworker_task", _fake_bg)
+    monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", {})
+    # client_tools werden bewusst NICHT durchgereicht:
+    fake_tools = [{"type": "function",
+                   "function": {"name": "read_file"}}]
+    tc = {"id": "call_x", "type": "function",
+          "function": {"name": proxy._COWORKER_DISPATCH_TOOL_NAME,
+                       "arguments": json.dumps({"task": "mach was", "context": ""})}}
+
+    async def _run():
+        ct = proxy._register_bg_dispatch(tc, "DATEI-KONTEXT",
+                                         client_tools=fake_tools)
+        await ct.aio_task
+        return ct
+
+    ct = asyncio.run(_run())
+    assert ct.file_context == "DATEI-KONTEXT"
+    # Der Coroutine-Argument client_tools muss None sein (tool-los):
+    assert seen["client_tools"] is None
+
+
 # ── Health-Probe Busy-False-Positive ──────────────────────────────────────
 
 def _make_running_task(task_id="cw_busy"):
