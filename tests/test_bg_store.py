@@ -148,6 +148,7 @@ def test_cleanup_removes_delivered_after_60s(monkeypatch):
 def test_status_line_format(monkeypatch):
     store: Dict[str, Any] = {}
     monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", store)
+    monkeypatch.setattr(proxy, "_COWORKER_STATUS_NOTED", set())
 
     t1 = proxy.CoworkerTask(task_id="cw_a", preview="task a", created_at=time.time())
     t1.status = "done"
@@ -159,19 +160,24 @@ def test_status_line_format(monkeypatch):
 
     line = proxy._coworker_status_line()
     assert line is not None
-    assert "cw_a" in line and "cw_b" in line
-    assert "collect_coworker" in line
-    assert "✅" in line and "⏳" in line
+    # Steering-Push: fertiges Ergebnis VOLL im Text, running nicht noetig
+    assert "cw_a" in line and "x" in line
+    assert "[Co-Worker-Ergebnis cw_a]" in line
+    assert t1.delivered is True          # sofort delivered
+    assert "cw_b" not in line            # laufende Tasks bleiben stillschweigend
+    # zweiter Aufruf: nichts mehr zu pushen (delivered), running bleibt still
+    assert proxy._coworker_status_line() is None
 
 
 def test_status_line_empty(monkeypatch):
     monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", {})
+    monkeypatch.setattr(proxy, "_COWORKER_STATUS_NOTED", set())
     assert proxy._coworker_status_line() is None
 
 
-def test_status_line_noted_once_per_task_status(monkeypatch):
-    """Die Status-Notiz darf das Hauptmodell nicht in jedem Folge-Turn mit
-    derselben Meldung beschallen — pro (task_id, status) genau einmal."""
+def test_status_line_running_silent_done_push(monkeypatch):
+    """Steering-Push: laufende Tasks erzeugen KEINE Turn-Notiz mehr (das
+    Modell wurde sonst vom Warten abgehalten); fertige werden gepusht."""
     store: Dict[str, Any] = {}
     monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", store)
     monkeypatch.setattr(proxy, "_COWORKER_STATUS_NOTED", set())
@@ -181,17 +187,16 @@ def test_status_line_noted_once_per_task_status(monkeypatch):
     t.status = "running"
     store["cw_once"] = t
 
-    assert proxy._coworker_status_line() is not None      # 1. Turn: Notiz
-    assert proxy._coworker_status_line() is None          # 2. Turn: keine
-    assert proxy._coworker_status_line() is None          # 3. Turn: keine
-
-    # Statuswechsel ist neue Information -> Notiz erscheint erneut
-    t.status = "done"
-    line = proxy._coworker_status_line()
-    assert line is not None and "cw_once" in line
+    # laufend: still (kein Push, keine Notiz — Push kommt automatisch)
+    assert proxy._coworker_status_line() is None
     assert proxy._coworker_status_line() is None
 
-
+    # -> done: Ergebnis wird VOLL gepusht, Task delivered
+    t.status = "done"
+    t.result = "ERGEBNIS-TEXT"
+    line = proxy._coworker_status_line()
+    assert line is not None and "ERGEBNIS-TEXT" in line
+    assert t.delivered is True
 def test_bg_task_shutdown_cancel_note(monkeypatch):
     """Cancel durch Prozess-Shutdown muss als Neustart gemeldet werden, nicht
     als TTL-Ablauf — sonst liest das Hauptmodell einen Restart als Task-Timeout."""

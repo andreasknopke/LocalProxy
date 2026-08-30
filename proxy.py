@@ -3080,14 +3080,16 @@ _COWORKER_DRIVER_GUIDANCE_SYSTEM: str = (
     "than actually run in parallel).\n"
     "WHEN YOU DELEGATE, DO NOT ALSO WRITE THAT CODE YOURSELF. Delegate, then "
     "use your own tools for what only you can do: read files, run tests, "
-    "inspect output, apply the expert's code. The expert is READ-ONLY (it can "
-    "inspect the workspace but cannot write) and has no view of this "
-    "conversation; the proxy hands it the files you have seen. It returns "
-    "complete file content as TEXT — you write it.\n"
+    "inspect output, apply the expert's code. The expert is READ-ONLY and "
+    "TOOL-LESS (works from the files the proxy hands it; it cannot browse the "
+    "workspace live and never writes) and has no view of this conversation. "
+    "It returns complete file content as TEXT, delivered AUTOMATICALLY as a "
+    "[Co-Worker-Ergebnis cw_xxx] message in a following turn — you never need "
+    "collect_coworker; keep working until it arrives.\n"
     "HOW:\n"
     "- dispatch_coworker returns a task_id immediately and does NOT block. "
-    "Dispatch first, then keep working — by the time you call collect_coworker "
-    "the answer is usually already there and you wait zero seconds.\n"
+    "Dispatch first, then keep working — the finished result is PUSHED into "
+    "one of your next turns while you are still productive.\n"
     "- ask_coworker blocks until the answer arrives; use it when you cannot "
     "continue without it.\n"
     "- Put several independent delegations in ONE turn — but only as many as "
@@ -3116,7 +3118,9 @@ _COWORKER_GUIDANCE_SYSTEM: str = (
     "a small set for yourself.\n"
     "HOW:\n"
     "- Independent sub-tasks → dispatch_coworker (non-blocking, returns "
-    "task_id immediately), then do your OWN work, then collect_coworker.\n"
+    "task_id immediately), then do your OWN work. You do NOT need "
+    "collect_coworker: the finished result is PUSHED to you automatically as "
+    "a [Co-Worker-Ergebnis cw_xxx] message in a following turn.\n"
     "- Need the answer before continuing → ask_coworker (blocking).\n"
     "- Patterns to avoid: dispatching one task per turn sequentially; "
     "doing everything yourself while machine B idles; dispatching more tasks "
@@ -3199,8 +3203,10 @@ def _coworker_capacity_note() -> str:
         "analysis as TEXT — it never writes files and cannot browse the "
         "workspace live. YOU are the only writer: take its returned code and "
         "write it yourself. Make the task self-contained and attach the files "
-        "it needs. Delegating pays off only when the co-worker's work overlaps "
-        "with your own; pure sequential waiting saves no time."
+        "it needs. DELIVERY IS AUTOMATIC: no collect_coworker needed — the "
+        "finished result is pushed into your next turns. Delegating pays off "
+        "only when the co-worker's work overlaps with your own; pure "
+        "sequential waiting saves no time."
     )
 
 # Für io_trace_analyze: alle Co-Worker-Tool-Namen (nach Definition gesetzt)
@@ -3216,11 +3222,11 @@ _COWORKER_DISPATCH_TOOL_DEF: Dict[str, Any] = {
             "model on the SEPARATE DGX Spark server. Returns IMMEDIATELY with "
             "a task_id (e.g. \"cw_ab12cd\") — the co-worker keeps computing "
             "in the background while you CONTINUE YOUR OWN WORK (call VS-Code "
-            "tools, edit files, think). The next client turn will remind you "
-            "of running/done tasks until you collect them. Pattern: dispatch "
-            "independent sub-tasks, then do your own work while they run, then "
-            "collect_coworker. See the CAPACITY note appended below for how "
-            "many tasks actually run at once. "
+            "tools, edit files, think). You do NOT need collect_coworker: as "
+            "soon as the task finishes, the proxy PUSHES the complete result "
+            "into one of your next turns as a [Co-Worker-Ergebnis cw_xxx] "
+            "message — keep working meanwhile. See the CAPACITY note appended "
+            "below for how many tasks actually run at once. "
             "The co-worker is READ-ONLY and TOOL-LESS: it works in a SINGLE "
             "pass from the file context the proxy attaches to each dispatched "
             "task (plus the task/context you provide) and returns its COMPLETE "
@@ -3253,13 +3259,15 @@ _COWORKER_COLLECT_TOOL_DEF: Dict[str, Any] = {
     "function": {
         "name": _COWORKER_COLLECT_TOOL_NAME,
         "description": (
-            "Join point: collect the results of previously dispatched "
-            "background tasks. BLOCKS until the requested tasks are done (or "
-            "timeout). Call with no arguments to collect ALL "
-            "running/finished tasks. Returns a list of "
-            "{task_id, status, result} entries. Typical flow: "
-            "dispatch_coworker (several) → do your own work → "
-            "collect_coworker → integrate the results into your answer."
+            "OPTIONAL early-join: collect results of dispatched background "
+            "tasks before they are pushed to you automatically. Call with no "
+            "arguments to collect ALL finished tasks. Returns a list of "
+            "{task_id, status, result} entries; tasks still running are "
+            "reported as status=running (this call BLOCKS up to "
+            "timeout_seconds). Normally NOT needed — finished results are "
+            "pushed automatically as [Co-Worker-Ergebnis cw_xxx] user "
+            "messages. Use only if you want a result early "
+            "(e.g. before a final answer)."
         ),
         "parameters": {
             "type": "object",
@@ -4839,18 +4847,18 @@ async def _await_bg_tasks(task_ids: Optional[List[str]],
         if t.status == "paused":
             # Tunnel-Session wartet auf VS-Code-Tool-Ausfuehrung (Resume im
             # Folgerequest) — kein Fehler, aber auch noch kein Ergebnis. Der
-            # Task bleibt undelivered; die Status-Notiz erzaehlt dem Modell
-            # weiter, dass arbeitet wird. KEIN wait sinnvoll hier.
+            # Task bleibt undelivered; der Steering-Push liefert das finale
+            # Ergebnis automatisch, sobald die Session final ist.
             out.append({"task_id": t.task_id, "status": "running",
                         "preview": t.preview,
-                        "note": "Co-Worker arbeitet mit Client-Tools; Teil-Ergebnisse "
-                                "kommen nach der Tool-Ausfuehrung im naechsten Turn"})
+                        "note": "Co-Worker arbeitet; das Endergebnis wird "
+                                "automatisch in einem Folge-Turn gepusht"})
             continue
         out.append(t.summary())
         if t.status in ("done", "error", "expired"):
             t.delivered = True
             t.finished_at = t.finished_at or time.time()
-        # running Tasks bleiben undelivered → Status-Injection erinnert daran
+        # running Tasks bleiben undelivered → Push liefert spaeter automatisch
     return out
 
 
@@ -4888,35 +4896,56 @@ _COWORKER_STATUS_NOTED: Set[str] = set()
 
 
 def _coworker_status_line() -> Optional[str]:
-    """Baut die kompakte Status-Notiz fuer undelivered Tasks ( None = keine
-    offenen Tasks). Format:
-    [Proxy] 2 Co-Worker Hintergrund-Tasks offen:
-    - ✅ cw_ab12cd: review proxy.py lines 100-200…
-    - ⏳ cw_ef34gh: refactor tools/auth.py…
+    """Steering-Push (v5.1): Baut die Inject-Nachricht fuer den naechsten
+    Worker-Turn. Zwei Teile:
 
-    Returns NUR Notizen fuer Tasks/Status, die noch nicht notiert wurden
-    (_COWORKER_STATUS_NOTED). Ein Task, der von running → done wechselt, wird
-    erneut erwaehnt — das ist die Information, die das Hauptmodell braucht."""
+    1. FERTIGE Ergebnisse (status=done, nicht delivered) werden als
+       VOLLSTAENDIGER Text gepusht und sofort delivered markiert — der Worker
+       muss collect_coworker nicht mehr rufen (Pull war bruechig: Ergebnis
+       lag fertig im Store, Worker collectierte nie, 13 Min Leerlauf).
+    2. LAUFENDE/fehlgeschlagene Tasks erscheinen als einzeilige Status-Notiz
+       (weiterhin pro (task_id, status) nur EINMAL — kein Beschaeftigen).
+
+    Returns None, wenn es nichts zu sagen gibt."""
     global _COWORKER_STATUS_NOTED
     if len(_COWORKER_STATUS_NOTED) > 400:
         _COWORKER_STATUS_NOTED.clear()
-    entries = [t for t in _COWORKER_BG_TASKS.values()
-               if not t.delivered and f"{t.task_id}:{t.status}" not in _COWORKER_STATUS_NOTED]
-    if not entries:
-        return None
-    lines = [f"[Proxy] {len(entries)} Co-Worker Hintergrund-Task(s) aktiv:"]
-    for t in entries[:8]:
-        _COWORKER_STATUS_NOTED.add(f"{t.task_id}:{t.status}")
-        icon = {"done": "✅", "error": "❌", "expired": "⏱️"}.get(t.status, "⏳")
-        detail = ""
-        if t.status in ("error", "expired"):
-            detail = f" — {t.error[:80]}" if t.error else ""
-        lines.append(f"- {icon} {t.task_id}: {t.preview}{detail}")
-    if len(entries) > 8:
-        lines.append(f"- … und {len(entries) - 8} weitere")
-    lines.append("Diese Tasks werden vom Co-Worker ausgeführt — führe sie NICHT selbst aus. "
-                 "Sammle die Ergebnisse mit collect_coworker, sobald sie fertig sind.")
-    return "\n".join(lines)
+    push_parts: List[str] = []
+    state_parts: List[str] = []
+    for t in _COWORKER_BG_TASKS.values():
+        if t.delivered or t.status == "running":
+            # running: Ergebnis kommt per Push, sobald fertig — kein
+            # Turn-Noise noetig. Done: wird unten gepusht und delivered.
+            continue
+        if t.status == "done" and t.result is not None:
+            # Steering-Push: volles Ergebnis in den naechsten Worker-Turn,
+            # sofort delivered (collect_coworker wird damit optional).
+            t.delivered = True
+            _COWORKER_STATUS_NOTED.add(f"pushed:{t.task_id}:{t.status}")
+            push_parts.append(
+                f"[Co-Worker-Ergebnis {t.task_id}] (Aufgabe: {t.preview})\n"
+                f"{t.result}"
+            )
+        else:
+            key = f"{t.task_id}:{t.status}"
+            if key in _COWORKER_STATUS_NOTED:
+                continue
+            _COWORKER_STATUS_NOTED.add(key)
+            icon = {"error": "❌", "expired": "⏱️"}.get(t.status, "⏳")
+            detail = f" — {t.error[:80]}" if (t.status in ("error", "expired") and t.error) else ""
+            state_parts.append(f"- {icon} {t.task_id}: {t.preview}{detail}")
+    if push_parts:
+        head = (f"[Proxy] {len(push_parts)} Co-Worker-Ergebnis(se) fertig — "
+                "integriere es direkt (Dateien selbst schreiben/pruefen), "
+                "kein collect_coworker noetig:")
+        return head + "\n\n" + "\n\n---\n\n".join(push_parts)
+    if state_parts:
+        return ("[Proxy] Co-Worker-Tasks offen:\n" + "\n".join(state_parts) +
+                "\nArbeite BY DESIGN asynchron weiter — das Ergebnis kommt "
+                "VON SELBST als [Co-Worker-Ergebnis cw_xxxxxxxx]-Nachricht "
+                "in einem der naechsten Turns; collect_coworker ist optional "
+                "(holt es frueh, wenn du nicht warten willst).")
+    return None
 
 
 async def _delegation_loop(body: Dict[str, Any], category: str,
