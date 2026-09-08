@@ -284,6 +284,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "response_loop_threshold": 3,
         "generic_tool_loop_threshold": 3,
         "generic_tool_loop_intervention": "",
+        "reasoning_cap_chars": 0,
+        "reasoning_cap_mode": "note",
+        "reasoning_cap_max_restarts": 1,
+        "loop_guard_enabled": True,
+        "loop_guard_mode": "restart",
+        "loop_guard_max_restarts": 1,
+        "loop_guard_min_chars": 120,
+        "loop_guard_sentence_min": 40,
+        "loop_guard_repeats": 3,
+        "loop_guard_window": 60,
+        "loop_guard_paragraph_min": 200,
+        "loop_guard_paragraph_repeats": 2,
+        "loop_guard_ngram_chars": 96,
+        "loop_guard_ngram_repeats": 3,
+        "loop_guard_hint": "",
         "coworker": {
             "enabled": True,
             "max_delegations_per_request": 2,
@@ -1280,6 +1295,79 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
         <div class="hint">Kappt grosse grep/read-Ergebnisse auf dieses Limit. 0 = deaktiviert.</div>
       </div>
       <div class="form-group">
+        <label>Reasoning-Cap (Zeichen, 0=aus)</label>
+        <input type="number" id="reasoning_cap_chars" min="0" max="1000000">
+        <div class="hint">Grober Backstop gegen Endlos-Denken: begrenzt reasoning_content pro Turn. 0 = deaktiviert. Der Text-Loop-Guard erkennt Wiederholungen praeziser und frueher.</div>
+      </div>
+      <div class="form-group">
+        <label>Reasoning-Cap-Modus</label>
+        <select id="reasoning_cap_mode">
+          <option value="note">note — Reasoning kappen, Stream weiterlaufen lassen</option>
+          <option value="restart">restart — Stream abbrechen, Folgeturn ohne Thinking</option>
+        </select>
+        <div class="hint">restart beendet Denk-Loops wirklich, liefert aber trotzdem eine Antwort.</div>
+      </div>
+
+      <h4 style="margin-top:24px;border-top:1px solid var(--border);padding-top:12px">🔁 Text-Loop-Guard</h4>
+      <div class="hint">Erkennt wiederholte Saetze/Absaetze/N-Gramme im laufenden Stream (Thinking UND Antwort), bricht den Backend-Stream intern ab und startet einen Folgeturn mit Anti-Loop-Hinweis — fuer den Client unsichtbar.</div>
+      <div class="form-group">
+        <span>Loop-Guard aktiv</span>
+        <label class="toggle"><input type="checkbox" id="loop_guard_enabled" checked><span class="slider"></span></label>
+      </div>
+      <div class="form-group">
+        <label>Modus</label>
+        <select id="loop_guard_mode">
+          <option value="restart">restart — intern abbrechen + Folgeturn (empfohlen)</option>
+          <option value="note">note — nur loggen (zum Messen der False-Positive-Rate)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Max. Restarts pro Request</label>
+        <input type="number" id="loop_guard_max_restarts" min="0" max="5">
+      </div>
+      <div class="form-group">
+        <label>Mindestlaenge Text (Zeichen)</label>
+        <input type="number" id="loop_guard_min_chars" min="0" max="10000">
+        <div class="hint">Erst ab dieser Textmenge wird ueberhaupt geprueft.</div>
+      </div>
+      <div class="form-group">
+        <label>Satz-Wiederholungen (Anzahl)</label>
+        <input type="number" id="loop_guard_repeats" min="2" max="20">
+        <div class="hint">Ab so vielen identischen Saetzen gilt es als Loop.</div>
+      </div>
+      <div class="form-group">
+        <label>Satz-Mindestlaenge (Zeichen)</label>
+        <input type="number" id="loop_guard_sentence_min" min="10" max="500">
+        <div class="hint">Kuerzere Fragmente (Tabellen/Bullets) werden ignoriert.</div>
+      </div>
+      <div class="form-group">
+        <label>Fenster (Saetze)</label>
+        <input type="number" id="loop_guard_window" min="4" max="500">
+        <div class="hint">Beobachtungsfenster fuer Wiederholungen.</div>
+      </div>
+      <div class="form-group">
+        <label>Absatz-Mindestlaenge (Zeichen)</label>
+        <input type="number" id="loop_guard_paragraph_min" min="20" max="5000">
+      </div>
+      <div class="form-group">
+        <label>Absatz-Wiederholungen (Anzahl)</label>
+        <input type="number" id="loop_guard_paragraph_repeats" min="2" max="10">
+        <div class="hint">Wiederholte Absaetze sind ein starkes Loop-Signal.</div>
+      </div>
+      <div class="form-group">
+        <label>N-Gramm-Laenge (Zeichen)</label>
+        <input type="number" id="loop_guard_ngram_chars" min="16" max="1000">
+        <div class="hint">Fenster fuer periodische Wiederholung ohne Satzgrenzen.</div>
+      </div>
+      <div class="form-group">
+        <label>N-Gramm-Wiederholungen (Anzahl)</label>
+        <input type="number" id="loop_guard_ngram_repeats" min="2" max="20">
+      </div>
+      <div class="form-group">
+        <label>Anti-Loop-Hinweis (optional)</label>
+        <textarea id="loop_guard_hint" rows="3" placeholder="Leer = Standardtext. Platzhalter {kind} und {count}."></textarea>
+      </div>
+      <div class="form-group">
         <label>Read-Loop-Schwelle (0=aus)</label>
         <input type="number" id="read_loop_threshold" min="0" max="100">
         <div class="hint">Erkennt wiederholtes Lesen derselben Datei/Zeilen. Bei &gt;N Wiederholungen wird eine Intervention injiziert. 0 = deaktiviert.</div>
@@ -1555,6 +1643,20 @@ async function loadConfig() {
     document.getElementById('response_loop_threshold').value = tk.response_loop_threshold != null ? tk.response_loop_threshold : 3;
     document.getElementById('generic_tool_loop_threshold').value = tk.generic_tool_loop_threshold != null ? tk.generic_tool_loop_threshold : 3;
     document.getElementById('generic_tool_loop_intervention').value = tk.generic_tool_loop_intervention || '';
+    // Reasoning-Cap
+    document.getElementById('reasoning_cap_chars').value = tk.reasoning_cap_chars || 0;
+    document.getElementById('reasoning_cap_mode').value = tk.reasoning_cap_mode || 'note';
+    // Text-Loop-Guard
+    document.getElementById('loop_guard_enabled').checked = tk.loop_guard_enabled !== false;
+    document.getElementById('loop_guard_mode').value = tk.loop_guard_mode || 'restart';
+    document.getElementById('loop_guard_max_restarts').value = tk.loop_guard_max_restarts != null ? tk.loop_guard_max_restarts : 1;
+    document.getElementById('loop_guard_min_chars').value = tk.loop_guard_min_chars != null ? tk.loop_guard_min_chars : 120;
+    document.getElementById('loop_guard_repeats').value = tk.loop_guard_repeats != null ? tk.loop_guard_repeats : 3;
+    document.getElementById('loop_guard_sentence_min').value = tk.loop_guard_sentence_min != null ? tk.loop_guard_sentence_min : 40;
+    document.getElementById('loop_guard_paragraph_repeats').value = tk.loop_guard_paragraph_repeats != null ? tk.loop_guard_paragraph_repeats : 2;
+    document.getElementById('loop_guard_ngram_chars').value = tk.loop_guard_ngram_chars != null ? tk.loop_guard_ngram_chars : 96;
+    document.getElementById('loop_guard_ngram_repeats').value = tk.loop_guard_ngram_repeats != null ? tk.loop_guard_ngram_repeats : 3;
+    document.getElementById('loop_guard_hint').value = tk.loop_guard_hint || '';
     const ls = tk.local_sampling || {};
     document.getElementById('local_temperature').value = ls.temperature != null ? ls.temperature : 0.7;
     document.getElementById('local_top_p').value = ls.top_p != null ? ls.top_p : 0.95;
@@ -1678,6 +1780,20 @@ async function saveConfig() {
     response_loop_threshold: parseInt(document.getElementById('response_loop_threshold').value) || 0,
     generic_tool_loop_threshold: parseInt(document.getElementById('generic_tool_loop_threshold').value) || 0,
     generic_tool_loop_intervention: document.getElementById('generic_tool_loop_intervention').value || '',
+    reasoning_cap_chars: parseInt(document.getElementById('reasoning_cap_chars').value) || 0,
+    reasoning_cap_mode: document.getElementById('reasoning_cap_mode').value || 'note',
+    loop_guard_enabled: document.getElementById('loop_guard_enabled').checked,
+    loop_guard_mode: document.getElementById('loop_guard_mode').value || 'restart',
+    loop_guard_max_restarts: parseInt(document.getElementById('loop_guard_max_restarts').value) || 0,
+    loop_guard_min_chars: parseInt(document.getElementById('loop_guard_min_chars').value) || 120,
+    loop_guard_sentence_min: parseInt(document.getElementById('loop_guard_sentence_min').value) || 40,
+    loop_guard_repeats: parseInt(document.getElementById('loop_guard_repeats').value) || 3,
+    loop_guard_window: parseInt(document.getElementById('loop_guard_window')?.value) || 60,
+    loop_guard_paragraph_min: parseInt(document.getElementById('loop_guard_paragraph_min')?.value) || 200,
+    loop_guard_paragraph_repeats: parseInt(document.getElementById('loop_guard_paragraph_repeats').value) || 2,
+    loop_guard_ngram_chars: parseInt(document.getElementById('loop_guard_ngram_chars').value) || 96,
+    loop_guard_ngram_repeats: parseInt(document.getElementById('loop_guard_ngram_repeats').value) || 3,
+    loop_guard_hint: document.getElementById('loop_guard_hint').value || '',
     coworker: {
       enabled: document.getElementById('coworker_enabled')?.checked ?? true,
       max_delegations_per_request: parseInt(document.getElementById('coworker_max_delegations')?.value) || 2,

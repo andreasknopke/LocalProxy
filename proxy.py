@@ -591,6 +591,206 @@ def _reasoning_forward(accumulated_len: int, delta_len: int, cap: int) -> Tuple[
     return delta_len, False
 
 
+# ── Text-Loop-Guard (modell-agnostisch) ───────────────────────────────────
+# Erkennt, wenn das Modell Saetze/Abschnitte/N-Gramme im laufenden Stream
+# wiederholt (Thinking- UND Antwort-Loop) und bricht den Backend-Stream
+# INTERN ab. Danach wird ein Folgeturn mit Anti-Loop-Hinweis gestartet —
+# VS Code sieht einen durchgehenden Stream mit genau EINEM finish_reason und
+# bekommt von der Unterbrechung nichts mit. Der Guard arbeitet auf dem
+# Text-Delta (reasoning_content UND content) und ist damit unabhaengig vom
+# Modell (kein Laguna-/Qwen-Gate).
+#
+# Der Reasoning-Cap bleibt als grober Backstop erhalten (Zeichenbudget);
+# der Guard ist die praezise, fruehe Erkennung.
+LOOP_GUARD_ENABLED: bool = os.getenv("LOOP_GUARD_ENABLED", "1").lower() in {"1", "true", "yes", "y", "on"}
+# Modus: "restart" (Default) bricht intern ab und startet einen Folgeturn mit
+# Anti-Loop-Hinweis. "note" loggt nur (zum Messen der False-Positive-Rate).
+LOOP_GUARD_MODE: str = os.getenv("LOOP_GUARD_MODE", "restart").strip().lower()
+LOOP_GUARD_MAX_RESTARTS: int = int(os.getenv("LOOP_GUARD_MAX_RESTARTS", "1"))
+# Mindestlaenge des beobachteten Textes, bevor der Guard ueberhaupt greift.
+LOOP_GUARD_MIN_CHARS: int = int(os.getenv("LOOP_GUARD_MIN_CHARS", "120"))
+# Satz-Loop: normalisierte Saetze/Zeilen ab N Zeichen, die >= R mal vorkommen.
+LOOP_GUARD_SENTENCE_MIN: int = int(os.getenv("LOOP_GUARD_SENTENCE_MIN", "40"))
+LOOP_GUARD_REPEATS: int = int(os.getenv("LOOP_GUARD_REPEATS", "3"))
+LOOP_GUARD_WINDOW: int = int(os.getenv("LOOP_GUARD_WINDOW", "60"))
+# Absatz-Loop: Absaetze ab N Zeichen, die >= 2 mal vorkommen (starkes Signal).
+LOOP_GUARD_PARAGRAPH_MIN: int = int(os.getenv("LOOP_GUARD_PARAGRAPH_MIN", "200"))
+LOOP_GUARD_PARAGRAPH_REPEATS: int = int(os.getenv("LOOP_GUARD_PARAGRAPH_REPEATS", "2"))
+# N-Gramm-/Tail-Loop: Rolling-Hash ueber die letzten N Zeichen.
+LOOP_GUARD_NGRAM_CHARS: int = int(os.getenv("LOOP_GUARD_NGRAM_CHARS", "96"))
+LOOP_GUARD_NGRAM_REPEATS: int = int(os.getenv("LOOP_GUARD_NGRAM_REPEATS", "3"))
+LOOP_GUARD_HINT: str = os.getenv(
+    "LOOP_GUARD_HINT",
+    "STOP LOOPING. You are repeating the same sentences/sections over and over "
+    "({kind} x{count}). This repetition adds no new information. Stop thinking "
+    "in circles and act now: either produce the concrete final answer or emit "
+    "the required tool calls. Do NOT repeat what you already wrote. Go on."
+)
+
+
+def _normalize_for_loop(text: str) -> str:
+    """Normalisiert Text fuer den Wiederholungsvergleich: lowercase,
+    Whitespace kollabiert. Zeichensetzung bleibt erhalten (Satzgrenzen)."""
+    return re.sub(r"\s+", " ", (text or "").lower()).strip()
+
+
+def _trim_looping_tail(text: str, sentence_min: int = 0) -> str:
+    """Entfernt eine trailing Wiederholung aus dem Text (Satz-Ebene): ab dem
+    ersten Vorkommen eines Satzes, der danach noch >= 2 mal folgt, wird alles
+    abgeschnitten. Konservativ — variierter Text bleibt unveraendert."""
+    if not text:
+        return text
+    minimum = sentence_min or LOOP_GUARD_SENTENCE_MIN
+    # Satzweise zerlegen, Trenner erhalten.
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    if len(parts) < 2:
+        return text
+    norm = [_normalize_for_loop(p) for p in parts]
+    for i in range(len(norm) - 1):
+        sig = norm[i]
+        if len(sig) < minimum:
+            continue
+        # Mindestens eine spaetere identische Wiederholung genuegt: der Trim
+        # laeuft ohnehin nur, nachdem der Guard einen Loop erkannt hat.
+        repeats = sum(1 for j in range(i + 1, len(norm)) if norm[j] == sig)
+        if repeats >= 1:
+            return " ".join(parts[:i + 1]).rstrip()
+    return text
+
+
+class _TextLoopGuard:
+    """Inkrementeller Wiederholungs-Detektor fuer einen Text-Stream.
+
+    feed(delta, channel) wird mit jedem Text-Delta gefuettert und liefert bei
+    erkannter Wiederholung ein dict {"kind", "count", "snippet"} — sonst None.
+    Nach dem ERSTEN Treffer liefert der Guard dauerhaft None: der Aufrufer
+    bricht dann ohnehin ab/startet neu, weitere Treffer sind wertlos.
+
+    channel="content": Code-Fences werden ignoriert (legitimer Code mit
+    wiederholten Zeilen soll nicht als Loop gelten). channel="reasoning":
+    Fences werden NICHT ignoriert — Denk-Loops passieren genau dort.
+    """
+
+    def __init__(self, enabled: bool = True, min_chars: int = 0) -> None:
+        self.enabled = bool(enabled)
+        self.min_chars = int(min_chars or LOOP_GUARD_MIN_CHARS)
+        self.text = ""
+        self._hit = False
+        self._sentence_counts: Dict[str, int] = {}
+        self._paragraph_counts: Dict[str, int] = {}
+        self._sent_buf = ""        # angebrochener Satz (wartet auf Trenner)
+        self._para_buf = ""        # angebrochener Absatz (wartet auf Leerzeile)
+        self._in_fence = False
+        self._fence_rem = ""       # angebrochene Zeile im Fence-Filter
+        self._last_periodic_len = 0
+
+    # ── interne Helfer ────────────────────────────────────────────────
+    def _visible(self, delta: str, channel: str) -> str:
+        """Filtert Code-Fences aus content-Deltas heraus (nur dort). Bei
+        Reasoning wird ungefiltert beobachtet."""
+        if channel != "content":
+            return delta
+        if ("`" not in delta and not self._fence_rem and not self._in_fence):
+            return delta
+        data = self._fence_rem + delta
+        self._fence_rem = ""
+        out: List[str] = []
+        idx = 0
+        while idx < len(data):
+            nl = data.find("\n", idx)
+            if nl == -1:
+                self._fence_rem = data[idx:]  # unfertige Zeile merken
+                break
+            line = data[idx:nl + 1]
+            idx = nl + 1
+            if line.strip().startswith("```"):
+                self._in_fence = not self._in_fence
+                continue
+            if not self._in_fence:
+                out.append(line)
+        return "".join(out)
+
+    def _update_sentences(self, visible: str) -> Optional[Dict[str, Any]]:
+        data = self._sent_buf + visible
+        parts = re.split(r"(?<=[.!?\n])\s+", data)
+        self._sent_buf = parts.pop() if parts else ""
+        last_sig = ""
+        for part in parts:
+            sig = _normalize_for_loop(part)
+            if len(sig) < LOOP_GUARD_SENTENCE_MIN:
+                continue
+            self._sentence_counts[sig] = self._sentence_counts.get(sig, 0) + 1
+            last_sig = sig
+        if last_sig and self._sentence_counts.get(last_sig, 0) >= LOOP_GUARD_REPEATS:
+            return {"kind": "sentence", "count": self._sentence_counts[last_sig],
+                    "snippet": last_sig[:80]}
+        return None
+
+    def _update_paragraphs(self, visible: str) -> Optional[Dict[str, Any]]:
+        data = self._para_buf + visible
+        paras = re.split(r"\n\s*\n", data)
+        self._para_buf = paras.pop() if paras else ""
+        last_sig = ""
+        for para in paras:
+            sig = _normalize_for_loop(para)
+            if len(sig) < LOOP_GUARD_PARAGRAPH_MIN:
+                continue
+            self._paragraph_counts[sig] = self._paragraph_counts.get(sig, 0) + 1
+            last_sig = sig
+        if (last_sig
+                and self._paragraph_counts.get(last_sig, 0) >= LOOP_GUARD_PARAGRAPH_REPEATS):
+            return {"kind": "paragraph", "count": self._paragraph_counts[last_sig],
+                    "snippet": last_sig[:80]}
+        return None
+
+    def _check_periodic(self) -> Optional[Dict[str, Any]]:
+        """Erkennt einen periodischen Tail: die letzten p Zeichen wiederholen
+        sich >= R mal unmittelbar am Textende. Fängt Loops ohne Satzzeichen
+        oder Leerzeilen (z. B. wiederholte JSON-Fragmente, Token-Spam)."""
+        R = max(2, LOOP_GUARD_NGRAM_REPEATS)
+        min_p = max(8, LOOP_GUARD_NGRAM_CHARS // 4)
+        tail_cap = max(LOOP_GUARD_NGRAM_CHARS * R * 4, 400)
+        s = self.text[-tail_cap:]
+        if len(s) < min_p * R:
+            return None
+        max_p = len(s) // R
+        for p in range(min_p, max_p + 1):
+            chunk = s[-p:]
+            # Trivial-Wiederholungen (z. B. "aaaa", "----", "    ") ignorieren.
+            if len(set(chunk)) < 3:
+                continue
+            if s.endswith(chunk * R):
+                return {"kind": "ngram", "count": R,
+                        "snippet": _normalize_for_loop(chunk)[:80]}
+        return None
+
+    # ── oeffentliche API ──────────────────────────────────────────────
+    def feed(self, delta: str, channel: str = "content") -> Optional[Dict[str, Any]]:
+        if not self.enabled or not delta or self._hit:
+            return None
+        visible = self._visible(delta, channel)
+        if not visible:
+            return None
+        self.text += visible
+        # Zaehler IMMER aktualisieren (auch unter der Mindestlaenge) — sonst
+        # gehen Wiederholungen verloren, die vor dem Limit aufgebaut wurden.
+        hit = self._update_sentences(visible)
+        if hit is None:
+            hit = self._update_paragraphs(visible)
+        if (hit is None and len(self.text) >= self.min_chars
+                and len(self.text) - self._last_periodic_len >= max(16, LOOP_GUARD_NGRAM_CHARS // 2)):
+            self._last_periodic_len = len(self.text)
+            hit = self._check_periodic()
+        if hit is None or len(self.text) < self.min_chars:
+            return None
+        self._hit = True
+        return hit
+
+    def snapshot(self) -> str:
+        """Akkumulierter sichtbarer Text (fuer Trimmen/Fallback)."""
+        return self.text
+
+
 # ── Laguna-S-2.1 Modell-Erkennung ─────────────────────────────────────────
 # Loop-Schutz (Read/Search/Generic/Response) und Sampling-Patches gelten
 # ausschliesslich fuer Laguna-S-2.1 Modelle — egal ob local oder cloud,
@@ -776,6 +976,32 @@ def _apply_config_file() -> None:
     REASONING_CAP_MODE = str(cfg.get("tokens", {}).get("reasoning_cap_mode", REASONING_CAP_MODE)).strip().lower()
     REASONING_CAP_MAX_RESTARTS = int(cfg.get("tokens", {}).get(
         "reasoning_cap_max_restarts", REASONING_CAP_MAX_RESTARTS))
+
+    global LOOP_GUARD_ENABLED, LOOP_GUARD_MODE, LOOP_GUARD_MAX_RESTARTS
+    global LOOP_GUARD_MIN_CHARS, LOOP_GUARD_SENTENCE_MIN, LOOP_GUARD_REPEATS
+    global LOOP_GUARD_WINDOW, LOOP_GUARD_PARAGRAPH_MIN, LOOP_GUARD_PARAGRAPH_REPEATS
+    global LOOP_GUARD_NGRAM_CHARS, LOOP_GUARD_NGRAM_REPEATS, LOOP_GUARD_HINT
+    LOOP_GUARD_ENABLED = bool(cfg.get("tokens", {}).get("loop_guard_enabled", LOOP_GUARD_ENABLED))
+    LOOP_GUARD_MODE = str(cfg.get("tokens", {}).get("loop_guard_mode", LOOP_GUARD_MODE)).strip().lower()
+    LOOP_GUARD_MAX_RESTARTS = int(cfg.get("tokens", {}).get(
+        "loop_guard_max_restarts", LOOP_GUARD_MAX_RESTARTS))
+    LOOP_GUARD_MIN_CHARS = int(cfg.get("tokens", {}).get(
+        "loop_guard_min_chars", LOOP_GUARD_MIN_CHARS))
+    LOOP_GUARD_SENTENCE_MIN = int(cfg.get("tokens", {}).get(
+        "loop_guard_sentence_min", LOOP_GUARD_SENTENCE_MIN))
+    LOOP_GUARD_REPEATS = int(cfg.get("tokens", {}).get("loop_guard_repeats", LOOP_GUARD_REPEATS))
+    LOOP_GUARD_WINDOW = int(cfg.get("tokens", {}).get("loop_guard_window", LOOP_GUARD_WINDOW))
+    LOOP_GUARD_PARAGRAPH_MIN = int(cfg.get("tokens", {}).get(
+        "loop_guard_paragraph_min", LOOP_GUARD_PARAGRAPH_MIN))
+    LOOP_GUARD_PARAGRAPH_REPEATS = int(cfg.get("tokens", {}).get(
+        "loop_guard_paragraph_repeats", LOOP_GUARD_PARAGRAPH_REPEATS))
+    LOOP_GUARD_NGRAM_CHARS = int(cfg.get("tokens", {}).get(
+        "loop_guard_ngram_chars", LOOP_GUARD_NGRAM_CHARS))
+    LOOP_GUARD_NGRAM_REPEATS = int(cfg.get("tokens", {}).get(
+        "loop_guard_ngram_repeats", LOOP_GUARD_NGRAM_REPEATS))
+    lg_hint = cfg.get("tokens", {}).get("loop_guard_hint", "")
+    if lg_hint:
+        LOOP_GUARD_HINT = str(lg_hint)
 
     global READ_LOOP_THRESHOLD, READ_LOOP_INTERVENTION
     global READ_LOOP_FILE_THRESHOLD, READ_LOOP_FILE_WINDOW, READ_LOOP_FILE_KEEP
@@ -3823,6 +4049,11 @@ async def _cw_stream_round(sess: Dict[str, Any], queue: asyncio.Queue,
     status = "failed"
     err_text = "unbekannter Fehler"
     header_sent = False
+    # Loop-Guard auch auf den Co-Worker-Output: separate Guards fuer reasoning
+    # und content (der Co-Worker hat einen eigenen Backend-Stream).
+    cw_reason_guard = _TextLoopGuard(enabled=LOOP_GUARD_ENABLED)
+    cw_content_guard = _TextLoopGuard(enabled=LOOP_GUARD_ENABLED)
+    cw_loop_hit: Optional[Dict[str, Any]] = None
 
     async def push_reasoning(rc: str) -> None:
         await queue.put(_format_openai_stream_chunk(
@@ -3848,22 +4079,41 @@ async def _cw_stream_round(sess: Dict[str, Any], queue: asyncio.Queue,
                 rc = _extract_reasoning_from_delta(delta)
                 if rc:
                     has_explicit_reasoning = True
-                    await push_reasoning(rc)
+                    if cw_loop_hit is None:
+                        cw_loop_hit = cw_reason_guard.feed(rc, "reasoning")
+                    if cw_loop_hit is None:
+                        await push_reasoning(rc)
                 tcd = delta.get("tool_calls")
                 if isinstance(tcd, list) and tcd:
                     _accumulate_stream_tool_calls(tc_state, tcd)
                 c = delta.get("content")
                 if isinstance(c, str) and c:
                     if has_explicit_reasoning:
-                        content_parts.append(c)
-                        await push_content(c)
+                        if cw_loop_hit is None:
+                            cw_loop_hit = cw_content_guard.feed(c, "content")
+                        if cw_loop_hit is None:
+                            content_parts.append(c)
+                            await push_content(c)
                     else:
                         rp, cp = _split_think_chunk(c, think_state)
                         if rp:
-                            await push_reasoning(rp)
+                            if cw_loop_hit is None:
+                                cw_loop_hit = cw_reason_guard.feed(rp, "reasoning")
+                            if cw_loop_hit is None:
+                                await push_reasoning(rp)
                         if cp:
-                            content_parts.append(cp)
-                            await push_content(cp)
+                            if cw_loop_hit is None:
+                                cw_loop_hit = cw_content_guard.feed(cp, "content")
+                            if cw_loop_hit is None:
+                                content_parts.append(cp)
+                                await push_content(cp)
+                if cw_loop_hit is not None:
+                    # Loop erkannt: Backend-Stream des Co-Workers intern abbrechen.
+                    _log(f"CW-Tunnel {sid}: Loop-Guard Treffer "
+                         f"({cw_loop_hit.get('kind')} x{cw_loop_hit.get('count')}) — "
+                         f"Stream abgebrochen")
+                    status = "loop"
+                    break
             elif ev_type == "usage":
                 pass  # interne Co-Worker-Usage: nicht an den Client
             elif ev_type == "done":
@@ -3872,7 +4122,7 @@ async def _cw_stream_round(sess: Dict[str, Any], queue: asyncio.Queue,
                 err_text = ev.get("content") or err_text
                 status = "failed"
                 break
-        if think_state.get("pending"):
+        if status != "loop" and think_state.get("pending"):
             pending = think_state.pop("pending", "")
             if think_state.get("in_think"):
                 await push_reasoning(pending)
@@ -3888,6 +4138,17 @@ async def _cw_stream_round(sess: Dict[str, Any], queue: asyncio.Queue,
 
     content = "".join(content_parts).strip()
     tool_calls = _finalize_stream_tool_calls(tc_state) if status == "ok" else None
+
+    # ── Loop-Guard-Treffer: trailing Wiederholung trimmen, Runde sauber
+    #    abschliessen (kein Fehler, keine Endlos-Wiederholung). ──
+    if status == "loop":
+        content = _trim_looping_tail(content)
+        _cw_append_assistant_round(sess, content, [])
+        sess["done"] = True
+        sess["final"] = content or "(Loop-Guard: wiederholter Co-Worker-Output verworfen)"
+        _log(f"CW-Tunnel {sid}: Loop-Guard — Runde beendet "
+             f"({cw_loop_hit.get('kind')} x{cw_loop_hit.get('count')})")
+        return
 
     if status == "ok" and tool_calls and sess["rounds"] < COWORKER_AGENT_MAX_ROUNDS:
         _cw_append_assistant_round(sess, content, tool_calls)
@@ -4625,6 +4886,70 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
                 "Subagenten in deinem Text."
             )
             msgs.append({"role": "user", "content": reminder})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Text-Loop-Guard ── Non-Streaming / 2-Pass-Wrapper
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _detect_text_loop(text: str, channel: str = "content") -> Optional[Dict[str, Any]]:
+    """Prueft einen fertigen Text (non-streaming Antwort) auf Wiederholungen.
+    Gibt das Loop-dict zurueck oder None. Fuer Cloud-Kategorien und den
+    2-Pass-Pfad, wo kein inkrementeller Stream-Guard laeuft."""
+    if not LOOP_GUARD_ENABLED or not text:
+        return None
+    g = _TextLoopGuard(enabled=True)
+    # In groesseren Bloecken fuettern, damit Satz-/Absatzgrenzen erkannt werden.
+    step = max(1, LOOP_GUARD_NGRAM_CHARS)
+    for i in range(0, len(text), step):
+        hit = g.feed(text[i:i + step], channel)
+        if hit:
+            return hit
+    return None
+
+
+async def _outcome_with_loop_guard(body: Dict[str, Any], category: str,
+                                   force_start_idx: Optional[int],
+                                   use_delegation: bool) -> Dict[str, Any]:
+    """Ruft das Modell auf und prueft die fertige Antwort auf Text-Loops.
+    Bei Treffer wird (Modus=restart) EIN Re-Call mit Anti-Loop-Hinweis
+    gestartet — der Client sieht davon nichts. Der Reasoning-Cap bleibt als
+    separater Backstop unveraendert aktiv."""
+    async def _call() -> Dict[str, Any]:
+        if use_delegation:
+            return await _delegation_loop(body, category, force_start_idx=force_start_idx)
+        return await _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
+
+    outcome = await _call()
+    if (not LOOP_GUARD_ENABLED or LOOP_GUARD_MODE != "restart"
+            or LOOP_GUARD_MAX_RESTARTS <= 0):
+        return outcome
+
+    for _ in range(LOOP_GUARD_MAX_RESTARTS):
+        result = outcome.get("result", {}) or {}
+        if result.get("tool_calls"):
+            return outcome
+        content = result.get("content") or ""
+        hit = _detect_text_loop(content, "content")
+        if not hit:
+            return outcome
+        hint = LOOP_GUARD_HINT.format(kind=hit.get("kind", "text"),
+                                      count=hit.get("count", LOOP_GUARD_REPEATS))
+        msgs = body.get("messages")
+        if isinstance(msgs, list):
+            msgs.append({"role": "user", "content": hint})
+        _log(f"Loop-Guard (non-stream): Wiederholung erkannt "
+             f"({hit.get('kind')} x{hit.get('count')}, "
+             f"snippet={hit.get('snippet','')[:60]!r}) — Re-Call mit Anti-Loop-Hinweis")
+        outcome = await _call()
+
+    result = outcome.get("result", {}) or {}
+    if not result.get("tool_calls"):
+        trimmed = _trim_looping_tail(result.get("content") or "")
+        if trimmed != (result.get("content") or ""):
+            result["content"] = trimmed
+            _log("Loop-Guard (non-stream): Restarts erschoepft — Content getrimmt")
+    return outcome
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -5777,11 +6102,11 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
                      "X-Accel-Buffering": "no"},
         )
 
-    # Non-Streaming: Fallback-Chain nutzen (mit Co-Worker-Delegation bei local)
-    if category == "local":
-        outcome = await _delegation_loop(body, category, force_start_idx=force_start_idx)
-    else:
-        outcome = await _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
+    # Non-Streaming: Fallback-Chain nutzen (mit Co-Worker-Delegation bei local).
+    # Der Loop-Guard prueft die fertige Antwort und startet bei Wiederholung
+    # einen internen Re-Call (fuer den Client unsichtbar).
+    outcome = await _outcome_with_loop_guard(
+        body, category, force_start_idx, use_delegation=(category == "local"))
     result = outcome.get("result", {})
     content = result.get("content", "") or ""
     used_model = outcome.get("used_model", active_model)
@@ -5844,8 +6169,10 @@ async def _stream_events(body: Dict[str, Any], category: str,
 
     # Backend-Call als Task starten, damit wir nebenbei Keepalives senden koennen.
     # (Nur fuer Nicht-Local-Kategorien; local nutzt _stream_local_events oben.)
+    # Loop-Guard: fertige Antwort wird auf Wiederholungen geprueft und bei
+    # Treffer intern ein Re-Call mit Anti-Loop-Hinweis gestartet.
     backend_task = asyncio.ensure_future(
-        _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
+        _outcome_with_loop_guard(body, category, force_start_idx, use_delegation=False)
     )
 
     try:
@@ -6651,8 +6978,18 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
     restarts_left = REASONING_CAP_MAX_RESTARTS if cap_mode == "restart" else 0
     is_restart_turn = False  # True ab dem 2. Anlauf (Thinking dann erzwungen AUS)
 
+    # ── Text-Loop-Guard ──────────────────────────────────────────────
+    # Modell-agnostische Erkennung von Satz-/Absatz-/N-Gramm-Wiederholungen
+    # im laufenden Stream. Ein Treffer bricht den Backend-Stream intern ab
+    # und startet einen Folgeturn mit Anti-Loop-Hinweis (VS Code merkt nichts).
+    loop_mode = LOOP_GUARD_MODE if LOOP_GUARD_MODE in ("restart", "note") else "restart"
+    loop_restarts_left = LOOP_GUARD_MAX_RESTARTS if loop_mode == "restart" else 0
+    loop_guard: Optional[_TextLoopGuard] = (
+        _TextLoopGuard(enabled=True) if LOOP_GUARD_ENABLED else None)
+
     while True:
         restart_requested = False
+        restart_reason = ""  # "reasoning-cap" | "loop-guard"
         # Transient-Reset je Turn — content bleibt ueber Restarts hinweg erhalten
         # (die abgebrochene Reasoning-Phase hat typischerweise noch keinen content).
         saved_content = state.get("content", "")
@@ -6666,6 +7003,9 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
         state["content"] = saved_content
         think_state: Dict[str, Any] = {"in_think": False, "pending": ""}
         cap_triggered = False
+        loop_hit: Optional[Dict[str, Any]] = None
+        if loop_guard is not None:
+            loop_guard = _TextLoopGuard(enabled=True)
 
         start_idx = force_start_idx if force_start_idx is not None else _CATEGORY_ACTIVE_IDX.get(category, 0)
         if start_idx >= len(defs):
@@ -6772,6 +7112,7 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
                              f"{reasoning_cap} chars) — Modus={cap_mode}")
                         if cap_mode == "restart":
                             restart_requested = True
+                            restart_reason = "reasoning-cap"
                             break
                         yield _format_openai_stream_chunk(
                             state.get("model", category), content=REASONING_CAP_NOTE,
@@ -6779,10 +7120,26 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
                             chunk_id=state.get("stream_id"))
                         state["role_sent"] = True
 
+                # ── Loop-Guard auf reasoning_content ──
+                if rc and loop_guard is not None and loop_hit is None:
+                    loop_hit = loop_guard.feed(rc, "reasoning")
+                    if loop_hit and loop_mode == "restart":
+                        # Immer abbrechen — der Restart-Block entscheidet, ob
+                        # ein Folgeturn startet oder der Turn sauber endet.
+                        restart_requested = True
+                        restart_reason = "loop-guard"
+                        break
+
                 c = delta.get("content")
                 if isinstance(c, str) and c:
                     if state.get("has_explicit_reasoning"):
                         # Backend liefert Reasoning in eigenem Feld → content unveraendert
+                        if loop_guard is not None and loop_hit is None:
+                            loop_hit = loop_guard.feed(c, "content")
+                            if loop_hit and loop_mode == "restart":
+                                restart_requested = True
+                                restart_reason = "loop-guard"
+                                break
                         state["content"] = (state.get("content") or "") + c
                         yield _format_openai_stream_chunk(
                             state.get("model", category), content=c,
@@ -6809,13 +7166,28 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
                                      f"{reasoning_cap} chars, <think>-Block) — Modus={cap_mode}")
                                 if cap_mode == "restart":
                                     restart_requested = True
+                                    restart_reason = "reasoning-cap"
                                     break
                                 yield _format_openai_stream_chunk(
                                     state.get("model", category), content=REASONING_CAP_NOTE,
                                     include_role=not state.get("role_sent"),
                                     chunk_id=state.get("stream_id"))
                                 state["role_sent"] = True
+                            # Loop-Guard auf den <think>-Anteil
+                            if loop_guard is not None and loop_hit is None:
+                                loop_hit = loop_guard.feed(reasoning_part, "reasoning")
+                                if loop_hit and loop_mode == "restart":
+                                    restart_requested = True
+                                    restart_reason = "loop-guard"
+                                    break
                         if content_part:
+                            # Loop-Guard auf den sichtbaren Antwort-Anteil
+                            if loop_guard is not None and loop_hit is None:
+                                loop_hit = loop_guard.feed(content_part, "content")
+                                if loop_hit and loop_mode == "restart":
+                                    restart_requested = True
+                                    restart_reason = "loop-guard"
+                                    break
                             state["content"] = (state.get("content") or "") + content_part
                             yield _format_openai_stream_chunk(
                                 state.get("model", category), content=content_part,
@@ -6843,6 +7215,31 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+
+        # ── Restart-Mode: abgebrochenen Turn mit Anti-Loop-Hinweis neu starten ──
+        if restart_requested and restart_reason == "loop-guard":
+            if loop_restarts_left > 0:
+                loop_restarts_left -= 1
+                hint = LOOP_GUARD_HINT.format(
+                    kind=(loop_hit or {}).get("kind", "text"),
+                    count=(loop_hit or {}).get("count", LOOP_GUARD_REPEATS))
+                msgs = body.get("messages")
+                if isinstance(msgs, list):
+                    msgs.append({"role": "user", "content": hint})
+                is_restart_turn = True  # ab jetzt Thinking erzwungen AUS
+                _log(f"Loop-Guard: Wiederholung erkannt ({(loop_hit or {}).get('kind')} "
+                     f"x{(loop_hit or {}).get('count')}, "
+                     f"snippet={(loop_hit or {}).get('snippet','')[:60]!r}) — "
+                     f"Backend-Stream abgebrochen, Folgeturn mit Anti-Loop-Hinweis "
+                     f"(Restarts uebrig={loop_restarts_left})")
+                continue
+            # Restarts erschoepft: trailing Wiederholung aus dem content trimmen
+            # und den Turn sauber beenden (kein endloser Loop, kein Fehler).
+            trimmed = _trim_looping_tail(state.get("content") or "")
+            if trimmed != (state.get("content") or ""):
+                state["content"] = trimmed
+            _log("Loop-Guard: Restarts erschoepft — Turn mit getrimmtem Content beendet")
+            break
 
         # ── Restart-Mode: abgebrochenen Turn mit Anti-Loop-Hinweis neu starten ──
         if restart_requested and restarts_left > 0:
