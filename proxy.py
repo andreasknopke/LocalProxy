@@ -385,6 +385,12 @@ LOCAL_PRESERVE_THINKING: bool = os.getenv("LOCAL_PRESERVE_THINKING", "true").low
 # originalen VSCode-Request. "none" = kein Reasoning (Feld wird entfernt).
 LOCAL_THINKING_MODE: str = os.getenv("LOCAL_THINKING_MODE", "none").strip().lower()
 _VALID_THINKING_MODES = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+# Thinking-OFF-Schalter Worker (Kategorie 'local'): ignoriert ALLE Thinking-
+# Parameter aus dem Client-Request UND der LOCAL_THINKING_MODE-Konfiguration
+# und erzwingt Reasoning AUS (reasoning_effort entfernt,
+# chat_template_kwargs.enable_thinking=false). Der Schalter steht ueber allem,
+# damit ein Denk-Modell auf Zuruf deterministisch stumm antwortet.
+LOCAL_THINKING_OFF: bool = os.getenv("LOCAL_THINKING_OFF", "false").lower() in {"1", "true", "yes", "y", "on"}
 # Anti-Loop-System-Prompt: wird als zusaetzliche System-Message injiziert
 LOCAL_ANTI_LOOP_SYSTEM_PROMPT: str = os.getenv(
     "LOCAL_ANTI_LOOP_SYSTEM_PROMPT",
@@ -490,7 +496,10 @@ RESPONSE_LOOP_REDIRECT_TEXT: str = os.getenv(
 COWORKER_ENABLED: bool = os.getenv("COWORKER_ENABLED", "true").lower() in {"1", "true", "yes", "y", "on"}
 COWORKER_MAX_DELEGATIONS: int = int(os.getenv("COWORKER_MAX_DELEGATIONS", "2"))
 COWORKER_TASK_CAP: int = int(os.getenv("COWORKER_TASK_CAP", "8000"))
-COWORKER_RESULT_CAP: int = int(os.getenv("COWORKER_RESULT_CAP", "12000"))
+# Ergebnis-Cap: 0 = aus. DEFAULT AUS (Evidenz 2026-08-29): bei Code-Auftraegen
+# kappte 12000 die Lieferung mitten in der Zeile (len=12011, '…[gekappt]') —
+# fuer das Hauptmodell unbrauchbar, fuehrte zu Nachfragen statt Weiterarbeit.
+COWORKER_RESULT_CAP: int = int(os.getenv("COWORKER_RESULT_CAP", "0"))
 # Automatisch angehaengter Datei-Kontext (VS-Code-Attachments + Tool-Ergebnisse)
 # fuer ask_coworker-Calls: Budget in Zeichen, 0 = deaktiviert.
 COWORKER_FILES_CAP: int = int(os.getenv("COWORKER_FILES_CAP", "60000"))
@@ -512,13 +521,40 @@ COWORKER_BG_TTL: float = float(os.getenv("COWORKER_BG_TTL", "1800"))
 # es an den Co-Worker delegiert. Ohne diesen Hinweis delegiert das Modell in
 # der Praxis nie — Tool-Beschreibungen allein aendern das Verhalten nicht.
 COWORKER_TEACH_DELEGATION: bool = os.getenv("COWORKER_TEACH_DELEGATION", "true").lower() in {"1", "true", "yes", "y", "on"}
+# Praefix-Sharing: den automatisch angehaengten Datei-Kontext VOR die Task-
+# Instruction setzen. Parallele Co-Worker-Tasks teilen sich dann einen
+# byte-identischen Praefix (system + Dateien) und unterscheiden sich nur in
+# den letzten paar hundert Token -> SGLang RadixAttention / vLLM Prefix-Cache
+# rechnen den teuren Prefill EINMAL statt pro Task. Nur sinnvoll, wenn mehrere
+# Tasks denselben Datei-Kontext bekommen (dispatch-Fan-out innerhalb eines
+# Requests) — genau dort berechnet der Loop files_context ohnehin einmalig.
+COWORKER_FILES_FIRST: bool = os.getenv("COWORKER_FILES_FIRST", "true").lower() in {"1", "true", "yes", "y", "on"}
+# Driver/Experte-Rollenmodell: die Guidance bringt dem Hauptmodell bei, ALS
+# SCHNELLER TREIBER zu arbeiten (eigene Tools, viele Turns) und den teuren
+# Experten nur fuer dichten Code-Inhalt zu rufen. Ohne diesen Modus lehrt die
+# Guidance das Gegenteil (moeglichst viel delegieren).
+COWORKER_DRIVER_MODE: bool = os.getenv("COWORKER_DRIVER_MODE", "false").lower() in {"1", "true", "yes", "y", "on"}
+# Deterministischer Zweitter Trigger neben manage_todo_list. Evidenz
+# (2026-08-28): ein 30B-Treiber hat einen Auftrag ("complete 3D horror game in
+# a single HTML file") ohne einen einzigen Tool-Call behandelt und den Code in
+# den Antwort-Text geschrieben. System-Praambel-Guidance wirkt bei solchen
+# Modellen nicht zuverlaessig — ein Hinweis DIREKT AN der User-Message steht am
+# Ende des Prompts und wiegt damit am meisten. Erkennung ist rein syntaktisch.
+COWORKER_BIG_BUILD_NUDGE: bool = os.getenv(
+    "COWORKER_BIG_BUILD_NUDGE", "true").lower() in {"1", "true", "yes", "y", "on"}
 # Deterministische Verteilung: Sobald das Hauptmodell per manage_todo_list eine
 # Task-Liste anlegt, verteilt der Proxy alle 'not-started' Todos AUTOMATISCH an
 # den Co-Worker — unabhaengig davon, ob das Hauptmodell die Co-Worker-Tools
 # selbst aufruft. Prompt-Injection allein ist NICHT deterministisch (lokale
 # Modelle delegieren in der Praxis nie); der Trigger ist hier ein parsebarer
 # Tool-Call (manage_todo_list), nicht die freie Modell-Entscheidung.
-COWORKER_AUTO_DISPATCH: bool = os.getenv("COWORKER_AUTO_DISPATCH", "true").lower() in {"1", "true", "yes", "y", "on"}
+# DEFAULT AUS (Evidenz 2026-08-29, proxy.opnwork.de): der Trigger ist zu stumpf —
+# er verteilt auch unmoegliche Tasks ('Browser playtest', 'Headless smoke test')
+# an einen Tool-losen Co-Worker (client_tools=0), erzeugt Duplikate bei leicht
+# abweichenden Titeln und beschallt das Hauptmodell mit Status-Notizen. Der
+# Co-Worker antwortet dann mit Ausreden statt Code. Explizit aktivieren via
+# COWORKER_AUTO_DISPATCH=true bzw. WebUI-Toggle.
+COWORKER_AUTO_DISPATCH: bool = os.getenv("COWORKER_AUTO_DISPATCH", "false").lower() in {"1", "true", "yes", "y", "on"}
 COWORKER_SYSTEM_PROMPT: str = os.getenv(
     "COWORKER_SYSTEM_PROMPT",
     "You are a co-worker coding model acting as a subagent for planning, code "
@@ -540,6 +576,13 @@ COWORKER_SYSTEM_PROMPT: str = os.getenv(
 # Session geroutet. Kein Runner, keine Relay-Queue: alles durch den Stream.
 COWORKER_AGENT_MODE: bool = os.getenv("COWORKER_AGENT_MODE", "true").lower() in {"1", "true", "yes", "y", "on"}
 COWORKER_AGENT_MAX_ROUNDS: int = int(os.getenv("COWORKER_AGENT_MAX_ROUNDS", "24"))
+# Thinking-OFF-Schalter Co-Worker: gilt fuer ALLE Co-Worker-Pfade (Tunnel-
+# Runden, ask_coworker/Agent-Loop, dispatch-Hintergrund-Tasks) — erzwingt
+# Reasoning AUS unabhaengig davon, was der Client oder SGLang vorschlagen.
+# Grund: ohne --reasoning-parser denkt der Experte ohnehin stumm, aber ein
+# Server MIT Parser verbrauchte Reasoning-Tokens fuer Aufgaben, bei denen
+# nur die Antwort zaehlt (Zeit + max_tokens-Budget).
+COWORKER_THINKING_OFF: bool = os.getenv("COWORKER_THINKING_OFF", "false").lower() in {"1", "true", "yes", "y", "on"}
 # Praefix der getunnelten tool_call_ids (cws_<session>_<origid>)
 CW_TUNNEL_ID_PREFIX: str = "cws_"
 # Wie lange Co-Worker-Sessions/Overlays im Speicher ueberleben (Sekunden).
@@ -803,17 +846,25 @@ def _is_laguna_model(model_name: str) -> bool:
     return bool(model_name and _LAGUNA_MODEL_RE.search(model_name))
 
 
-# ── Qwen-Modell-Erkennung ─────────────────────────────────────────────────
-# Qwen-Reasoning-Modelle (Qwen3 etc.) neigen zu Endlos-Denkschleifen — die
-# Anti-Loop-Sampling-Parameter gelten deshalb fuer ALLE Qwen-Modelle, egal
-# ob local oder coworker, egal welche Groesse/Quantisierung (qwen3.8-26b,
-# Qwen/Qwen3-Next-80B, qwen3-coder, ...).
-_QWEN_MODEL_RE = re.compile(r"qwen", re.IGNORECASE)
+# ── Qwen-Anti-Loop-Modell-Erkennung ───────────────────────────────────────
+# NUR das qwen3.8-26b (DGX Spark, SGLang) zeigt die beobachteten Endlos-
+# Denkschleifen, fuer die die Anti-Loop-Sampling-Parameter gedacht sind.
+# FRUEHER matchte das Muster pauschal "qwen" und hat damit JEDES Qwen-Modell
+# (qwen3-coder, Qwen/Qwen3-Next-80B, Qwen3-VL, ...) auf temp=0.3 / top_p=0.95 /
+# presence_penalty=0.5 gezwungen — die Parameter sind aber eine Massnahme gegen
+# ein spezifisches Modell, nicht gegen die ganze Familie. Deshalb jetzt ein
+# enges Muster auf die 26b-Variante (Schreibweisen mit - _ oder Leerzeichen).
+_QWEN_ANTI_LOOP_MODEL_RE = re.compile(r"qwen[\s._-]*3[\s._-]*8[\s._-]*26[\s._-]*b",
+                                      re.IGNORECASE)
 
 
-def _is_qwen_model(model_name: str) -> bool:
-    """True wenn der Modellname ein Qwen-Modell ist (case-insensitive)."""
-    return bool(model_name and _QWEN_MODEL_RE.search(model_name))
+def _is_qwen_anti_loop_model(model_name: str) -> bool:
+    """True wenn das Modell die Qwen-Anti-Loop-Parameter braucht (case-insensitive).
+
+    Trifft NUR auf qwen3.8-26b (und Schreibvarianten qwen3.8_26b, qwen3.8 26b)
+    zu — NICHT auf andere Qwen-Modelle wie qwen3-coder oder Qwen3-Next-80B.
+    """
+    return bool(model_name and _QWEN_ANTI_LOOP_MODEL_RE.search(model_name))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1046,6 +1097,8 @@ def _apply_config_file() -> None:
     global COWORKER_DISPATCH_CAP, COWORKER_BG_TTL
     global COWORKER_SYSTEM_PROMPT, COWORKER_TEACH_DELEGATION
     global COWORKER_AUTO_DISPATCH
+    global COWORKER_FILES_FIRST, COWORKER_DRIVER_MODE
+    global COWORKER_BIG_BUILD_NUDGE, COWORKER_THINKING_OFF
     cw = tokens_cfg.get("coworker", {})
     if isinstance(cw, dict) and cw:
         COWORKER_ENABLED = bool(cw.get("enabled", COWORKER_ENABLED))
@@ -1061,6 +1114,10 @@ def _apply_config_file() -> None:
         COWORKER_BG_TTL = float(cw.get("bg_ttl_seconds", COWORKER_BG_TTL))
         COWORKER_TEACH_DELEGATION = bool(cw.get("teach_delegation", COWORKER_TEACH_DELEGATION))
         COWORKER_AUTO_DISPATCH = bool(cw.get("auto_dispatch", COWORKER_AUTO_DISPATCH))
+        COWORKER_FILES_FIRST = bool(cw.get("files_first", COWORKER_FILES_FIRST))
+        COWORKER_DRIVER_MODE = bool(cw.get("driver_mode", COWORKER_DRIVER_MODE))
+        COWORKER_BIG_BUILD_NUDGE = bool(cw.get("big_build_nudge", COWORKER_BIG_BUILD_NUDGE))
+        COWORKER_THINKING_OFF = bool(cw.get("thinking_off", COWORKER_THINKING_OFF))
         cw_prompt = cw.get("system_prompt", "")
         if cw_prompt:
             COWORKER_SYSTEM_PROMPT = str(cw_prompt)
@@ -1072,7 +1129,7 @@ def _apply_config_file() -> None:
     global LOCAL_DRY_MULTIPLIER, LOCAL_DRY_BASE, LOCAL_DRY_ALLOWED_LENGTH
     global LOCAL_DRY_PENALTY_LAST_N, LOCAL_DRY_SEQUENCE_BREAKER
     global LOCAL_ENABLE_THINKING, LOCAL_PRESERVE_THINKING, LOCAL_THINKING_MODE
-    global LOCAL_ANTI_LOOP_SYSTEM_PROMPT
+    global LOCAL_THINKING_OFF, LOCAL_ANTI_LOOP_SYSTEM_PROMPT
     local_cfg = tokens_cfg.get("local_sampling", {})
     if isinstance(local_cfg, dict) and local_cfg:
         LOCAL_TEMPERATURE = float(local_cfg.get("temperature", LOCAL_TEMPERATURE))
@@ -1088,6 +1145,7 @@ def _apply_config_file() -> None:
         LOCAL_PRESERVE_THINKING = bool(local_cfg.get("preserve_thinking", LOCAL_PRESERVE_THINKING))
         tm = str(local_cfg.get("thinking_mode", LOCAL_THINKING_MODE)).strip().lower()
         LOCAL_THINKING_MODE = tm if tm in _VALID_THINKING_MODES else "none"
+        LOCAL_THINKING_OFF = bool(local_cfg.get("thinking_off", LOCAL_THINKING_OFF))
         al_prompt = local_cfg.get("anti_loop_system_prompt", "")
         if al_prompt:
             LOCAL_ANTI_LOOP_SYSTEM_PROMPT = str(al_prompt)
@@ -2633,6 +2691,30 @@ def _patch_thinking_mode_payload(payload: Dict[str, Any]) -> None:
     _log(f"Thinking-Mode '{mode}' angewendet (reasoning_effort war: {old!r})")
 
 
+def _force_thinking_off_payload(payload: Dict[str, Any], label: str) -> None:
+    """Erzwingt Thinking AUS — ueberschreibt ALLES andere (Client-Request,
+    LOCAL_THINKING_MODE, Reasoning-Restart-Patches).
+
+    Entfernt reasoning_effort und setzt chat_template_kwargs auf
+    enable_thinking=false / preserve_thinking=false (Qwen3-/vLLM-/SGLang-
+    Templates respektieren das). Wird von den Thinking-OFF-Schaltern fuer
+    Worker (local) und Co-Worker aufgerufen.
+    """
+    removed = []
+    if "reasoning_effort" in payload:
+        removed.append(f"reasoning_effort={payload.pop('reasoning_effort')!r}")
+    if "reasoning" in payload:
+        removed.append(f"reasoning={payload.pop('reasoning')!r}")
+    ctk = payload.get("chat_template_kwargs")
+    if not isinstance(ctk, dict):
+        ctk = {}
+        payload["chat_template_kwargs"] = ctk
+    ctk["enable_thinking"] = False
+    ctk["preserve_thinking"] = False
+    _log(f"Thinking-OFF ({label}): Reasoning erzwungen aus"
+         + (f" ({', '.join(removed)})" if removed else ""))
+
+
 def _clean_payload(payload: Dict[str, Any], keep_tools: bool = False,
                    keep_top_k: bool = False) -> Dict[str, Any]:
     if not payload.get("stream") and "stream_options" in payload:
@@ -2706,9 +2788,9 @@ def _patch_local_sampling_payload(payload: Dict[str, Any]) -> None:
 
 
 # ── Qwen-Anti-Loop-Sampling ────────────────────────────────────────────────
-# Qwen-Reasoning-Modelle (z.B. qwen3.8-26b) neigen zu Endlos-Denkschleifen.
-# Als Anti-Loop-Strategie werden fuer Qwen-Modelle — lokal UND Coworker —
-# IMMER folgende Parameter erzwungen, egal was der VS-Code-Client sendet:
+# Das qwen3.8-26b neigt zu Endlos-Denkschleifen. Als Anti-Loop-Strategie
+# werden fuer DIESES Modell — lokal UND Coworker — IMMER folgende Parameter
+# erzwungen, egal was der VS-Code-Client sendet:
 #   temperature=0.3, presence_penalty=0.5, top_p=0.95
 # (presence_penalty=1.5 bestrafte strukturierte Tool-Call-JSON-Feldnamen
 #  wie "command"/"path"/"content" und fuehrte dazu, dass das Modell den Code
@@ -2719,13 +2801,14 @@ _QWEN_ANTI_LOOP_TOP_P: float = 0.95
 
 
 def _patch_qwen_anti_loop_payload(payload: Dict[str, Any], model_name: str) -> None:
-    """Erzwingt Qwen-Anti-Loop-Sampling — NUR wenn model_name ein Qwen-Modell ist.
+    """Erzwingt Qwen-Anti-Loop-Sampling — NUR fuer das qwen3.8-26b.
 
     Wie der fruehere Moonshot-Patch: ueberschreibt die vom Client gesendeten
     Sampling-Parameter hart mit den Anti-Loop-Werten (temp=0.3,
     presence_penalty=0.5, top_p=0.95) und loggt die Aenderungen.
+    Andere Qwen-Modelle (qwen3-coder, Qwen3-Next-80B, ...) bleiben unangetastet.
     """
-    if not _is_qwen_model(model_name):
+    if not _is_qwen_anti_loop_model(model_name):
         return
     fixes = []
     cur = payload.get("temperature")
@@ -2814,18 +2897,35 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
         }
         _log("Reasoning-Restart: enable_thinking=false fuer Folgeturn gesetzt")
 
+    # Thinking-OFF-Schalter (WebUI/Env): steht ABSICHTLICH nach allen anderen
+    # Thinking-Patches, damit der Schalter ueber Client-Request,
+    # LOCAL_THINKING_MODE und Reasoning-Restart gewinnt.
+    if category == "local" and LOCAL_THINKING_OFF:
+        _force_thinking_off_payload(payload, "Worker/local")
+    elif category == "coworker" and COWORKER_THINKING_OFF:
+        # Greift fuer JEDEM Co-Worker-Pfad: Tunnel-Runden (_cw_stream_round),
+        # ask_coworker/Agent-Loop und dispatch-Hintergrund-Tasks laufen alle
+        # ueber _build_passthrough_payload(category="coworker").
+        _force_thinking_off_payload(payload, "Co-Worker")
+
+    # Reihenfolge ist Absicht: ERST [EXECUTION RULES], DANN die
+    # Delegations-Guidance. Beide werden in dieselbe System-Message gemergt, und
+    # am Ende einer Praembel wirkt die LETZTE Anweisung am staerksten — "emit
+    # the write/edit tool calls directly, prefer acting over drafting"
+    # widerspricht dem Delegieren, wenn es zuletzt steht. Evidenz (2026-08-28):
+    # mit EXECUTION RULES zuletzt hat das Treiber-Modell ein ganzes Spiel in den
+    # Antwort-Text geschrieben statt zu delegieren (0 tool_calls im Stream).
+    #
+    # [EXECUTION RULES] nur bei aktiver Delegation (COWORKER_ENABLED) — sonst
+    # pure passthrough. Vom Health-Check bewusst UNABHAENGIG: die Regeln
+    # betreffen das generische write/edit-Tool-Calling, nicht die Delegation.
+    if payload.get("tools") and COWORKER_ENABLED:
+        _inject_tool_execution_guidance(payload)
+
     # Co-Worker-Delegation: ask_coworker-Tool nur bei Kategorie=local + Health-OK
     if category == "local":
         _inject_coworker_tool(payload)
-
-    # Tool-Execution-Guidance: [EXECUTION RULES] nur injizieren, wenn die
-    # Co-Worker-Delegation aktiviert ist (COWORKER_ENABLED) — bei deaktivierter
-    # Delegation bleibt der Prompt unveraendert (pure passthrough). Vom
-    # Co-Worker-Health-Check ist sie bewusst UNABHAENGIG: die Regeln betreffen
-    # das generische write/edit-Tool-Calling des Hauptmodells, nicht die
-    # Delegation, und sollen nicht daran haengen, ob der Co-Worker erreichbar ist.
-    if payload.get("tools") and COWORKER_ENABLED:
-        _inject_tool_execution_guidance(payload)
+        _inject_coworker_nudge(payload)
 
     return _clean_payload(payload, keep_tools=True, keep_top_k=False)
 
@@ -3151,27 +3251,106 @@ _TOOL_EXECUTION_GUIDANCE: str = (
 # Regeln aus dem Fork-Join-Design (Skalier-Lektionen):
 #   triviales → selbst, 1 Task pro Datei/Aspekt im selben Turn, 4-8 fuer
 #   grosse Aufgahaben, dispatch → eigene Arbeit → collect.
+# Treiber/Experte-Variante der Guidance. Rollenbild: das HAUPTMODELL ist der
+# schnelle Treiber (kurze Latenz, hoher Prefill-Durchsatz, viele Tool-Turns),
+# der Co-Worker der langsame aber starke Experte (dichter Code-Content, keine
+# Tools). Die Guidance muss hier das GEGENTEIL lehren als im Default-Modus —
+# sonst delegiert der Treiber jede Kleinigkeit und verliert seinen Latenz-
+# Vorteil, oder er delegiert nie und der Experte idle.
+COWORKER_DRIVER_GUIDANCE_MARKER: str = "[PROXY DRIVER/EXPERT GUIDANCE]"
+
+_COWORKER_NUDGE_MARKER: str = "[PROXY DELEGATION NUDGE]"
+# Syntaktische Erkennung eines Grossbau-Auftrags. ZWEI Achsen muessen
+# zusammentreffen (weniger False Positives als ein einzelnes Muster):
+#   Achse A (Pflicht): ein Schaffens-Verb
+#   Achse B (eine von beiden): ein Umfangs-Wort, oder ein Ganz-Artefakt-Noun
+#     in Verb-Naehe
+# "fix the typo" / "run the full test suite" fuellen Achse A nicht und feuern
+# nicht. Bewusst NICHT "file"/"class"/"tool"/"cli" als Noun — die stecken auch
+# in "rewrite this file", wo der Treiber selbst schreiben soll.
+_COWORKER_BUILD_VERB_RE: "re.Pattern[str]" = re.compile(
+    r"\b(build|create|implement|rewrite|generate|develop|author)\b", re.IGNORECASE)
+_COWORKER_SCOPE_WORD_RE: "re.Pattern[str]" = re.compile(
+    r"\b(complete|full[- ]scale|entire|whole|from scratch|production[- ]ready|"
+    r"all[- ]in[- ]one|thousands of lines)\b", re.IGNORECASE)
+_COWORKER_ARTIFACT_NEAR_VERB_RE: "re.Pattern[str]" = re.compile(
+    r"\b(build|create|implement|rewrite|generate|develop|author)\b.{0,60}"
+    r"\b(game|app|application|engine|framework|system|module|library|"
+    r"website|dashboard|suite|api)\b", re.IGNORECASE | re.DOTALL)
+_COWORKER_NUDGE_TEXT: str = (
+    "\n\n" + _COWORKER_NUDGE_MARKER + "\n"
+    "This request asks for a large body of code (a whole program, file or "
+    "module). Do NOT write it yourself. Call dispatch_coworker first — one "
+    "task per file or aspect, all in this one turn — then use your own tools "
+    "to read files, apply the expert's code and run tests. Writing this "
+    "directly into your answer text produces no file and is a failed turn."
+)
+
+_COWORKER_DRIVER_GUIDANCE_SYSTEM: str = (
+    COWORKER_DRIVER_GUIDANCE_MARKER + "\n"
+    "You are the FAST DRIVER of a two-model team. You run on fast hardware; "
+    "the EXPERT model runs on separate hardware, is much stronger at writing "
+    "large amounts of code, and is reached through ask_coworker / "
+    "dispatch_coworker / collect_coworker — the FIRST tools in your tool list. "
+    "Reaching for them is expected, good work, not an exception: two models "
+    "finish large work faster than you alone.\n"
+    "THE THRESHOLD — count the code you are about to produce:\n"
+    "- Under ~50 lines: write it yourself with your edit tools.\n"
+    "- Roughly 50-200 lines: your call — delegate if you are unsure of the "
+    "shape.\n"
+    "- Over ~200 lines of new or rewritten code: DELEGATE FIRST. A whole "
+    "program, game, module or class, a big refactor, or a 'build me a complete "
+    "X' request is always over this line.\n"
+    "- Several independent files or aspects: dispatch them together in the "
+    "SAME turn (subject to the CAPACITY note below — do not dispatch more "
+    "than actually run in parallel).\n"
+    "WHEN YOU DELEGATE, DO NOT ALSO WRITE THAT CODE YOURSELF. Delegate, then "
+    "use your own tools for what only you can do: read files, run tests, "
+    "inspect output, apply the expert's code. The expert is READ-ONLY and "
+    "TOOL-LESS (works from the files the proxy hands it; it cannot browse the "
+    "workspace live and never writes) and has no view of this conversation. "
+    "It returns complete file content as TEXT, delivered AUTOMATICALLY as a "
+    "[Co-Worker-Ergebnis cw_xxx] message in a following turn — you never need "
+    "collect_coworker; keep working until it arrives.\n"
+    "HOW:\n"
+    "- dispatch_coworker returns a task_id immediately and does NOT block. "
+    "Dispatch first, then keep working — the finished result is PUSHED into "
+    "one of your next turns while you are still productive.\n"
+    "- ask_coworker blocks until the answer arrives; use it when you cannot "
+    "continue without it.\n"
+    "- Put several independent delegations in ONE turn — but only as many as "
+    "actually run in parallel (see the CAPACITY note below); extra tasks just "
+    "queue and you wait sequentially. A batch also shares one prefix cache, so "
+    "it costs less than the same tasks spread over turns.\n"
+    "AFTER an expert answer: apply it with your edit/write tools, then run the "
+    "tests. The expert cannot execute anything, so its code is unverified "
+    "until you verify it."
+)
+
 _COWORKER_GUIDANCE_SYSTEM: str = (
     "[PROXY DELEGATION GUIDANCE]\n"
     "You lead a two-machine team: you run on machine A; a Co-Worker model runs "
-    "on a SEPARATE machine B (own hardware, ~6-10 parallel sessions). It is "
-    "reachable ONLY via the ask_coworker / dispatch_coworker / collect_coworker "
-    "tools. Using it well makes the team much faster — this is expected "
-    "behavior, not an exception.\n"
+    "on a SEPARATE machine B (own hardware). It is reachable ONLY via the "
+    "ask_coworker / dispatch_coworker / collect_coworker tools. Using it well "
+    "makes the team much faster — this is expected behavior, not an exception.\n"
+    "The Co-Worker is READ-ONLY: it inspects the workspace and returns its "
+    "complete file content / analysis as TEXT; YOU are the only writer.\n"
     "WHEN to delegate:\n"
-    "- Multi-file or multi-aspect work: dispatch ONE task per "
-    "file/aspect — all in the SAME turn, not sequentially.\n"
-    "- Large explore/review/refactor jobs: fan out 4-8 tasks, then integrate.\n"
+    "- Multi-file or multi-aspect work: dispatch the independent tasks "
+    "together in the SAME turn (subject to the CAPACITY note below).\n"
+    "- Large explore/review/refactor jobs: fan out tasks, then integrate.\n"
     "- Trivial single-file questions: do them yourself.\n"
     "- A long read/search list: hand the files to the Co-Worker and keep only "
     "a small set for yourself.\n"
     "HOW:\n"
     "- Independent sub-tasks → dispatch_coworker (non-blocking, returns "
-    "task_id immediately), then do your OWN work, then collect_coworker.\n"
+    "task_id immediately), then do your OWN work. You do NOT need "
+    "collect_coworker: the finished result is PUSHED to you automatically as "
+    "a [Co-Worker-Ergebnis cw_xxx] message in a following turn.\n"
     "- Need the answer before continuing → ask_coworker (blocking).\n"
     "- Patterns to avoid: dispatching one task per turn sequentially; "
-    "doing everything yourself while machine B idles; delegating "
-    "trivia.\n"
+    "doing everything yourself while machine B idles; dispatching more tasks "
+    "than actually run in parallel and then waiting; delegating trivia.\n"
     "The proxy automatically attaches the files from this conversation to "
     "every co-worker call — task/context can stay concise."
 )
@@ -3213,6 +3392,49 @@ _COWORKER_TOOL_DEF: Dict[str, Any] = {
 _COWORKER_DISPATCH_TOOL_NAME = "dispatch_coworker"
 _COWORKER_COLLECT_TOOL_NAME = "collect_coworker"
 
+
+def _coworker_capacity_note() -> str:
+    """Wahrheitsgetreue Kapazitaets- und Pipeline-Info fuer den Worker, die
+    zur Injektionszeit die ECHTE Concurrency (COWORKER_MAX_PARALLEL) nennt.
+    Der Worker soll nicht blind 4-8 Tasks dispatchen, wenn nur einer parallel
+    laeuft — und verstehen, dass der Coworker read-only ist und Code im Stream
+    zurueckgibt, den der Worker selbst schreibt."""
+    n = max(1, COWORKER_MAX_PARALLEL)
+    cap = COWORKER_DISPATCH_CAP
+    if n == 1:
+        para = (
+            "Only ONE co-worker task runs at a time, so dispatching several "
+            "tasks gives NO speedup — they just queue and you end up waiting "
+            "sequentially. With a single slot the ONLY useful pattern is: "
+            "dispatch ONE substantial task, then IMMEDIATELY do your own work "
+            "in parallel (read files, plan, write the parts only you must "
+            "touch) so the co-worker's time OVERLAPS yours, then "
+            "collect_coworker. Do NOT dispatch multiple tasks expecting them to "
+            "run in parallel — they will not."
+        )
+    else:
+        para = (
+            f"Up to {n} co-worker tasks run in parallel, so dispatch "
+            f"independent tasks together in ONE turn to overlap them. Do not "
+            f"dispatch more than {n} at once expecting more concurrency — the "
+            f"extra tasks queue."
+        )
+    return (
+        "\n\n[CO-WORKER CAPACITY & PIPELINE] "
+        f"The co-worker runs at most {n} task(s) concurrently "
+        f"(dispatch cap {cap} per request). " + para +
+        " The co-worker is READ-ONLY and TOOL-LESS: it works in a SINGLE pass "
+        "from the file context the proxy attaches to each dispatched task (plus "
+        "the task/context you provide) and returns its COMPLETE file content / "
+        "analysis as TEXT — it never writes files and cannot browse the "
+        "workspace live. YOU are the only writer: take its returned code and "
+        "write it yourself. Make the task self-contained and attach the files "
+        "it needs. DELIVERY IS AUTOMATIC: no collect_coworker needed — the "
+        "finished result is pushed into your next turns. Delegating pays off "
+        "only when the co-worker's work overlaps with your own; pure "
+        "sequential waiting saves no time."
+    )
+
 # Für io_trace_analyze: alle Co-Worker-Tool-Namen (nach Definition gesetzt)
 _COWORKER_TOOL_NAMES = (_COWORKER_TOOL_NAME, _COWORKER_DISPATCH_TOOL_NAME,
                         _COWORKER_COLLECT_TOOL_NAME)
@@ -3226,15 +3448,20 @@ _COWORKER_DISPATCH_TOOL_DEF: Dict[str, Any] = {
             "model on the SEPARATE DGX Spark server. Returns IMMEDIATELY with "
             "a task_id (e.g. \"cw_ab12cd\") — the co-worker keeps computing "
             "in the background while you CONTINUE YOUR OWN WORK (call VS-Code "
-            "tools, edit files, think). The next client turn will remind you "
-            "of running/done tasks until you collect them. Fan-out scaling: "
-            "trivial sub-task → just do it yourself; one task per file for "
-            "multi-file work; 4-8 parallel tasks for large refactors. Pattern: "
-            "dispatch ALL independent sub-tasks in ONE turn (multiple "
-            "dispatch_coworker calls), do your own work, then collect_coworker. "
-            "The proxy AUTOMATICALLY appends conversation file contents to "
-            "each dispatched task. Task must be fully self-contained — the "
-            "co-worker has NO access to tools or this conversation."
+            "tools, edit files, think). You do NOT need collect_coworker: as "
+            "soon as the task finishes, the proxy PUSHES the complete result "
+            "into one of your next turns as a [Co-Worker-Ergebnis cw_xxx] "
+            "message — keep working meanwhile. See the CAPACITY note appended "
+            "below for how many tasks actually run at once. "
+            "The co-worker is READ-ONLY and TOOL-LESS: it works in a SINGLE "
+            "pass from the file context the proxy attaches to each dispatched "
+            "task (plus the task/context you provide) and returns its COMPLETE "
+            "file content / analysis as TEXT — it never writes files and "
+            "cannot browse the workspace live. YOU are the only writer: take "
+            "its returned code and write it yourself. The proxy appends the "
+            "conversation's file contents to each dispatched task, so make the "
+            "task self-contained and name the files it needs — the co-worker "
+            "does NOT see this conversation otherwise."
         ),
         "parameters": {
             "type": "object",
@@ -3258,13 +3485,15 @@ _COWORKER_COLLECT_TOOL_DEF: Dict[str, Any] = {
     "function": {
         "name": _COWORKER_COLLECT_TOOL_NAME,
         "description": (
-            "Join point: collect the results of previously dispatched "
-            "background tasks. BLOCKS until the requested tasks are done (or "
-            "timeout). Call with no arguments to collect ALL "
-            "running/finished tasks. Returns a list of "
-            "{task_id, status, result} entries. Typical flow: "
-            "dispatch_coworker (several) → do your own work → "
-            "collect_coworker → integrate the results into your answer."
+            "OPTIONAL early-join: collect results of dispatched background "
+            "tasks before they are pushed to you automatically. Call with no "
+            "arguments to collect ALL finished tasks. Returns a list of "
+            "{task_id, status, result} entries; tasks still running are "
+            "reported as status=running (this call BLOCKS up to "
+            "timeout_seconds). Normally NOT needed — finished results are "
+            "pushed automatically as [Co-Worker-Ergebnis cw_xxx] user "
+            "messages. Use only if you want a result early "
+            "(e.g. before a final answer)."
         ),
         "parameters": {
             "type": "object",
@@ -3290,6 +3519,13 @@ _COWORKER_HEALTH_CACHE: Dict[str, Any] = {
     "checked_at": 0.0,
     "last_error": "noch nicht geprueft",
 }
+
+# Shutdown-Signal fuer BG-Tasks: True, waehrend der Prozess faehrt. Erlaubt es
+# _run_bg_coworker_task, "Neustart" von "TTL abgelaufen" zu unterscheiden.
+_SHUTTING_DOWN: bool = False
+_SHUTDOWN_CANCEL_NOTE: str = (
+    "Co-Worker-Task wurde durch einen PROXY-NEUSTART abgebrochen — nicht wegen "
+    "Timeout. Der Task war noch in Arbeit; bei Bedarf erneut dispatchen.")
 
 
 def _coworker_configured() -> bool:
@@ -3338,6 +3574,21 @@ async def _probe_coworker() -> bool:
         })
         return reachable
     except Exception as exc:
+        # Busy-False-Positive vermeiden: ein Co-Worker mit niedriger
+        # Concurrency (z. B. max_parallel=1) ist waehrend ein Task laeuft fuer
+        # den Ping nicht durchlaessig — Timeout/ConnectError heisst dann
+        # "beschaeftigt", NICHT "abgestuerzt". Solange BG-Tasks laufen,
+        # reachable auf True halten, sonst verschwinden dispatch/collect aus
+        # der Worker-Tool-Liste, genau wenn er collecten will (Schnittstellen-
+        # bug, beobachtet 2026-08-29 18:58: Task laeuft, collect-Tool weg).
+        busy = any(t.status in ("running", "paused")
+                   for t in _COWORKER_BG_TASKS.values())
+        if busy and _COWORKER_HEALTH_CACHE.get("reachable", False):
+            _COWORKER_HEALTH_CACHE.update({
+                "checked_at": time.time(),
+                "last_error": f"busy ({_safe_str(exc)[:60]}) — reachable gehalten",
+            })
+            return True
         _COWORKER_HEALTH_CACHE.update({
             "reachable": False,
             "checked_at": time.time(),
@@ -3347,9 +3598,13 @@ async def _probe_coworker() -> bool:
 
 
 async def _coworker_health_loop() -> None:
-    """Periodischer Health-Check fuer den Co-Worker (Startup-Probe + Intervall).
-    Laeuft NUR wenn COWORKER_ENABLED aktiv ist — bei deaktiviertem Co-Worker
-    wird kein Ping ans andere System geschickt."""
+    """Startup-Probe + TTL-Cleanup-Schleife. Der Health-Check laeuft NUR
+    einmal beim Start (kein periodisches Re-Probing): ein Co-Worker mit
+    niedriger Concurrency (max_parallel=1) ist waehrend ein Task laeuft nicht
+    anpingbar, ein periodischer Probe wuerde reachable=False setzen und damit
+    dispatch/collect aus der Worker-Tool-Liste reissen, genau wenn der Worker
+    collecten will. Die Schleife bleibt fuer das TTL-Cleanup offener
+    Hintergrund-Tasks. Laeuft NUR wenn COWORKER_ENABLED aktiv ist."""
     if not COWORKER_ENABLED:
         _COWORKER_HEALTH_CACHE.update({"reachable": False, "last_error": "Co-Worker deaktiviert"})
         return
@@ -3373,10 +3628,8 @@ async def _coworker_health_loop() -> None:
             if not _coworker_configured():
                 _COWORKER_HEALTH_CACHE.update({"reachable": False, "last_error": "nicht konfiguriert"})
                 continue
-            await _probe_coworker()
-            state = ("erreichbar" if _COWORKER_HEALTH_CACHE.get("reachable")
-                     else f"UNREACHABLE ({_COWORKER_HEALTH_CACHE.get('last_error', '?')})")
-            _log(f"Co-Worker Health-Check: {state}")
+            # KEIN periodischer Probe (siehe Docstring). Nur TTL-Cleanup der
+            # Hintergrund-Tasks, damit abgelaufene running-Tasks geraeumt werden.
             # Fork-Join: TTL-Cleanup der Hintergrund-Tasks mit inline ziehen
             if COWORKER_FORK_JOIN and _COWORKER_BG_TASKS:
                 _cleanup_bg_tasks()
@@ -3422,6 +3675,65 @@ def _inject_tool_execution_guidance(payload: Dict[str, Any]) -> None:
     _log("Tool-Execution-Guidance injiziert ([EXECUTION RULES])")
 
 
+def _is_big_build_request(text: str) -> bool:
+    """True, wenn ein Auftrag nach einem Grossbau aussieht (siehe die drei
+    Regexe oben): Schaffens-Verb PLUS (Umfangs-Wort ODER Artefakt-Noun in
+    Verb-Naehe)."""
+    if not text or not _COWORKER_BUILD_VERB_RE.search(text):
+        return False
+    return bool(_COWORKER_SCOPE_WORD_RE.search(text)
+                or _COWORKER_ARTIFACT_NEAR_VERB_RE.search(text))
+
+
+def _inject_coworker_nudge(payload: Dict[str, Any]) -> bool:
+    """Haengt bei einem als GROSSBAU erkennbaren Auftrag einen kurzen
+    Delegations-Hinweis an die LETZTE User-Message. Returns True bei Injection.
+
+    Warum nicht im System-Prompt: die Guidance dort hat ein 30B-Modell in 65
+    getrackten Turns zu 0 Delegationen gefuehrt. Die User-Message steht am Ende
+    des Prompts — dort wirkt eine Anweisung am staerksten.
+
+    Voraussetzungen: die Co-Worker-Tools muessen wirklich am Backend sein
+    (Health-OK), sonst fuehrt der Hinweis zu einem Call ins Leere. Idempotent
+    ueber den Marker (Folgerunden derselben Conversation werden nicht
+    zugemuellt)."""
+    if not COWORKER_BIG_BUILD_NUDGE:
+        return False
+    tool_names = {str((t.get("function") or {}).get("name", ""))
+                  for t in payload.get("tools") or [] if isinstance(t, dict)}
+    if _COWORKER_TOOL_NAME not in tool_names:
+        return False
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return False
+    for m in reversed(messages):
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if isinstance(content, list):
+            text = "".join(str(p.get("text", "")) for p in content
+                           if isinstance(p, dict) and p.get("type") == "text")
+        elif isinstance(content, str):
+            text = content
+        else:
+            return False
+        if _COWORKER_NUDGE_MARKER in text:
+            return False
+        if not _is_big_build_request(text):
+            return False
+        if isinstance(content, list):
+            for p in reversed(content):
+                if isinstance(p, dict) and p.get("type") == "text":
+                    p["text"] = str(p.get("text", "")) + _COWORKER_NUDGE_TEXT
+                    _log("Co-Worker-Big-Build-Nudge injiziert (User-Message)")
+                    return True
+            return False
+        m["content"] = text + _COWORKER_NUDGE_TEXT
+        _log("Co-Worker-Big-Build-Nudge injiziert (User-Message)")
+        return True
+    return False
+
+
 def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
     """Injiziert die Co-Worker-Tools (ask_coworker; bei aktivem Fork-Join
     zusaetzlich dispatch_coworker + collect_coworker) in den Payload — NUR
@@ -3441,12 +3753,28 @@ def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
         payload["tools"] = tools
     existing = {str((t.get("function") or {}).get("name", "")) for t in tools if isinstance(t, dict)}
     if _COWORKER_TOOL_NAME not in existing:
-        tools.append(copy.deepcopy(_COWORKER_TOOL_DEF))
+        # AN DEN ANFANG der tools-Liste, nicht anhaengen. Evidenz (2026-08-28,
+        # 65 getrackte Turns): mit 56 Client-Tools standen die drei
+        # Delegationstools auf Index 56-58 von 59 — coworker_calls_seen war in
+        # ALLEN Turns 0. Ein kleines Treiber-Modell waehlt Werkzeuge aus dem
+        # Anfang der Liste; hinten angehaengt verlieren sie gegen jede
+        # VS-Code-Definition. Die index-Felder EMITTIERTER tool_calls sind
+        # davon unberuehrt (sie zaehlen pro Response, nicht gegen die
+        # tools-Liste) — Client-Ausfuehrung bleibt korrekt.
+        prepend: List[Dict[str, Any]] = [copy.deepcopy(_COWORKER_TOOL_DEF)]
         if COWORKER_FORK_JOIN:
             if _COWORKER_DISPATCH_TOOL_NAME not in existing:
-                tools.append(copy.deepcopy(_COWORKER_DISPATCH_TOOL_DEF))
+                d = copy.deepcopy(_COWORKER_DISPATCH_TOOL_DEF)
+                # Wahrheitsgetreue Kapazitaets-/Pipeline-Info an die
+                # Dispatch-Beschreibung haengen (zaehlt die echte Concurrency).
+                try:
+                    d["function"]["description"] += _coworker_capacity_note()
+                except (KeyError, TypeError):
+                    pass
+                prepend.append(d)
             if _COWORKER_COLLECT_TOOL_NAME not in existing:
-                tools.append(copy.deepcopy(_COWORKER_COLLECT_TOOL_DEF))
+                prepend.append(copy.deepcopy(_COWORKER_COLLECT_TOOL_DEF))
+        tools[:0] = prepend
         if "tool_choice" not in payload:
             payload["tool_choice"] = "auto"
     # Bootstrap-Guidance: an die BESTEHENDE System-Message anhaengen (merge),
@@ -3455,24 +3783,37 @@ def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
     # must be at the beginning", sonst 500 vom Backend). Ohne Guidance nutzen
     # lokale Modelle die Co-Worker-Tools in der Praxis nicht.
     if COWORKER_TEACH_DELEGATION:
+        guidance_text = (_COWORKER_DRIVER_GUIDANCE_SYSTEM if COWORKER_DRIVER_MODE
+                         else _COWORKER_GUIDANCE_SYSTEM)
+        # Kapazitaets-/Pipeline-Wahrheit an die Guidance haengen, damit der
+        # Worker die echte Concurrency kennt und nicht blind fan-out betreibt.
+        guidance_text = guidance_text + _coworker_capacity_note()
+        marker = (COWORKER_DRIVER_GUIDANCE_MARKER if COWORKER_DRIVER_MODE
+                  else "[PROXY DELEGATION GUIDANCE]")
+        other_marker = ("[PROXY DELEGATION GUIDANCE]" if COWORKER_DRIVER_MODE
+                        else COWORKER_DRIVER_GUIDANCE_MARKER)
         messages = payload.get("messages")
         if isinstance(messages, list):
+            # Einmalige Injektion: der eigene Marker, UND die Variante des
+            # anderen Modus, damit ein Umschalten von driver_mode nicht beide
+            # Anleitungen in dieselbe History schreibt.
             has_guidance = any(
                 isinstance(m, dict)
                 and m.get("role") == "system"
-                and "[PROXY DELEGATION GUIDANCE]" in str(m.get("content", ""))
+                and (marker in str(m.get("content", ""))
+                     or other_marker in str(m.get("content", "")))
                 for m in messages)
             if not has_guidance:
                 first = messages[0] if messages and isinstance(messages[0], dict) else None
                 if first is not None and first.get("role") == "system":
                     first["content"] = (
                         str(first.get("content") or "").rstrip()
-                        + "\n\n" + _COWORKER_GUIDANCE_SYSTEM
+                        + "\n\n" + guidance_text
                     )
                 else:
                     messages.insert(0, {
                         "role": "system",
-                        "content": _COWORKER_GUIDANCE_SYSTEM,
+                        "content": guidance_text,
                     })
     _log(f"Co-Worker-Tools injiziert (Health-OK"
          f"{', Fork-Join' if COWORKER_FORK_JOIN else ''}"
@@ -3570,6 +3911,32 @@ def _extract_conversation_files(messages: Optional[List[Dict[str, Any]]],
     return "\n\n".join(blocks)
 
 
+def _cw_join_files_and_task(files: str, task_block: str) -> str:
+    """Ordnet Datei-Kontext und Task-Block in der Reihenfolge an, die den
+    Praefix-Cache des Co-Worker-Servers maximiert.
+
+    COWORKER_FILES_FIRST (Default): Dateien ZUERST. Mehrere parallele Tasks
+    desselben Requests teilen denselben Datei-Kontext (der Loop extrahiert
+    files_context einmal pro Request) — mit Dateien am Anfang ist ihr
+    Praefix (system + Dateien) byte-identisch und der Server prefillt ihn
+    nur EINMAL (SGLang RadixAttention / vLLM Prefix-Cache). Bei 30k Token
+    Datei-Kontext spart das pro Parallel-Task den kompletten Prefill.
+    Sonst: Task zuerst (alter Aufbau, Praefix divergiert sofort).
+
+    Voraussetzung ist eine deterministische Dateireihenfolge — die liefert
+    _extract_conversation_files (History-Reihenfolge, kein set-Iteration)."""
+    if COWORKER_FILES_FIRST:
+        return (
+            "## Dateiinhalte aus dem Chat (vom Proxy automatisch angehaengt — "
+            "gehoeren zum aktuellen Kontext)\n" + files
+            + "\n\n## Aufgabe\n" + task_block
+        )
+    return task_block + (
+        "\n\n## Dateiinhalte aus dem Chat (vom Proxy automatisch "
+        "angehaengt — gehoeren zum aktuellen Kontext)\n" + files
+    )
+
+
 def _build_coworker_body(task: str, context: str,
                          extra_context: Optional[str] = None) -> Dict[str, Any]:
     """Baut eine frische, minimale Session fuer den Co-Worker.
@@ -3587,10 +3954,7 @@ def _build_coworker_body(task: str, context: str,
     if COWORKER_TASK_CAP > 0 and len(user_content) > COWORKER_TASK_CAP:
         user_content = user_content[:COWORKER_TASK_CAP] + "\n…[gekappt]"
     if extra:
-        user_content += (
-            "\n\n## Dateiinhalte aus dem Chat (vom Proxy automatisch "
-            "angehaengt — gehoeren zum aktuellen Kontext)\n" + extra
-        )
+        user_content = _cw_join_files_and_task(extra, user_content)
     messages: List[Dict[str, Any]] = []
     if COWORKER_SYSTEM_PROMPT.strip():
         messages.append({"role": "system", "content": COWORKER_SYSTEM_PROMPT})
@@ -3619,14 +3983,19 @@ async def _run_coworker_call(tool_call: Dict[str, Any],
     context = str(args.get("context", "") or "")
 
     started = time.perf_counter()
-    if COWORKER_AGENT_MODE:
-        # v4 Agent-Mode: agentischer Loop mit Tool-Zugriff (Runner-Relay)
-        result = await _run_coworker_agent(task, context, extra_context=extra_context)
-    else:
-        body = _build_coworker_body(task, context, extra_context=extra_context)
-        # inject_hindsight=False: kein Hindsight-Recall fuer Co-Worker-Calls
-        # (vermeidet Kontamination des Co-Worker-Sessions mit Haupt-History)
-        result = await _call_single_model(body, "coworker", 0, inject_hindsight=False)
+    # Semaphore AUCH hier: ask_coworker lief bisher am COWORKER_MAX_PARALLEL-
+    # Limit vorbei. Ein Server mit hartem max_running_requests (z. B. SGLang 4)
+    # kollidiert sonst mit parallel laufenden dispatch-Tasks — der eine wartet,
+    # ohne selbst zum Batch beizutragen.
+    async with _coworker_semaphore():
+        if COWORKER_AGENT_MODE:
+            # v4 Agent-Mode: agentischer Loop mit Tool-Zugriff (Runner-Relay)
+            result = await _run_coworker_agent(task, context, extra_context=extra_context)
+        else:
+            body = _build_coworker_body(task, context, extra_context=extra_context)
+            # inject_hindsight=False: kein Hindsight-Recall fuer Co-Worker-Calls
+            # (vermeidet Kontamination des Co-Worker-Sessions mit Haupt-History)
+            result = await _call_single_model(body, "coworker", 0, inject_hindsight=False)
     duration = time.perf_counter() - started
 
     if result.get("status") == "ok":
@@ -3669,23 +4038,30 @@ async def _run_coworker_call(tool_call: Dict[str, Any],
 # zurueck und werden per ID-Praefix zur Session geroutet.
 
 _COWORKER_AGENT_SYSTEM_PROMPT: str = (
-    "You are an autonomous coding subagent collaborating with the main agent "
-    "in the same workspace. You have access to the same tools as the main "
-    "agent (they are provided in the tools parameter of every request). "
-    "Work iteratively: call tools as needed, inspect results, and continue "
-    "until the task is fully done or blocked. When finished, respond with a "
-    "concise final summary of what you did (including created/modified "
-    "file paths). Be efficient: batch independent operations. Do NOT ask "
-    "the user questions and do NOT restate the task — your output goes "
-    "back to the main agent, not to a human."
+    "You are a READ-ONLY research and analysis subagent collaborating with a "
+    "main agent in the same workspace. You may ONLY inspect the workspace with "
+    "read-only tools (read_file, list_dir, grep_search, file_search, view_image, "
+    "fetch_webpage, etc.). You have NO write, edit, create, delete, or terminal "
+    "execution tools — the main agent is the ONLY writer. Do NOT attempt to "
+    "modify files. Work iteratively: read/inspect as needed, then return your "
+    "result as TEXT. When the task asks for code or file content, output the "
+    "COMPLETE, ready-to-paste content in fenced code blocks with the exact "
+    "target file path stated above each block, so the main agent can write it. "
+    "When the task is analysis, return a concise, concrete report. Be "
+    "efficient: batch independent reads. Do NOT ask the user questions and do "
+    "NOT restate the task — your output goes back to the main agent, not to a "
+    "human."
 )
 
 _COWORKER_PLAIN_PROMPT: str = (
-    "You are a helpful assistant supporting a main agent as a delegated "
-    "subagent. Answer the given task concisely and technically, purely "
-    "from the provided context (you have NO tool access in this mode). "
-    "If information is missing, say so explicitly and give the best "
-    "possible answer from what you have."
+    "You are a READ-ONLY research and analysis subagent supporting a main "
+    "agent. You have NO tool access in this mode: work purely from the "
+    "provided task and file context, in a SINGLE pass. The main agent is the "
+    "ONLY writer of files. For code/file work, return the COMPLETE "
+    "ready-to-paste content in fenced code blocks, each preceded by its exact "
+    "target file path — do not truncate or summarize code. For analysis, give "
+    "a concise, concrete report. If information is missing from the context, "
+    "say so explicitly and give the best possible answer from what you have."
 )
 
 # ── Tunnel-Session-Store ──────────────────────────────────────────────────
@@ -3807,24 +4183,60 @@ def _cw_strip_tunnel_from_messages(messages: List[Dict[str, Any]]) -> int:
     return removed
 
 
+# Read-Only-Whitelist fuer Co-Worker-Sessions: Der Co-Worker ist ein reiner
+# Leser/Analyst. Er darf Dateien untersuchen und Inhalt/Analyse zurueckgeben,
+# aber NICHTS schreiben oder ausfuehren — der Worker bleibt einziger Schreiber
+# (Single-Writer-Prinzip). Damit kann der Worker die Co-Worker-Leistung nicht
+# uebersehen: sie landet als Tool-Ergebnis in seinem Kontext. Alles ausserhalb
+# dieser Whitelist wird aus den Client-Tools entfernt.
+_COWORKER_READONLY_TOOLS: Set[str] = {
+    "read_file", "list_dir", "grep_search", "file_search", "view_image",
+    "fetch_webpage", "github_repo", "github_text_search", "get_vscode_api",
+    "copilot_getNotebookSummary", "read_notebook_cell_output", "get_errors",
+    "terminal_last_command", "terminal_selection", "get_task_output",
+    "get_terminal_output", "screenshot_page", "read_page",
+    "vscode_listCodeUsages", "session_store_sql",
+    "vscode_searchExtensions_internal",
+}
+
+
+def _cw_filter_readonly_tools(
+        client_tools: Optional[List[Dict[str, Any]]]
+) -> List[Dict[str, Any]]:
+    """Laesst nur die Read-Only-Tools der Whitelist durch (Name aus
+    tool.function.name). Schreib-/Exec-Tools werden entfernt."""
+    if not client_tools:
+        return []
+    out: List[Dict[str, Any]] = []
+    for t in client_tools:
+        name = ((t or {}).get("function") or {}).get("name")
+        if name in _COWORKER_READONLY_TOOLS:
+            out.append(t)
+    return out
+
+
 def _cw_session_new(task_text: str, context_text: str,
                     extra_context: Optional[str] = None,
                     client_tools: Optional[List[Dict[str, Any]]] = None,
                     system_prompt: Optional[str] = None,
                     group: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Startet eine frische Co-Worker-Tunnel-Session. client_tools sind die
-    ORIGINAL-Tool-Definitionen aus dem Client-Request — der Co-Worker erhaelt
-    exakt die Werkzeuge, die der Client sowieso ausfuehren kann."""
+    ORIGINAL-Tool-Definitionen aus dem Client-Request; sie werden zentral auf
+    die Read-Only-Whitelist gefiltert — der Co-Worker wird zum Leser/Analysten,
+    der Inhalt zurueckgibt statt selbst zu schreiben."""
     _cw_sessions_cleanup()
+    client_tools = _cw_filter_readonly_tools(client_tools)
 
     user_content = (task_text or "").strip()
     if (context_text or "").strip():
         user_content += f"\n\n## Context\n{context_text.strip()}"
-    if extra_context:
-        user_content += ("\n\n## Dateiinhalte aus dem Chat (automatisch angehaengt)\n"
-                         + extra_context)
     if COWORKER_TASK_CAP > 0 and len(user_content) > COWORKER_TASK_CAP:
         user_content = user_content[:COWORKER_TASK_CAP] + "\n…[gekappt]"
+    if extra_context:
+        # Praefix-Sharing: Dateien vor der Task-Instruction (siehe
+        # _cw_join_files_and_task). Der Task-Block ist bereits gekappt, nur
+        # die Dateien koennen danach noch wachsen.
+        user_content = _cw_join_files_and_task(extra_context, user_content)
 
     sess: Dict[str, Any] = {
         "sid": uuid.uuid4().hex[:8],
@@ -4070,58 +4482,62 @@ async def _cw_stream_round(sess: Dict[str, Any], queue: asyncio.Queue,
             model, content=c, include_role=False, chunk_id=stream_id))
 
     try:
-        async for ev in _stream_single_model_events(body, "coworker", 0,
-                                                    inject_hindsight=False):
-            ev_type = ev.get("type") if isinstance(ev, dict) else None
-            if ev_type == "chunk":
-                choice = ev.get("choice") or {}
-                delta = choice.get("delta") or {}
-                rc = _extract_reasoning_from_delta(delta)
-                if rc:
-                    has_explicit_reasoning = True
-                    if cw_loop_hit is None:
-                        cw_loop_hit = cw_reason_guard.feed(rc, "reasoning")
-                    if cw_loop_hit is None:
-                        await push_reasoning(rc)
-                tcd = delta.get("tool_calls")
-                if isinstance(tcd, list) and tcd:
-                    _accumulate_stream_tool_calls(tc_state, tcd)
-                c = delta.get("content")
-                if isinstance(c, str) and c:
-                    if has_explicit_reasoning:
+        # Eine Tunnel-Runde = ein laufender Request auf dem Co-Worker-Server.
+        # Das Semaphore zaehlt mit, damit parallele Sessions (und ask_coworker)
+        # das harte max_running_requests des Servers nicht ueberlaufen.
+        async with _coworker_semaphore():
+            async for ev in _stream_single_model_events(body, "coworker", 0,
+                                                        inject_hindsight=False):
+                ev_type = ev.get("type") if isinstance(ev, dict) else None
+                if ev_type == "chunk":
+                    choice = ev.get("choice") or {}
+                    delta = choice.get("delta") or {}
+                    rc = _extract_reasoning_from_delta(delta)
+                    if rc:
+                        has_explicit_reasoning = True
                         if cw_loop_hit is None:
-                            cw_loop_hit = cw_content_guard.feed(c, "content")
+                            cw_loop_hit = cw_reason_guard.feed(rc, "reasoning")
                         if cw_loop_hit is None:
-                            content_parts.append(c)
-                            await push_content(c)
-                    else:
-                        rp, cp = _split_think_chunk(c, think_state)
-                        if rp:
+                            await push_reasoning(rc)
+                    tcd = delta.get("tool_calls")
+                    if isinstance(tcd, list) and tcd:
+                        _accumulate_stream_tool_calls(tc_state, tcd)
+                    c = delta.get("content")
+                    if isinstance(c, str) and c:
+                        if has_explicit_reasoning:
                             if cw_loop_hit is None:
-                                cw_loop_hit = cw_reason_guard.feed(rp, "reasoning")
+                                cw_loop_hit = cw_content_guard.feed(c, "content")
                             if cw_loop_hit is None:
-                                await push_reasoning(rp)
-                        if cp:
-                            if cw_loop_hit is None:
-                                cw_loop_hit = cw_content_guard.feed(cp, "content")
-                            if cw_loop_hit is None:
-                                content_parts.append(cp)
-                                await push_content(cp)
-                if cw_loop_hit is not None:
-                    # Loop erkannt: Backend-Stream des Co-Workers intern abbrechen.
-                    _log(f"CW-Tunnel {sid}: Loop-Guard Treffer "
-                         f"({cw_loop_hit.get('kind')} x{cw_loop_hit.get('count')}) — "
-                         f"Stream abgebrochen")
-                    status = "loop"
+                                content_parts.append(c)
+                                await push_content(c)
+                        else:
+                            rp, cp = _split_think_chunk(c, think_state)
+                            if rp:
+                                if cw_loop_hit is None:
+                                    cw_loop_hit = cw_reason_guard.feed(rp, "reasoning")
+                                if cw_loop_hit is None:
+                                    await push_reasoning(rp)
+                            if cp:
+                                if cw_loop_hit is None:
+                                    cw_loop_hit = cw_content_guard.feed(cp, "content")
+                                if cw_loop_hit is None:
+                                    content_parts.append(cp)
+                                    await push_content(cp)
+                    if cw_loop_hit is not None:
+                        # Loop erkannt: Backend-Stream des Co-Workers intern abbrechen.
+                        _log(f"CW-Tunnel {sid}: Loop-Guard Treffer "
+                             f"({cw_loop_hit.get('kind')} x{cw_loop_hit.get('count')}) — "
+                             f"Stream abgebrochen")
+                        status = "loop"
+                        break
+                elif ev_type == "usage":
+                    pass  # interne Co-Worker-Usage: nicht an den Client
+                elif ev_type == "done":
+                    status = "ok"
+                elif ev_type == "error":
+                    err_text = ev.get("content") or err_text
+                    status = "failed"
                     break
-            elif ev_type == "usage":
-                pass  # interne Co-Worker-Usage: nicht an den Client
-            elif ev_type == "done":
-                status = "ok"
-            elif ev_type == "error":
-                err_text = ev.get("content") or err_text
-                status = "failed"
-                break
         if status != "loop" and think_state.get("pending"):
             pending = think_state.pop("pending", "")
             if think_state.get("in_think"):
@@ -4179,6 +4595,7 @@ async def _cw_stream_round(sess: Dict[str, Any], queue: asyncio.Queue,
         pass
     sess["done"] = True
     sess["final"] = err_display
+    sess["tunnel_failed"] = True
 
 
 async def _stream_coworker_tunnel_phase(sessions: List[Dict[str, Any]],
@@ -4251,6 +4668,27 @@ def _cw_attach_finals(msgs: List[Dict[str, Any]],
     done = [s for s in sessions if s.get("done")]
     if not done:
         return
+    # BG-Dispatch-Tasks, deren Tunnel-Session jetzt final ist: paused → done/error
+    for s in done:
+        bg_id = s.get("bg_task_id")
+        if not bg_id:
+            continue
+        ct = _COWORKER_BG_TASKS.get(bg_id)
+        if ct is None or ct.status not in ("paused", "running"):
+            continue
+        final_text = s.get("final") or ""
+        if s.get("tunnel_failed"):
+            ct.status = "error"
+            ct.error = _safe_str(final_text) or "Co-Worker-Runde fehlgeschlagen"
+            io_log_bg_result(ct.task_id, "error", ct.error)
+        else:
+            if COWORKER_RESULT_CAP > 0 and len(final_text) > COWORKER_RESULT_CAP:
+                final_text = final_text[:COWORKER_RESULT_CAP] + "\n…[gekappt]"
+            ct.status = "done"
+            ct.result = final_text
+            ct.finished_at = time.time()
+            io_log_bg_result(ct.task_id, "done", final_text)
+        _log(f"BG-Task {bg_id} nach Tunnel-Resume: {ct.status}")
     asks = [s.get("orig_ask") for s in done]
     asks = [a for a in asks if isinstance(a, dict)]
     if not asks:
@@ -4311,7 +4749,7 @@ async def _run_coworker_agent(task_text: str, context_text: str,
 class CoworkerTask:
     task_id: str
     preview: str                       # 60-Zeichen-Task-Vorschau (Status-Zeile)
-    status: str = "running"            # running | done | error | expired
+    status: str = "running"            # running | paused | done | error | expired
     result: Optional[str] = None       # Co-Worker-Antwort (bei done)
     error: Optional[str] = None        # Fehlertext (bei error/expired)
     created_at: float = field(default_factory=time.time)
@@ -4319,6 +4757,7 @@ class CoworkerTask:
     delivered: bool = False            # True sobald per collect abgeliefert
     file_context: Optional[str] = None # Datei-Kontext zum Dispatch-Zeitpunkt
     aio_task: Optional[asyncio.Task] = None  # der laufende Hintergrund-Task
+    sid: Optional[str] = None          # Tunnel-Session (Client-Tools-Modus)
 
     def summary(self) -> Dict[str, Any]:
         """Kompakte JSON-Repraesentation fuer tool-results / Status-Zeilen."""
@@ -4372,45 +4811,116 @@ def _coworker_fit(task: CoworkerTask, result: str) -> str:
     return result
 
 
-async def _run_bg_coworker_task(task: CoworkerTask, tool_call_args: Dict[str, Any]) -> None:
-    """Coroutine eines Hintergrund-Tasks: baut die minimale Sub-Session und
-    ruft den Co-Worker NON-streaming auf (kein Client-Queue vorhanden — das
-    Live-Streaming der content entfaellt, Reasoning faellt weg). Ergebnis
-    landet in task.result; Fehler in task.error mit status=error."""
+async def _run_bg_coworker_task(task: CoworkerTask, tool_call_args: Dict[str, Any],
+                                client_tools: Optional[List[Dict[str, Any]]] = None) -> None:
+    """Coroutine eines Hintergrund-Tasks. Zwei Modi:
+
+    * client_tools mitgegeben (NEU, Standardueber alle Dispatch-Call-Sites):
+      Der Co-Worker bekommt die ORIGINALEN Client-Tool-Definitionen (VS-Code-
+      Tools) und arbeitet damit im Workspace wie das Hauptmodell. Endet die
+      erste Runde mit tool_calls, pausiert der Task (status=paused) und
+      merkt sich die Tunnel-Session — die tool_calls werden beim naechsten
+      Client-Request dem Hauptmodell vorgelegt (Tunnel-Resume, ID-Format
+      cws_<sid>_<orig>), VS Code fuehrt sie aus, die Results kommen in den
+      Folgerequest zurueck in die Session. Erst wenn die Session final ist,
+      ist der Task done und collect_coworker liefert echten Arbeitstext.
+    * client_tools leer/None (Fallback): nicht-streamender Plain-Call wie
+      bisher (niemals echter Workspace-Zugriff).
+
+    Ergebnis landet in task.result; Fehler in task.error mit status=error."""
     started = time.perf_counter()
     task_text = str(tool_call_args.get("task", "") or "")
     context_text = str(tool_call_args.get("context", "") or "")
     try:
         if COWORKER_AGENT_MODE:
-            # v4 Agent-Mode: agentischer Loop mit Tool-Zugriff
-            async with _coworker_semaphore():
-                result = await _run_coworker_agent(task_text, context_text,
-                                                   extra_context=task.file_context,
-                                                   task_id=task.task_id)
+            if client_tools:
+                # Tunnel-Session mit echten Client-Tools starten (eine Runde).
+                # Der Rest des agentischen Loops laeuft ueber Tunnel-Resume
+                # (Folgerequest). KEIN externes Semaphore hier: _cw_stream_round
+                # acquired selbst (asyncio.Semaphore ist nicht reentrant —
+                # Nested-Acquire bei max_parallel=1 waere ein Deadlock).
+                sess = _cw_session_new(task_text, context_text,
+                                       extra_context=task.file_context,
+                                       client_tools=client_tools)
+                sess["bg_task_id"] = task.task_id
+                task.sid = sess["sid"]
+                q: asyncio.Queue = asyncio.Queue()
+                await _cw_stream_round(sess, q, "local", f"cwq-bg-{uuid.uuid4().hex[:8]}")
+                if sess.get("done"):
+                    content = sess.get("final") or ""
+                    if COWORKER_RESULT_CAP > 0 and len(content) > COWORKER_RESULT_CAP:
+                        content = content[:COWORKER_RESULT_CAP] + "\n…[gekappt]"
+                    task.result = content
+                    task.status = "done"
+                    task.finished_at = time.time()
+                    io_log_bg_result(task.task_id, "done", content)
+                    _log(f"BG-Task {task.task_id} OK (Tunnel, sofort final) "
+                         f"duration={time.perf_counter() - started:.1f}s len={len(content)}")
+                elif sess.get("last_fwd_calls"):
+                    # Pausiert: tool_calls warten auf Ausfuehrung durch VS Code
+                    # via Tunnel-Resume im naechsten Client-Request.
+                    task.status = "paused"
+                    io_log_bg_result(task.task_id, "bg_paused",
+                                     "%d tool call(s) waiting" % len(sess["last_fwd_calls"]))
+                    _log(f"BG-Task {task.task_id} PAUSIERT — {len(sess['last_fwd_calls'])} "
+                         f"tool_call(s) fwd zum Client (Session {sess['sid']})")
+                else:
+                    # Weder final noch pausiert → Runde fehlgeschlagen.
+                    task.error = sess.get("final") or "Co-Worker-Runde fehlgeschlagen"
+                    task.status = "error"
+                    task.finished_at = time.time()
+                    io_log_bg_result(task.task_id, "error", task.error)
+                    _log(f"BG-Task {task.task_id} TUNNEL-FEHLER: {str(task.error)[:200]}")
+            else:
+                # Tool-los/Single-Shot (Standard): Semaphore respektiert
+                # COWORKER_MAX_PARALLEL (lokales Modell hat nur 1 Concurrency).
+                async with _coworker_semaphore():
+                    result = await _run_coworker_agent(task_text, context_text,
+                                                       extra_context=task.file_context,
+                                                       task_id=task.task_id)
+                if result.get("status") == "ok":
+                    content = result.get("content", "") or ""
+                    if COWORKER_RESULT_CAP > 0 and len(content) > COWORKER_RESULT_CAP:
+                        content = content[:COWORKER_RESULT_CAP] + "\n…[gekappt]"
+                    task.result = content
+                    task.status = "done"
+                    io_log_bg_result(task.task_id, "done", content)
+                    _log(f"BG-Task {task.task_id} OK duration={time.perf_counter() - started:.1f}s "
+                         f"len={len(content)}")
+                else:
+                    err = result.get("content") or "unbekannter Fehler"
+                    task.error = _safe_str(err)
+                    task.status = "error"
+                    io_log_bg_result(task.task_id, "error", task.error)
+                    _COWORKER_HEALTH_CACHE["reachable"] = False
         else:
             body = _build_coworker_body(task_text, context_text, extra_context=task.file_context)
             # Begrenzung der parallelen Co-Worker-Calls passiert HIER, vor dem Call
             async with _coworker_semaphore():
                 result = await _call_single_model(body, "coworker", 0, inject_hindsight=False)
-        duration = time.perf_counter() - started
-        if result.get("status") == "ok":
-            content = result.get("content", "") or ""
-            if COWORKER_RESULT_CAP > 0 and len(content) > COWORKER_RESULT_CAP:
-                content = content[:COWORKER_RESULT_CAP] + "\n…[gekappt]"
-            task.result = content
-            task.status = "done"
-            io_log_bg_result(task.task_id, "done", content)
-            _log(f"BG-Task {task.task_id} OK duration={duration:.1f}s len={len(content)}")
-        else:
-            err = result.get("content") or "unbekannter Fehler"
-            task.error = _safe_str(err)
-            task.status = "error"
-            io_log_bg_result(task.task_id, "error", task.error)
-            _COWORKER_HEALTH_CACHE["reachable"] = False
-            _log(f"BG-Task {task.task_id} FEHLER duration={duration:.1f}s: {task.error[:200]}")
+            if result.get("status") == "ok":
+                content = result.get("content", "") or ""
+                if COWORKER_RESULT_CAP > 0 and len(content) > COWORKER_RESULT_CAP:
+                    content = content[:COWORKER_RESULT_CAP] + "\n…[gekappt]"
+                task.result = content
+                task.status = "done"
+                io_log_bg_result(task.task_id, "done", content)
+                _log(f"BG-Task {task.task_id} OK duration={time.perf_counter() - started:.1f}s")
+            else:
+                err = result.get("content") or "unbekannter Fehler"
+                task.error = _safe_str(err)
+                task.status = "error"
+                io_log_bg_result(task.task_id, "error", task.error)
+                _COWORKER_HEALTH_CACHE["reachable"] = False
     except asyncio.CancelledError:
+        # Zwei Gruende fuer Cancel: TTL-Cleanup (_cleanup_bg_tasks) oder Prozess-
+        # Shutdown (WebUI-Neustart / SIGTERM). Beides bisher als "TTL/Shutdown"
+        # gemeldet → das Hauptmodell konnte nicht unterscheiden, ob der Task
+        # wirklich abgelaufen ist oder nur einem Restart zum Opfer fiel
+        # (beobachtet 2026-08-29: 10 Tasks gleichzeitig verloren).
         task.status = "expired"
-        task.error = "abgebrochen (TTL/Shutdown)"
+        task.error = (_SHUTDOWN_CANCEL_NOTE if _SHUTTING_DOWN
+                      else "abgebrochen (TTL)")
         io_log_bg_result(task.task_id, "expired", task.error)
         raise
     except Exception as exc:
@@ -4428,9 +4938,13 @@ def _task_preview_from_args(args: Dict[str, Any], max_chars: int = 60) -> str:
 
 
 def _register_bg_dispatch(tool_call: Dict[str, Any],
-                          files_context: str) -> CoworkerTask:
+                          files_context: str,
+                          client_tools: Optional[List[Dict[str, Any]]] = None) -> CoworkerTask:
     """Legt einen neuen Hintergrund-Task an und startet die Coroutine
-    (fire-and-forget, non-blocking). Caller prueft cap/limits VOR dem Aufruf."""
+    (fire-and-forget, non-blocking). Caller prueft cap/limits VOR dem Aufruf.
+    client_tools = Original-Client-Tool-Definitionen → der BG-Co-Worker
+    arbeitet damit im Workspace (Tunnel-Pause/Resume); ohne Tools der
+    Plain-Fallback wie bisher."""
     tool_call_id = tool_call.get("id") or f"call_{uuid.uuid4().hex[:12]}"
     args_raw = (tool_call.get("function") or {}).get("arguments", "{}")
     try:
@@ -4445,10 +4959,19 @@ def _register_bg_dispatch(tool_call: Dict[str, Any],
         preview=_task_preview_from_args(args),
         file_context=files_context or None,
     )
-    aio = asyncio.ensure_future(_run_bg_coworker_task(ct, args))
+    # Steering-Modell (2026-08-29): BG-Dispatch laeuft IMMER tool-los als
+    # Single-Shot aus dem angehaengten Datei-Kontext. Der asynchrone
+    # Tunnel-Rueckkanal (Client-Tools -> Pause -> cws_-Resume im Folgerequest)
+    # hat sich als die Hauptfehlerquelle erwiesen: der Co-Worker pausiert bei
+    # Read-Calls und das Resume liefert das Ergebnis nie beim Worker ab.
+    # Ohne Tools arbeitet der Co-Worker in EINEM Durchgang aus dem Kontext und
+    # gibt den kompletten Inhalt als Text zurueck -> collect_coworker liefert
+    # synchron echten Arbeitstext. client_tools wird daher bewusst ignoriert.
+    aio = asyncio.ensure_future(_run_bg_coworker_task(ct, args, None))
     ct.aio_task = aio
     _COWORKER_BG_TASKS[task_id] = ct
-    _log(f"BG-Dispatch {task_id} (tool_call={tool_call_id}): {ct.preview}")
+    _log(f"BG-Dispatch {task_id} (tool_call={tool_call_id}, tool-los/Single-Shot): "
+         f"{ct.preview}")
     return ct
 
 
@@ -4487,10 +5010,14 @@ def _extract_not_started_todos(tool_calls: Optional[List[Dict[str, Any]]]) -> Li
 
 
 def _auto_dispatch_todos(titles: List[str], files_context: str,
-                         dispatch_count: int) -> Tuple[List[CoworkerTask], int]:
+                         dispatch_count: int,
+                         client_tools: Optional[List[Dict[str, Any]]] = None
+                         ) -> Tuple[List[CoworkerTask], int]:
     """Verteilt not-started Todos deterministisch an den Co-Worker (BG-Tasks).
     Respektiert COWORKER_DISPATCH_CAP und den Duplikat-Schutz
-    (_COWORKER_AUTO_DISPATCHED). Returns (erstellte Tasks, Anzahl)."""
+    (_COWORKER_AUTO_DISPATCHED). Returns (erstellte Tasks, Anzahl).
+    client_tools wird durchgereicht → BG-Co-Worker arbeitet mit echten
+    Client-Tools im Workspace statt tool-los code-in-Text zu liefern."""
     global _COWORKER_AUTO_DISPATCHED
     created: List[CoworkerTask] = []
     if len(_COWORKER_AUTO_DISPATCHED) > 200:
@@ -4502,14 +5029,24 @@ def _auto_dispatch_todos(titles: List[str], files_context: str,
         if h in _COWORKER_AUTO_DISPATCHED:
             continue
         _COWORKER_AUTO_DISPATCHED.add(h)
+        _cw_tools = _cw_filter_readonly_tools(client_tools)
+        tool_hint = ("You may INSPECT the workspace with the read-only tools "
+                     "attached to your request (read_file, list_dir, "
+                     "grep_search, file_search, view_image, etc.). You CANNOT "
+                     "write, edit, or run anything — the main agent is the only "
+                     "writer. "
+                     if _cw_tools else
+                     "The relevant file contents from the main conversation are "
+                     "attached below for context (you have no tool access in "
+                     "this mode). ")
         task_text = (
             f"Task: {title}\n\n"
-            "Execute this task autonomously and completely using the "
-            "available tools to inspect and modify the workspace as needed. "
-            "The relevant file contents from the main conversation are "
-            "attached below for context. When finished, respond with a "
-            "concise summary of what you did, including any file paths "
-            "you created or modified."
+            "Execute this task autonomously and completely. "
+            + tool_hint +
+            "Return your result as TEXT: for code/file work, output the "
+            "COMPLETE ready-to-paste content in fenced code blocks, each "
+            "preceded by its exact target file path; for analysis, a concise "
+            "concrete report. The main agent will write the files itself."
         )
         tc = {
             "id": f"call_{uuid.uuid4().hex[:12]}",
@@ -4520,7 +5057,7 @@ def _auto_dispatch_todos(titles: List[str], files_context: str,
                                         ensure_ascii=False),
             },
         }
-        ct = _register_bg_dispatch(tc, files_context)
+        ct = _register_bg_dispatch(tc, files_context, client_tools)
         created.append(ct)
     return created, len(created)
 
@@ -4568,11 +5105,21 @@ async def _await_bg_tasks(task_ids: Optional[List[str]],
         out.append({"task_id": tid, "status": "unknown",
                     "error": "Task-ID nicht gefunden (bereits abgeliefert oder abgelaufen)"})
     for t in selected:
+        if t.status == "paused":
+            # Tunnel-Session wartet auf VS-Code-Tool-Ausfuehrung (Resume im
+            # Folgerequest) — kein Fehler, aber auch noch kein Ergebnis. Der
+            # Task bleibt undelivered; der Steering-Push liefert das finale
+            # Ergebnis automatisch, sobald die Session final ist.
+            out.append({"task_id": t.task_id, "status": "running",
+                        "preview": t.preview,
+                        "note": "Co-Worker arbeitet; das Endergebnis wird "
+                                "automatisch in einem Folge-Turn gepusht"})
+            continue
         out.append(t.summary())
         if t.status in ("done", "error", "expired"):
             t.delivered = True
             t.finished_at = t.finished_at or time.time()
-        # running Tasks bleiben undelivered → Status-Injection erinnert daran
+        # running Tasks bleiben undelivered → Push liefert spaeter automatisch
     return out
 
 
@@ -4604,28 +5151,62 @@ def _cleanup_bg_tasks() -> None:
                 _COWORKER_BG_TASKS.pop(t.task_id, None)
 
 
+# Notierte (task_id, status)-Kombinationen: die Status-Notiz darf pro Task und
+# Status genau EINMAL ins Gespraech — nicht in jedem Folge-Turn.
+_COWORKER_STATUS_NOTED: Set[str] = set()
+
+
 def _coworker_status_line() -> Optional[str]:
-    """Baut die kompakte Status-Notiz fuer undelivered Tasks ( None = keine
-    offenen Tasks). Format:
-    [Proxy] 2 Co-Worker Hintergrund-Tasks offen:
-    - ✅ cw_ab12cd: review proxy.py lines 100-200…
-    - ⏳ cw_ef34gh: refactor tools/auth.py…
-    """
-    entries = [t for t in _COWORKER_BG_TASKS.values() if not t.delivered]
-    if not entries:
-        return None
-    lines = [f"[Proxy] {len(entries)} Co-Worker Hintergrund-Task(s) aktiv:"]
-    for t in entries[:8]:
-        icon = {"done": "✅", "error": "❌", "expired": "⏱️"}.get(t.status, "⏳")
-        detail = ""
-        if t.status in ("error", "expired"):
-            detail = f" — {t.error[:80]}" if t.error else ""
-        lines.append(f"- {icon} {t.task_id}: {t.preview}{detail}")
-    if len(entries) > 8:
-        lines.append(f"- … und {len(entries) - 8} weitere")
-    lines.append("Diese Tasks werden vom Co-Worker ausgeführt — führe sie NICHT selbst aus. "
-                 "Sammle die Ergebnisse mit collect_coworker, sobald sie fertig sind.")
-    return "\n".join(lines)
+    """Steering-Push (v5.1): Baut die Inject-Nachricht fuer den naechsten
+    Worker-Turn. Zwei Teile:
+
+    1. FERTIGE Ergebnisse (status=done, nicht delivered) werden als
+       VOLLSTAENDIGER Text gepusht und sofort delivered markiert — der Worker
+       muss collect_coworker nicht mehr rufen (Pull war bruechig: Ergebnis
+       lag fertig im Store, Worker collectierte nie, 13 Min Leerlauf).
+    2. LAUFENDE/fehlgeschlagene Tasks erscheinen als einzeilige Status-Notiz
+       (weiterhin pro (task_id, status) nur EINMAL — kein Beschaeftigen).
+
+    Returns None, wenn es nichts zu sagen gibt."""
+    global _COWORKER_STATUS_NOTED
+    if len(_COWORKER_STATUS_NOTED) > 400:
+        _COWORKER_STATUS_NOTED.clear()
+    push_parts: List[str] = []
+    state_parts: List[str] = []
+    for t in _COWORKER_BG_TASKS.values():
+        if t.delivered or t.status == "running":
+            # running: Ergebnis kommt per Push, sobald fertig — kein
+            # Turn-Noise noetig. Done: wird unten gepusht und delivered.
+            continue
+        if t.status == "done" and t.result is not None:
+            # Steering-Push: volles Ergebnis in den naechsten Worker-Turn,
+            # sofort delivered (collect_coworker wird damit optional).
+            t.delivered = True
+            _COWORKER_STATUS_NOTED.add(f"pushed:{t.task_id}:{t.status}")
+            push_parts.append(
+                f"[Co-Worker-Ergebnis {t.task_id}] (Aufgabe: {t.preview})\n"
+                f"{t.result}"
+            )
+        else:
+            key = f"{t.task_id}:{t.status}"
+            if key in _COWORKER_STATUS_NOTED:
+                continue
+            _COWORKER_STATUS_NOTED.add(key)
+            icon = {"error": "❌", "expired": "⏱️"}.get(t.status, "⏳")
+            detail = f" — {t.error[:80]}" if (t.status in ("error", "expired") and t.error) else ""
+            state_parts.append(f"- {icon} {t.task_id}: {t.preview}{detail}")
+    if push_parts:
+        head = (f"[Proxy] {len(push_parts)} Co-Worker-Ergebnis(se) fertig — "
+                "integriere es direkt (Dateien selbst schreiben/pruefen), "
+                "kein collect_coworker noetig:")
+        return head + "\n\n" + "\n\n---\n\n".join(push_parts)
+    if state_parts:
+        return ("[Proxy] Co-Worker-Tasks offen:\n" + "\n".join(state_parts) +
+                "\nArbeite BY DESIGN asynchron weiter — das Ergebnis kommt "
+                "VON SELBST als [Co-Worker-Ergebnis cw_xxxxxxxx]-Nachricht "
+                "in einem der naechsten Turns; collect_coworker ist optional "
+                "(holt es frueh, wenn du nicht warten willst).")
+    return None
 
 
 async def _delegation_loop(body: Dict[str, Any], category: str,
@@ -4687,7 +5268,9 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
                 and _COWORKER_HEALTH_CACHE.get("reachable", False)):
             todo_titles = _extract_not_started_todos(other_calls)
             if todo_titles:
-                created, n = _auto_dispatch_todos(todo_titles, files_context, dispatch_count)
+                created, n = _auto_dispatch_todos(todo_titles, files_context,
+                                                  dispatch_count,
+                                                  client_tools=body.get("tools"))
                 if n:
                     dispatch_count += n
                     ids = ", ".join(ct.task_id for ct in created)
@@ -4732,7 +5315,8 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
                              "tool_calls": dispatch_norm})
                 mini_results: List[Dict[str, Any]] = []
                 for tc in dispatch_norm:
-                    ct = _register_bg_dispatch(tc, files_context)
+                    ct = _register_bg_dispatch(tc, files_context,
+                                               client_tools=body.get("tools"))
                     mini_results.append({
                         "role": "tool",
                         "tool_call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
@@ -5544,8 +6128,9 @@ def io_trace_analyze(turn_id: str) -> Dict[str, Any]:
             payload = ev.get("payload")
             msgs = payload.get("messages") if isinstance(payload, dict) else None
             for m in msgs or []:
-                if isinstance(m, dict) and m.get("role") == "system" \
-                        and "[PROXY DELEGATION GUIDANCE]" in str(m.get("content", "")):
+                if isinstance(m, dict) and m.get("role") == "system" and (
+                        "[PROXY DELEGATION GUIDANCE]" in str(m.get("content", ""))
+                        or COWORKER_DRIVER_GUIDANCE_MARKER in str(m.get("content", ""))):
                     analysis["guidance_in_system"] = True
                 if isinstance(m, dict) and m.get("role") == "system" \
                         and "[EXECUTION RULES]" in str(m.get("content", "")):
@@ -5900,6 +6485,12 @@ async def _lifespan(app: FastAPI):
 
     yield
 
+    global _SHUTTING_DOWN
+    _SHUTTING_DOWN = True
+    n_running = sum(1 for t in _COWORKER_BG_TASKS.values() if t.status == "running")
+    if n_running:
+        _log(f"Shutdown: {n_running} laufende Co-Worker BG-Task(s) werden abgebrochen "
+             "(kein Ergebnis — bei erneutem Dispatch erneut beauftragen).")
     _log("LocalProxy shutting down.")
 
 
@@ -6051,16 +6642,27 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     #         _log(f"Loop-Intervention: history truncated + appended "
     #              f"(read={read_hit}, search={search_hit}, generic={generic_hit})")
 
-    # Co-Worker-Health-Cache frisch halten (nicht-blockierend): Wenn der Cache
-    # aelter als das Health-Intervall ist, Probe im Hintergrund anstossen, damit
-    # der naechste Request den aktuellen Zustand sieht.
+    # Co-Worker-Health-Cache: NUR beim Cold-Start (noch nie geprueft) warten
+    # wir einmalig bis max. Probe-Timeout — sonst laeuft der erste Request ohne
+    # Co-Worker-Tools, obwohl der Co-Worker erreichbar ist (beobachtet:
+    # 2026-08-29 09:01 'Health-Check nicht bestanden (noch nicht geprueft)').
+    # KEIN periodisches Re-Probing pro Request: ein Co-Worker mit niedriger
+    # Concurrency (max_parallel=1) ist waehrend ein Task laeuft nicht anpingbar;
+    # ein Re-Probe wuerde reachable=False setzen und dispatch/collect aus der
+    # Worker-Tool-Liste reissen, genau wenn der Worker collecten will.
     if category == "local" and COWORKER_ENABLED and _coworker_configured():
-        if time.time() - float(_COWORKER_HEALTH_CACHE.get("checked_at", 0.0)) > COWORKER_HEALTH_INTERVAL:
-            _spawn(_probe_coworker())
+        if float(_COWORKER_HEALTH_CACHE.get("checked_at", 0.0)) <= 0.0:
+            await _probe_coworker()
+            _log(f"Co-Worker Cold-Start-Probe: "
+                 f"{'erreichbar' if _COWORKER_HEALTH_CACHE.get('reachable') else 'UNREACHABLE (' + str(_COWORKER_HEALTH_CACHE.get('last_error', '?')) + ')'}")
 
     # Fork-Join: Status offener Hintergrund-Tasks als kompakte user-Notiz
     # ans Ende der History haengen (nach Kategorie-Detection — beeinflusst
     # weder Flag-Extraktion noch Tool-Continuation-Erkennung).
+    # NICHT jeden Turn wiederholen — sonst wird das Hauptmodell mit derselben
+    # Notiz beschallt und kann seine eigene Todo-Kette nicht mehr abarbeiten
+    # (beobachtet 2026-08-29: 839 chars in JEDEM Turn, Turns 09:13-09:20).
+    # Notiz erscheint pro (task_id, status)-Kombination genau einmal.
     if (category == "local" and COWORKER_ENABLED and COWORKER_FORK_JOIN
             and _COWORKER_BG_TASKS):
         status = _coworker_status_line()
@@ -7386,7 +7988,9 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
                 and _COWORKER_HEALTH_CACHE.get("reachable", False)):
             todo_titles = _extract_not_started_todos(other_calls)
             if todo_titles:
-                created, n = _auto_dispatch_todos(todo_titles, files_context, dispatch_count)
+                created, n = _auto_dispatch_todos(todo_titles, files_context,
+                                                  dispatch_count,
+                                                  client_tools=body.get("tools"))
                 if n:
                     dispatch_count += n
                     ids = ", ".join(ct.task_id for ct in created)
@@ -7452,7 +8056,8 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
                          "tool_calls": dispatch_norm})
             dispatched_note = ["\n\n[Proxy] Co-Worker dispatched:"]
             for tc in dispatch_norm:
-                ct = _register_bg_dispatch(tc, files_context)
+                ct = _register_bg_dispatch(tc, files_context,
+                                           client_tools=body.get("tools"))
                 msgs.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",

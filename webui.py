@@ -303,15 +303,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "enabled": True,
             "max_delegations_per_request": 2,
             "task_cap_chars": 8000,
-            "result_cap_chars": 12000,
+            "result_cap_chars": 0,
             "files_cap_chars": 60000,
             "health_interval_seconds": 60,
             "probe_timeout_seconds": 5,
             "enable_fork_join": True,
-            "max_parallel": 8,
+            "max_parallel": 3,
             "dispatch_cap_per_request": 12,
             "bg_ttl_seconds": 1800,
             "teach_delegation": True,
+            "auto_dispatch": False,
+            "files_first": True,
+            "driver_mode": True,
+            "big_build_nudge": True,
+            "thinking_off": False,
             "system_prompt": "You are a co-worker coding model acting as a subagent for planning, code review, brainstorming and parallel implementation tasks. You receive a self-contained task and optional context. Answer with concrete, actionable output: for planning give a step-by-step plan; for review list issues with file/line references and concrete fixes; for coding give complete, idiomatic code. You have NO access to tools, the conversation history or the workspace — work only from what is given to you.",
         },
         "local_sampling": {
@@ -327,6 +332,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "enable_thinking": True,
             "preserve_thinking": True,
             "thinking_mode": "none",
+            "thinking_off": False,
             "anti_loop_system_prompt": "",
         },
     },
@@ -707,6 +713,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
           <span>Vision (image_url Support)</span>
           <label class="toggle"><input type="checkbox" id="local_is_vision"><span class="slider"></span></label>
         </div>
+        <div class="toggle-row">
+          <span>Thinking OFF erzwingen (Reasoning deaktivieren — überschreibt Client-Request, Thinking Mode und Reasoning-Restart)</span>
+          <label class="toggle"><input type="checkbox" id="local_thinking_off"><span class="slider"></span></label>
+        </div>
         <button class="btn btn-primary" onclick="testCategory('local')" style="margin-top:8px">Test-Endpunkt</button>
         <div class="status-line" id="local_test_status"></div>
       </div>
@@ -777,7 +787,8 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
           </div>
           <div class="form-group">
             <label>Result-Cap (Zeichen)</label>
-            <input type="number" id="coworker_result_cap" min="100" max="100000">
+            <input type="number" id="coworker_result_cap" min="0" max="1000000">
+            <div class="hint">Kürzt Co-Worker-Ergebnisse vor der Rückgabe an das Hauptmodell — 0 = aus (Code-Lieferungen nicht abschneiden).</div>
           </div>
           <div class="form-group">
             <label>Datei-Kontext-Cap (Zeichen)</label>
@@ -804,11 +815,31 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
           <span>Delegations-Anleitung injizieren (system-Message: wann/wie Coworker-Tools nutzen)</span>
           <label class="toggle"><input type="checkbox" id="coworker_teach_delegation" checked><span class="slider"></span></label>
         </div>
+        <div class="toggle-row">
+          <span>Treiber/Experte-Rollenmodell (Hauptmodell = schneller Treiber, Coworker = teurer Experte nur für dichten Code)</span>
+          <label class="toggle"><input type="checkbox" id="coworker_driver_mode" checked><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+          <span>Auto-Dispatch von Todos (verteilt ALLE not-started manage_todo_list-Einträge automatisch an den Coworker — ohne Tool-Zugriff, erzeugt Duplikate; nur mit Fork-Join wirksam)</span>
+          <label class="toggle"><input type="checkbox" id="coworker_auto_dispatch"><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+          <span>Dateikontext vor der Task-Injection (Praefix-Cache-Sharing über parallele Tasks)</span>
+          <label class="toggle"><input type="checkbox" id="coworker_files_first" checked><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+          <span>Big-Build-Nudge (bei "complete/build a …"-Aufträgen Delegations-Hinweis an die User-Message)</span>
+          <label class="toggle"><input type="checkbox" id="coworker_big_build_nudge" checked><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+          <span>Thinking OFF erzwingen (Experte antwortet ohne Reasoning — überschreibt reasoning_effort und enable_thinking auf allen Coworker-Pfaden)</span>
+          <label class="toggle"><input type="checkbox" id="coworker_thinking_off"><span class="slider"></span></label>
+        </div>
         <div class="row">
           <div class="form-group">
             <label>Max. parallele BG-Tasks (Semaphore)</label>
             <input type="number" id="coworker_max_parallel" min="1" max="32">
-            <div class="hint">Gleichzeitige Co-Worker-Calls im Hintergrund (DGX Spark: 8 = Sweet Spot).</div>
+            <div class="hint">Gleichzeitige Co-Worker-Calls — ask_coworker und dispatch zählen gemeinsam. Bei SGLang max_running_requests=4: 3 setzen, einen Slot frei lassen.</div>
           </div>
           <div class="form-group">
             <label>Dispatch-Cap pro Request</label>
@@ -1670,6 +1701,8 @@ async function loadConfig() {
     document.getElementById('local_enable_thinking').checked = ls.enable_thinking !== false;
     document.getElementById('local_preserve_thinking').checked = ls.preserve_thinking !== false;
     document.getElementById('local_thinking_mode').value = ls.thinking_mode || 'none';
+    const lsTOEl = document.getElementById('local_thinking_off');
+    if (lsTOEl) lsTOEl.checked = ls.thinking_off === true;
     document.getElementById('local_anti_loop_system_prompt').value = ls.anti_loop_system_prompt || '';
 
     // Co-Worker-Delegation Settings
@@ -1681,7 +1714,7 @@ async function loadConfig() {
     const cwTaskEl = document.getElementById('coworker_task_cap');
     if (cwTaskEl) cwTaskEl.value = cw.task_cap_chars != null ? cw.task_cap_chars : 8000;
     const cwResultEl = document.getElementById('coworker_result_cap');
-    if (cwResultEl) cwResultEl.value = cw.result_cap_chars != null ? cw.result_cap_chars : 12000;
+    if (cwResultEl) cwResultEl.value = cw.result_cap_chars != null ? cw.result_cap_chars : 0;
     const cwFilesEl = document.getElementById('coworker_files_cap');
     if (cwFilesEl) cwFilesEl.value = cw.files_cap_chars != null ? cw.files_cap_chars : 60000;
     const cwHIntEl = document.getElementById('coworker_health_interval');
@@ -1691,13 +1724,23 @@ async function loadConfig() {
     const cwFJEl = document.getElementById('coworker_fork_join');
     if (cwFJEl) cwFJEl.checked = cw.enable_fork_join !== false;
     const cwMPEl = document.getElementById('coworker_max_parallel');
-    if (cwMPEl) cwMPEl.value = cw.max_parallel != null ? cw.max_parallel : 8;
+    if (cwMPEl) cwMPEl.value = cw.max_parallel != null ? cw.max_parallel : 3;
     const cwDCEl = document.getElementById('coworker_dispatch_cap');
     if (cwDCEl) cwDCEl.value = cw.dispatch_cap_per_request != null ? cw.dispatch_cap_per_request : 12;
     const cwTTLEl = document.getElementById('coworker_bg_ttl');
     if (cwTTLEl) cwTTLEl.value = cw.bg_ttl_seconds != null ? cw.bg_ttl_seconds : 1800;
     const cwTDEl = document.getElementById('coworker_teach_delegation');
     if (cwTDEl) cwTDEl.checked = cw.teach_delegation !== false;
+    const cwDFEl = document.getElementById('coworker_files_first');
+    if (cwDFEl) cwDFEl.checked = cw.files_first !== false;
+    const cwDMEl = document.getElementById('coworker_driver_mode');
+    if (cwDMEl) cwDMEl.checked = cw.driver_mode !== false;
+    const cwADEl = document.getElementById('coworker_auto_dispatch');
+    if (cwADEl) cwADEl.checked = cw.auto_dispatch === true;
+    const cwBBEl = document.getElementById('coworker_big_build_nudge');
+    if (cwBBEl) cwBBEl.checked = cw.big_build_nudge !== false;
+    const cwTOEl = document.getElementById('coworker_thinking_off');
+    if (cwTOEl) cwTOEl.checked = cw.thinking_off === true;
     const cwSPEl = document.getElementById('coworker_system_prompt');
     if (cwSPEl) cwSPEl.value = cw.system_prompt || '';
 
@@ -1798,15 +1841,20 @@ async function saveConfig() {
       enabled: document.getElementById('coworker_enabled')?.checked ?? true,
       max_delegations_per_request: parseInt(document.getElementById('coworker_max_delegations')?.value) || 2,
       task_cap_chars: parseInt(document.getElementById('coworker_task_cap')?.value) || 8000,
-      result_cap_chars: parseInt(document.getElementById('coworker_result_cap')?.value) || 12000,
+      result_cap_chars: (v => Number.isFinite(v) && v >= 0 ? v : 0)(parseInt(document.getElementById('coworker_result_cap')?.value, 10)),
       files_cap_chars: parseInt(document.getElementById('coworker_files_cap')?.value) ?? 60000,
       health_interval_seconds: parseFloat(document.getElementById('coworker_health_interval')?.value) || 60,
       probe_timeout_seconds: parseFloat(document.getElementById('coworker_probe_timeout')?.value) || 5,
       enable_fork_join: document.getElementById('coworker_fork_join')?.checked ?? true,
-      max_parallel: parseInt(document.getElementById('coworker_max_parallel')?.value) || 8,
+      max_parallel: parseInt(document.getElementById('coworker_max_parallel')?.value) || 3,
       dispatch_cap_per_request: parseInt(document.getElementById('coworker_dispatch_cap')?.value) || 12,
       bg_ttl_seconds: parseFloat(document.getElementById('coworker_bg_ttl')?.value) || 1800,
       teach_delegation: document.getElementById('coworker_teach_delegation')?.checked ?? true,
+      auto_dispatch: document.getElementById('coworker_auto_dispatch')?.checked ?? false,
+      files_first: document.getElementById('coworker_files_first')?.checked ?? true,
+      driver_mode: document.getElementById('coworker_driver_mode')?.checked ?? true,
+      big_build_nudge: document.getElementById('coworker_big_build_nudge')?.checked ?? true,
+      thinking_off: document.getElementById('coworker_thinking_off')?.checked ?? false,
       system_prompt: document.getElementById('coworker_system_prompt')?.value || '',
     },
     local_sampling: {
@@ -1822,6 +1870,7 @@ async function saveConfig() {
       enable_thinking: document.getElementById('local_enable_thinking').checked,
       preserve_thinking: document.getElementById('local_preserve_thinking').checked,
       thinking_mode: document.getElementById('local_thinking_mode').value || 'none',
+      thinking_off: document.getElementById('local_thinking_off')?.checked ?? false,
       anti_loop_system_prompt: document.getElementById('local_anti_loop_system_prompt').value || '',
     },
   };

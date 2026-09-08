@@ -839,7 +839,7 @@ def test_local_events_dispatch_streams_note_and_history(monkeypatch):
                 "local-model", content="Endergebnis nach Fork", include_role=True,
                 chunk_id="test")
 
-    async def fake_bg(task, args):
+    async def fake_bg(task, args, client_tools=None):
         task.status = "done"
         task.result = "bg-result"
         task.finished_at = time.time()
@@ -947,7 +947,7 @@ def test_local_events_dispatch_with_vstool_forwards(monkeypatch):
         state["finish_reason"] = "tool_calls"
         yield ": keepalive\n\n"
 
-    async def fake_bg(task, args):
+    async def fake_bg(task, args, client_tools=None):
         task.status = "done"
         task.result = "ok"
         task.finished_at = time.time()

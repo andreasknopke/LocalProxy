@@ -54,6 +54,33 @@ def test_parse_tunnel_id_rejects_foreign_ids():
     assert proxy._cw_parse_tunnel_id("cws_") is None
 
 
+def test_readonly_filter_keeps_only_whitelisted_tools():
+    """Der Co-Worker ist read-only: Schreib-/Exec-Tools werden aus den
+    Client-Tools entfernt, Lesetools bleiben."""
+    tools = [
+        {"type": "function", "function": {"name": "read_file"}},
+        {"type": "function", "function": {"name": "grep_search"}},
+        {"type": "function", "function": {"name": "create_file"}},
+        {"type": "function", "function": {"name": "replace_string_in_file"}},
+        {"type": "function", "function": {"name": "run_in_terminal"}},
+    ]
+    out = proxy._cw_filter_readonly_tools(tools)
+    names = [t["function"]["name"] for t in out]
+    assert names == ["read_file", "grep_search"]
+    # Leere/None-Eingabe ist robust.
+    assert proxy._cw_filter_readonly_tools(None) == []
+    assert proxy._cw_filter_readonly_tools([]) == []
+
+
+def test_session_new_filters_client_tools_readonly():
+    """_cw_session_new filtert client_tools zentral auf read-only."""
+    sess = proxy._cw_session_new(
+        "task", "ctx",
+        client_tools=[{"type": "function", "function": {"name": "read_file"}},
+                      {"type": "function", "function": {"name": "create_file"}}])
+    assert [t["function"]["name"] for t in sess["client_tools"]] == ["read_file"]
+
+
 def test_map_tool_calls_out_assigns_tunnel_ids():
     sess = proxy._cw_session_new("task", "ctx", client_tools=[])
     calls = [{"id": "call_1", "type": "function",
@@ -239,3 +266,103 @@ def test_run_coworker_agent_fallback_no_config(monkeypatch):
     monkeypatch.setattr(proxy, "_MODEL_CATEGORIES", {})
     res = asyncio.run(proxy._run_coworker_agent("task", ""))
     assert res["status"] == "error"
+
+
+# ── Steering-Modell: BG-Dispatch ist tool-los / Single-Shot ───────────────
+
+def test_register_bg_dispatch_ignores_client_tools(monkeypatch):
+    """Steering-Modell: dispatch_coworker laeuft IMMER tool-los, auch wenn der
+    Aufrufer client_tools mitgibt. Der asynchrone Tunnel-Rueckkanal war die
+    Hauptfehlerquelle; der Co-Worker arbeitet stattdessen Single-Shot aus dem
+    angehaengten Datei-Kontext."""
+    seen = {}
+
+    async def _fake_bg(task, args, client_tools=None):
+        seen["client_tools"] = client_tools
+        seen["args"] = args
+
+    monkeypatch.setattr(proxy, "_run_bg_coworker_task", _fake_bg)
+    monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", {})
+    # client_tools werden bewusst NICHT durchgereicht:
+    fake_tools = [{"type": "function",
+                   "function": {"name": "read_file"}}]
+    tc = {"id": "call_x", "type": "function",
+          "function": {"name": proxy._COWORKER_DISPATCH_TOOL_NAME,
+                       "arguments": json.dumps({"task": "mach was", "context": ""})}}
+
+    async def _run():
+        ct = proxy._register_bg_dispatch(tc, "DATEI-KONTEXT",
+                                         client_tools=fake_tools)
+        await ct.aio_task
+        return ct
+
+    ct = asyncio.run(_run())
+    assert ct.file_context == "DATEI-KONTEXT"
+    # Der Coroutine-Argument client_tools muss None sein (tool-los):
+    assert seen["client_tools"] is None
+
+
+# ── Health-Probe Busy-False-Positive ──────────────────────────────────────
+
+def _make_running_task(task_id="cw_busy"):
+    import time as _t
+    ct = proxy.CoworkerTask(task_id=task_id, preview="p", created_at=_t.time())
+    ct.status = "running"
+    return ct
+
+
+def test_probe_keeps_reachable_when_busy(monkeypatch):
+    """Ein Co-Worker mit max_parallel=1 ist waehrend ein Task laeuft nicht
+    anpingbar. Der Probe darf reachable NICHT auf False setzen, solange ein
+    BG-Task laeuft — sonst verschwindet collect_coworker aus der Worker-Liste."""
+    _model_defs_fixture(monkeypatch)
+    monkeypatch.setattr(proxy, "_COWORKER_HEALTH_CACHE",
+                        {"reachable": True, "checked_at": 0.0, "last_error": ""})
+    monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS",
+                        {"cw_busy": _make_running_task()})
+
+    class BoomClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None, headers=None):
+            raise RuntimeError("connect timeout")
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", BoomClient)
+    ok = asyncio.run(proxy._probe_coworker())
+    assert ok is True
+    assert proxy._COWORKER_HEALTH_CACHE["reachable"] is True
+    assert "busy" in proxy._COWORKER_HEALTH_CACHE["last_error"]
+
+
+def test_probe_marks_unreachable_when_idle(monkeypatch):
+    """Ohne laufende BG-Tasks darf ein fehlgeschlagener Probe reachable auf
+    False setzen (echter Ausfall)."""
+    _model_defs_fixture(monkeypatch)
+    monkeypatch.setattr(proxy, "_COWORKER_HEALTH_CACHE",
+                        {"reachable": True, "checked_at": 0.0, "last_error": ""})
+    monkeypatch.setattr(proxy, "_COWORKER_BG_TASKS", {})
+
+    class BoomClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None, headers=None):
+            raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", BoomClient)
+    ok = asyncio.run(proxy._probe_coworker())
+    assert ok is False
+    assert proxy._COWORKER_HEALTH_CACHE["reachable"] is False
