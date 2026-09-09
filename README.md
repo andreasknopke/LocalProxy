@@ -14,7 +14,8 @@ VS Code Copilot  --POST /v1/chat/completions-->  FastAPI Gateway
   |  (tools, messages von VS Code Host)            |
   |                                                 |
   |  1. Auth (PROXY_API_KEY)                        |
-  |  2. Prompt-Flag extrahieren (--light etc.)      |
+  |  2. Modell-Identifier aus body["model"]         |
+  |     (oder Prompt-Flag --light etc.)             |
   |  3. Kategorie auswahlen (oder WebUI-Default)    |
   |  4. Hindsight Recall (System-Message-Prafix)    |
   |  5. Payload bauen + transparente Mods:           |
@@ -36,6 +37,27 @@ VS Code Copilot  --POST /v1/chat/completions-->  FastAPI Gateway
 | `--vision` | Multimodales Modell (GPT-4o) | Bilder, Screenshots, Diagrams |
 
 Ohne Flag wird die in der **WebUI** konfigurierte Default-Kategorie verwendet.
+
+### Modell-Auswahl per Identifier (`body["model"]`)
+
+Alternativ (und mit **höherer Priorität** als das Flag) wählt der Client die
+Kategorie bzw. das Modell über das OpenAI-Standardfeld `model`:
+
+| Identifier | Bedeutung |
+|-----------|-----------|
+| `local`, `coworker`, `light`, `strong`, `vision` | Kategorie, Slot 1 |
+| `light2`, `light3`, `strong2`, `vision2` … | Kategorie + Slot (1-basiert; `light2` = 2. Modell der Kategorie `light`) |
+| Modellname, z.B. `Qwen3.8-27b` | Fuzzy-Match (normalisiert: lowercase, `- _ . /` und Leerzeichen entfernt, Teilstring in beide Richtungen) über **alle** Kategorien, Reihenfolge `local → coworker → light → strong → vision` |
+| unbekannt | Fallback auf `DEFAULT_CATEGORY` (Log-Warnung) |
+
+- **Priorität:** Identifier aus `body["model"]` → Prompt-Flag im aktuellen Turn
+  (`--light 2`) → Prompt-Flag aus der History → Default-Kategorie.
+  Ein Prompt-Flag **mit Slot** im aktuellen Turn schlägt den Slot des Identifiers.
+- Prompt-Flags (`--light`, `--strong 2`, …) funktionieren unverändert weiter.
+- `GET /v1/models` liefert die Identifier (`local`, `light`, `light2`, …) plus
+  die Backend-Modellnamen als Alias — damit erscheinen sie in der
+  Modellauswahl des Clients. Die WebUI zeigt die verfügbaren Identifier im
+  Tab **Modelle** an.
 
 Jede Kategorie ist vollstandig konfigurierbar:
 - `api_url` — OpenAI-kompatibler Endpoint

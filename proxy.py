@@ -12,7 +12,8 @@ Architektur:
 Komponenten:
   1. Qdrant-basiertes Hindsight Memory
   2. 4 Modell-Kategorien: local, light, strong, vision
-  3. Prompt-Flag-Steuerung: --local, --light, --strong, --vision
+  3. Modell-Identifier-Steuerung: body["model"] (local/light/light2/Modellname)
+     sowie Prompt-Flags --local, --light, --strong, --vision
   4. WebUI-Konfiguration (webui.py)
 """
 
@@ -1212,6 +1213,87 @@ def _strip_model_flags_from_messages(messages: List[Dict[str, Any]]) -> List[Dic
                         cleaned, _, _ = _extract_model_flag(block.get("text", ""))
                         block["text"] = cleaned
     return messages
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Model-Identifier ── Kategorie/Modell per body["model"] waehlen
+# ═══════════════════════════════════════════════════════════════════════════
+# Der Client schickt die Modell-ID im OpenAI-Standardfeld `model`. Der Proxy
+# interpretiert sie als Identifier:
+#   "local" | "light" | "strong" | "vision" | "coworker"  → Kategorie, Slot 1
+#   "light2" / "strong3" / "vision1" …                    → Kategorie + Slot n
+#   "Qwen3.8-27b"                                         → Modellname-Match
+#                                                            ueber ALLE Kategorien
+# Unbekannt → None (Aufrufer faellt auf DEFAULT_CATEGORY zurueck).
+
+_IDENTIFIER_CATEGORY_ORDER: Tuple[str, ...] = ("local", "coworker", "light", "strong", "vision")
+
+
+def _normalize_identifier(text: str) -> str:
+    """Normalisiert Identifier/Modellnamen fuer den Vergleich:
+    lowercase, alle Trenn-/Sonderzeichen (./-_ und Whitespace) entfernt."""
+    return re.sub(r'[\s\-_./\\:,]+', '', str(text).lower())
+
+
+def _resolve_model_identifier(identifier: str) -> Optional[Tuple[str, int]]:
+    """Loest einen Modell-Identifier zu (category, def_idx) auf.
+
+    Reihenfolge:
+      1) Kategoriename ("light")                     → (category, 0)
+      2) Kategorie + Ziffer 1-basiert ("light2")     → (category, n-1)
+         Nur wenn der Slot existiert; "light1" == "light".
+      3) Modellname-Match (fuzzy, normalisiert, Teilstring in beide
+         Richtungen) ueber ALLE Kategorien in _IDENTIFIER_CATEGORY_ORDER.
+         Erster Treffer gewinnt.
+    Returns None, wenn nichts passt (kein Kategorie-Name, kein Modell-Match).
+    """
+    raw = str(identifier or "").strip()
+    if not raw:
+        return None
+
+    # 1) + 2) Kategorie (+ optionale Slot-Ziffer)
+    m = re.fullmatch(r'([A-Za-z]+)\s*[-_]?\s*(\d*)', raw)
+    if m:
+        cat = m.group(1).lower()
+        if cat in _VALID_CATEGORIES:
+            slot_str = m.group(2)
+            idx = 0
+            if slot_str:
+                slot_num = int(slot_str)
+                if slot_num < 1:
+                    return None
+                idx = slot_num - 1
+            defs = _model_defs(cat)
+            if idx < len(defs):
+                return (cat, idx)
+            # Slot existiert nicht → Kategorie allein ist trotzdem gueltig
+            if defs and idx > 0:
+                _log(f"Identifier '{raw}': Slot {idx + 1} fuer '{cat}' nicht "
+                     f"konfiguriert ({len(defs)} Slots) → nutze Slot 1")
+                return (cat, 0)
+            return None
+
+    # 3) Modellname-Match ueber alle Kategorien
+    norm_id = _normalize_identifier(raw)
+    if norm_id:
+        for cat in _IDENTIFIER_CATEGORY_ORDER:
+            for i, d in enumerate(_model_defs(cat)):
+                model_name = str(d.get("model_name", "") or "")
+                norm_model = _normalize_identifier(model_name)
+                if not norm_model:
+                    continue
+                if norm_id in norm_model or norm_model in norm_id:
+                    _log(f"Identifier '{raw}' → Modell-Match {cat}[{i}]="
+                         f"{model_name}")
+                    return (cat, i)
+    return None
+
+
+def _identifier_for(category: str, idx: int) -> str:
+    """Kanonischer Identifier fuer (category, idx) — fuer /v1/models."""
+    if idx <= 0:
+        return category
+    return f"{category}{idx + 1}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -6591,7 +6673,24 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
 
     cleaned, flag_category, flag_slot = _extract_model_flag(last_user)
 
-    if flag_category:
+    # Identifier aus body["model"] (OpenAI-Standardfeld) — hoechste Prioritaet.
+    # Der Client waehlt damit Kategorie und/oder Slot: "local", "light",
+    # "light2", "strong3", "Qwen3.8-27b" (Modell-Match ueber alle Kategorien).
+    identifier = str(body.get("model") or "").strip()
+    identifier_match = _resolve_model_identifier(identifier) if identifier else None
+
+    force_start_idx: Optional[int] = None
+    if identifier_match:
+        category, ident_idx = identifier_match
+        if ident_idx > 0:
+            force_start_idx = ident_idx
+    elif identifier:
+        _log(f"Identifier '{identifier}' unbekannt → Fallback "
+             f"{flag_category or DEFAULT_CATEGORY}")
+        category = flag_category or (
+            _find_category_in_messages(msgs, DEFAULT_CATEGORY)
+            if _is_tool_continuation(msgs) else DEFAULT_CATEGORY)
+    elif flag_category:
         # Flag in der aktuellen Message → explizite Wahl
         category = flag_category
     elif _is_tool_continuation(msgs):
@@ -6601,8 +6700,8 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
         # Neuer Request ohne Flag: Default
         category = DEFAULT_CATEGORY
 
-    # Slot-Nummer in 0-basierten Index umrechnen (--light 2 → Idx 1)
-    force_start_idx: Optional[int] = None
+    # Slot-Nummer aus Prompt-Flag (--light 2) schlaegt den Identifier-Slot
+    # (explizite Eingabe im aktuellen Turn gewinnt).
     if flag_slot is not None and category not in ("local", "coworker"):
         force_start_idx = flag_slot - 1  # Slot 1=Idx 0, Slot 2=Idx 1, Slot 3=Idx 2
         defs_validate = _model_defs(category)
@@ -6691,7 +6790,8 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
             _log(f"CW-Tunnel-Resume: Kategorie {category} — {removed} "
                  f"Tunnel-Nachricht(en) entfernt (kein Resume)")
 
-    _log(f"Kategorie: {category} (Flag={'--'+category if flag_category else 'default'}"
+    _log(f"Kategorie: {category} (Quelle="
+         f"{'identifier:'+identifier if identifier_match else ('--'+flag_category if flag_category else 'default')}"
          f"{' Slot='+str(flag_slot) if flag_slot else ''}), "
          f"Idx={active_idx}, Modell={active_model}")
 
@@ -8215,14 +8315,32 @@ async def list_models(request: Request):
     if logs_str and logs_str.isdigit() and int(logs_str) > 0:
         return JSONResponse(content=await _get_logs_handler(lines=int(logs_str)))
     await _auth_or_raise(request)
-    models = []
+    models: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
+
+    def _add(entry: Dict[str, Any]) -> None:
+        if entry["id"] in seen_ids:
+            return
+        seen_ids.add(entry["id"])
+        models.append(entry)
+
     for key in ("local", "coworker", "light", "strong", "vision"):
         defs = _model_defs(key)
         for i, d in enumerate(defs):
-            models.append({
-                "id": d.get("model_name", "?"),
+            model_name = d.get("model_name", "?")
+            # Proxy-Identifier (Kategorie/Slot) — DAS Interface fuer body["model"]
+            _add({
+                "id": _identifier_for(key, i),
+                "object": "model",
+                "owned_by": f"proxy:{key}[{i}]",
+                "backend_model": model_name,
+            })
+            # Backend-Modellname als Alias (Modell-Match im Identifier-Resolver)
+            _add({
+                "id": model_name,
                 "object": "model",
                 "owned_by": f"category:{key}[{i}]",
+                "proxy_identifier": _identifier_for(key, i),
             })
     return JSONResponse(content={"object": "list", "data": models})
 
@@ -8234,6 +8352,16 @@ async def healthz(request: Request):
         "status": "ok",
         "version": "3.0.0",
         "default_category": DEFAULT_CATEGORY,
+        "identifiers": {
+            key: [_identifier_for(key, i) for i in range(len(defs))]
+            for key, defs in {
+                "local": _model_defs("local"),
+                "coworker": _model_defs("coworker"),
+                "light": _model_defs("light"),
+                "strong": _model_defs("strong"),
+                "vision": _model_defs("vision"),
+            }.items() if defs
+        },
         "categories": {
             key: [{
                 "model_name": d.get("model_name", "?"),

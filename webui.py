@@ -611,6 +611,11 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .model-tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
 .model-card { display: none; }
 .model-card.active { display: block; }
+.identifier-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.identifier-list code {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 2px 8px; font-size: 12px; color: var(--accent);
+}
 .model-slot { padding: 4px 0; }
 .status-line { font-size: 0.8rem; color: var(--text2); margin-top: 4px; }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
@@ -653,6 +658,18 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
           <option value="strong">strong — leistungsstarkes Modell</option>
           <option value="vision">vision — multimodales Modell</option>
         </select>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Modell-Identifier (body["model"])</h3>
+      <div class="hint">
+        Diese IDs im Client (z.B. VS Code Copilot) als Modellname eintragen.
+        <code>light2</code> = 2. Slot der Kategorie <code>light</code>;
+        ein Modellname wie <code>Qwen3.8-27b</code> wird in allen Kategorien gesucht.
+      </div>
+      <div id="identifierList" class="identifier-list">
+        <span class="hint">Lade…</span>
       </div>
     </div>
 
@@ -1588,6 +1605,28 @@ function showToast(msg, type) {
   setTimeout(() => { t.classList.remove('show'); }, 3000);
 }
 
+// ============ IDENTIFIER-LISTE ============
+async function loadIdentifiers() {
+  const el = document.getElementById('identifierList');
+  if (!el) return;
+  try {
+    const r = await fetch('/healthz');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    const ids = data.identifiers || {};
+    const chips = [];
+    for (const cat of ['local','coworker','light','strong','vision']) {
+      for (const id of (ids[cat] || [])) chips.push(id);
+    }
+    el.innerHTML = chips.length
+      ? chips.map(c => '<code>' + escapeHtml(c) + '</code>').join('')
+      : '<span class="hint">Keine Modelle konfiguriert</span>';
+  } catch (e) {
+    el.innerHTML = '<span class="hint">Identifier konnten nicht geladen werden: '
+      + escapeHtml(e.message) + '</span>';
+  }
+}
+
 // ============ LOAD CONFIG ============
 async function loadConfig() {
   try {
@@ -2079,6 +2118,7 @@ function togglePw(btn) {
 
 // ============ INIT ============
 loadConfig();
+loadIdentifiers();
 // Fuege Show/Hide-Buttons zu allen Passwortfeldern hinzu
 document.querySelectorAll('input[type=password]').forEach(function(inp) {
   var wrapper = document.createElement('span');
