@@ -1335,7 +1335,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
         <span>Debug-Logs schreiben (proxy.log, Payload-Dumps, I/O-Traces)</span>
         <label class="toggle"><input type="checkbox" id="debug_logging" checked><span class="slider"></span></label>
       </div>
-      <div class="hint">Aus = es werden keine neuen Logs geschrieben — weder proxy.log (Datei + stdout) noch data/debug/ (Payload-Dumps) noch data/io_traces/ (I/O-Traces) noch der Debug-Ring. Die Log-Anzeige unten zeigt dann nur noch die letzten Einträge vor dem Ausschalten. Env-Var: DEBUG_LOGGING.</div>
+      <div class="hint">An = voller Detail-Log: der komplette SSE-Stream wird pro Chunk geloggt, zusätzlich Payload-Dumps in data/debug/, I/O-Traces in data/io_traces/ und der Debug-Ring. Aus = diese Detail-/Stream-Ausgaben werden unterdrückt — das Standard-Log (Requests, Modell-Calls, Fehler, Startup) läuft unverändert weiter und bleibt im Log-Window sichtbar. Env-Var: DEBUG_LOGGING.</div>
     </div>
     <div class="card">
       <h3>Token-Schutz</h3>
@@ -1538,9 +1538,6 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
   <!-- ====== SEKTION: LOGS ====== -->
   <section id="section-logs">
     <div class="card" style="padding:12px">
-      <div id="logDebugHint" style="display:none;margin-bottom:12px;padding:8px 12px;border:1px solid #d2991d;border-radius:6px;background:rgba(210,153,29,.08);color:#d2991d;font-size:0.8rem">
-        ⏸ Debug-Logging ist AUS — es werden keine neuen Logs geschrieben (Anzeige zeigt nur noch alte Einträge). Aktivieren unter <b>Proxy → Debug-Logging</b>.
-      </div>
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px">
         <h3 style="margin:0">Proxy-Logs <span style="font-size:0.75rem;color:var(--text2);font-weight:400" id="logFileLabel"></span></h3>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -1704,8 +1701,6 @@ async function loadConfig() {
     const tk = cfg.tokens || {};
     document.getElementById('tool_result_cap').value = tk.tool_result_cap || 0;
     document.getElementById('debug_logging').checked = tk.debug_logging !== false;
-    const logHint = document.getElementById('logDebugHint');
-    if (logHint) logHint.style.display = tk.debug_logging === false ? 'block' : 'none';
     document.getElementById('read_loop_threshold').value = tk.read_loop_threshold != null ? tk.read_loop_threshold : 3;
     document.getElementById('read_loop_intervention').value = tk.read_loop_intervention || '';
     document.getElementById('search_loop_threshold').value = tk.search_loop_threshold != null ? tk.search_loop_threshold : 3;
