@@ -32,14 +32,16 @@ _WEBUI_LOG_HANDLER = logging.handlers.RotatingFileHandler(
 _WEBUI_LOG_HANDLER.setFormatter(logging.Formatter("%(message)s"))
 
 # Debug-Logging-Master-Schalter (Spiegel von proxy.DEBUG_LOGGING). Wird bei
-# jedem Config-Reload (_reload_proxy_config) mit dem Proxy-Wert synchronisiert;
-# der WebUI-eigene _log schreibt dann ebenfalls nichts mehr.
+# jedem Config-Reload (_reload_proxy_config) mit dem Proxy-Wert synchronisiert.
+# Der WebUI-eigene _log schreibt UNABHAENGIG davon immer — es sind
+# Standard-Betriebsmeldungen (Config-Reload, Neustart), die im Log-Window des
+# WebUI auch bei ausgeschaltetem Debug-Logging sichtbar bleiben sollen.
 _DEBUG_LOGGING: bool = True
 
 
 def _log(msg: str) -> None:
-    if not _DEBUG_LOGGING:
-        return
+    # Standard-Log: schreibt immer (unabhaengig von DEBUG_LOGGING), damit das
+    # Log-Window des WebUI auch bei ausgeschaltetem Debug-Logging gefuellt bleibt.
     import datetime as _dt
     timestamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] [webui] {msg}"

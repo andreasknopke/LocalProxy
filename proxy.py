@@ -71,25 +71,23 @@ _LOG_HANDLER = logging.handlers.RotatingFileHandler(
 _LOG_HANDLER.setFormatter(logging.Formatter("%(message)s"))
 
 # ── Debug-Logging-Master-Schalter ──────────────────────────────────────────
-# Steuert ALLE Debug-/Trace-Ausgaben:
-#   - proxy.log (Datei + stdout, via _log)
+# Steuert die DETAIL-/Trace-Ausgaben (Zusatz zum Standard-Log):
+#   - Kompletter SSE-Stream pro Chunk (via _log_debug im Stream-Pfad)
 #   - Payload-Dumps in data/debug/ (_dump_debug_payload)
 #   - I/O-Traces in data/io_traces/ (io_trace_active)
 #   - Debug-Ring (_register_debug_request)
-# AUS → es wird NICHTS mehr geschrieben; die Log-Anzeige im WebUI zeigt dann
-# nur noch die letzten Eintraege vor dem Abschalten (Anzeige selbst bleibt
-# unveraendert). Steuerbar via WebUI (tokens.debug_logging) oder Env
-# DEBUG_LOGGING (default an).
+# Das STANDARD-Log (REQ-IN/OUT, Model OK/ERROR, Stream OK, Startup, Config …)
+# laeuft ueber _log() und wird UNABHAENGIG von diesem Schalter immer geschrieben
+# — damit im Log-Window des WebUI auch bei ausgeschaltetem Debug-Logging
+# weiterhin die laufenden Ereignisse sichtbar bleiben.
+# Steuerbar via WebUI (tokens.debug_logging) oder Env DEBUG_LOGGING (default an).
 DEBUG_LOGGING: bool = os.getenv("DEBUG_LOGGING", "1").lower() in {"1", "true", "yes", "on"}
 
 
-def _log(msg: str) -> None:
-    """Schreibt eine Log-Zeile mit Timestamp in Datei + stdout.
+def _write_log_line(msg: str) -> None:
+    """Interne Hilfsfunktion: schreibt eine Log-Zeile mit Timestamp in Datei + stdout.
     Faengt UnicodeEncodeError ab (z.B. wenn stdout ASCII-only ist in Docker/CI).
-    Bei DEBUG_LOGGING=False wird nichts geschrieben (Master-Schalter).
     """
-    if not DEBUG_LOGGING:
-        return
     timestamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {msg}"
     # Robustes stdout: fallback auf ASCII-safe print
@@ -104,6 +102,26 @@ def _log(msg: str) -> None:
         ))
     except Exception:
         pass
+
+
+def _log(msg: str) -> None:
+    """Standard-Log: schreibt IMMER (unabhaengig von DEBUG_LOGGING).
+
+    Das ist der laufende Betrieb (Requests, Modell-Calls, Fehler, Startup).
+    Bleibt auch bei ausgeschaltetem Debug-Logging im Log-Window sichtbar.
+    """
+    _write_log_line(msg)
+
+
+def _log_debug(msg: str) -> None:
+    """Debug-Log: schreibt NUR bei DEBUG_LOGGING=True.
+
+    Fuer Detail-/Trace-Ausgaben wie den kompletten SSE-Stream pro Chunk.
+    Bei DEBUG_LOGGING=False wird nichts geschrieben.
+    """
+    if not DEBUG_LOGGING:
+        return
+    _write_log_line(msg)
 
 
 # ── Background-Task-Registry ───────────────────────────────────────────────
@@ -6449,6 +6467,10 @@ async def _log_all_requests(request: Request, call_next):
     # Nur API-Routen loggen, nicht Static/WebUI
     if path.startswith("/webui") or path in ("/docs", "/openapi.json", "/favicon.ico"):
         return await call_next(request)
+    # Health-Check wird vom WebUI regelmaessig gepollt — nicht ins Log schreiben,
+    # damit das Log-Window nicht mit REQ-IN/OUT GET /healthz zugetuellt wird.
+    if path == "/healthz":
+        return await call_next(request)
 
     auth_header = request.headers.get("authorization", "")
     auth_prefix = ""
@@ -7594,6 +7616,9 @@ async def _stream_single_model_events(body: Dict[str, Any], category: str, def_i
                     data = line[len("data:"):].strip()
                     if not data or data == "[DONE]":
                         continue
+                    # Kompletter Stream bei aktivem Debug-Logging: jeder SSE-Chunk
+                    # (rohes JSON) wird geloggt. Bei DEBUG_LOGGING=False unterdrueckt.
+                    _log_debug(f"STREAM-CHUNK cat={category}[{def_idx}] model={model} {data}")
                     try:
                         chunk = json.loads(data)
                     except (json.JSONDecodeError, ValueError):
