@@ -2138,12 +2138,40 @@ document.querySelectorAll('input[type=password]').forEach(function(inp) {
 # API Endpoints
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _resolve_live_proxy_module():
+    """Loest das Modul, dessen Global-Variablen der LAUFENDEN Server bedient.
+
+    Wichtig: Bei Start via 'python proxy.py' ist das laufende Server-Modul
+    '__main__' — NICHT 'proxy'. Ein 'import proxy' / 'from proxy import ...'
+    legt eine ZWEITE Modul-Kopie mit eigenen Globals an; ein Reload wuerde dort
+    schreiben, waehrend die Requests weiterhin die (alten) Globals von '__main__'
+    lesen. Deshalb wird das lebende Modul explizit aufgeloest:
+      - '__main__' ist das laufende Proxy-Modul, wenn 'python proxy.py' gestartet
+        wurde (erkennbar am Attribut _apply_config_file).
+      - Sonst (z.B. 'uvicorn proxy:app') ist es das 'proxy'-Modul.
+    """
+    import sys
+    main_mod = sys.modules.get("__main__")
+    if main_mod is not None and hasattr(main_mod, "_apply_config_file"):
+        return main_mod
+    proxy_mod = sys.modules.get("proxy")
+    if proxy_mod is None:
+        import proxy as proxy_mod  # type: ignore
+    return proxy_mod
+
+
 def _reload_proxy_config() -> None:
     global _DEBUG_LOGGING
     try:
-        from proxy import _apply_config_file, DEBUG_LOGGING
-        _DEBUG_LOGGING = bool(DEBUG_LOGGING)
-        _apply_config_file()
+        proxy_mod = _resolve_live_proxy_module()
+        _DEBUG_LOGGING = bool(getattr(proxy_mod, "DEBUG_LOGGING", True))
+        # Rueckkopie: WebUI-Schalter auf den Wert des lebenden Moduls setzen,
+        # damit beide Prozesse/Module konsistent bleiben.
+        try:
+            proxy_mod.DEBUG_LOGGING = _DEBUG_LOGGING
+        except Exception:
+            pass
+        proxy_mod._apply_config_file()
         _log("Proxy-Config aus config.json neu geladen (in-process)")
     except Exception as e:
         _log(f"Proxy-Config-Reload fehlgeschlagen: {e}")
