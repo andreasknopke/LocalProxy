@@ -2990,12 +2990,13 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
     # Reasoning-Restart: Thinking fuer den Folgeturn erzwingen AUS (Modell soll
     # direkt antworten statt erneut endlos zu denken). Qwen3-/vLLM-Templates
     # respektieren chat_template_kwargs.enable_thinking=false.
+    # WICHTIG: dabei MUSS reasoning_effort entfernt werden — ein Reasoning-Effort
+    # > none zusammen mit enable_thinking=false lehnt vLLM/Qwen3 mit HTTP 400 ab
+    # (Request bricht sofort ab). _force_thinking_off_payload entfernt beides
+    # konsistent (reasoning_effort/reasoning + Template-Kwargs).
     if force_no_thinking:
-        payload["chat_template_kwargs"] = {
-            "enable_thinking": False,
-            "preserve_thinking": False,
-        }
-        _log("Reasoning-Restart: enable_thinking=false fuer Folgeturn gesetzt")
+        _force_thinking_off_payload(payload, "Reasoning-Restart")
+        _log("Reasoning-Restart: Thinking AUS fuer Folgeturn gesetzt")
 
     # Thinking-OFF-Schalter (WebUI/Env): steht ABSICHTLICH nach allen anderen
     # Thinking-Patches, damit der Schalter ueber Client-Request,
