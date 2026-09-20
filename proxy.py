@@ -7954,12 +7954,17 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
                 msgs = body.get("messages")
                 if isinstance(msgs, list):
                     msgs.append({"role": "user", "content": hint})
-                is_restart_turn = True  # ab jetzt Thinking erzwungen AUS
+                # KEINE Aenderung des Thinking-Levels: is_restart_turn bleibt
+                # unveraendert (force_no_thinking NICHT gesetzt). Ein Wechsel von
+                # reasoning_effort/enable_thinking wuerde den KV-/Prompt-Cache des
+                # Backends invalidieren -> langer Re-Prefill ohne Cache. Der
+                # "STOP LOOPING"-Hinweis allein soll das Looping brechen; das
+                # Reasoning-Level bleibt identisch, damit der Praefix-Cache trifft.
                 _log(f"Loop-Guard: Wiederholung erkannt ({(loop_hit or {}).get('kind')} "
                      f"x{(loop_hit or {}).get('count')}, "
                      f"snippet={(loop_hit or {}).get('snippet','')[:60]!r}) — "
-                     f"Backend-Stream abgebrochen, Folgeturn mit Anti-Loop-Hinweis "
-                     f"(Restarts uebrig={loop_restarts_left})")
+                     f"Backend-Stream abgebrochen, Folgeturn mit STOP-LOOPING-Hinweis "
+                     f"(Thinking-Level unveraendert, Restarts uebrig={loop_restarts_left})")
                 continue
             # Restarts erschoepft: trailing Wiederholung aus dem content trimmen
             # und den Turn sauber beenden (kein endloser Loop, kein Fehler).
