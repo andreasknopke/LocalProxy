@@ -402,8 +402,9 @@ LOCAL_ENABLE_THINKING: bool = os.getenv("LOCAL_ENABLE_THINKING", "true").lower()
 LOCAL_PRESERVE_THINKING: bool = os.getenv("LOCAL_PRESERVE_THINKING", "true").lower() in {"1", "true", "yes", "y", "on"}
 # Thinking-Mode fuer das lokale Modell: ueberschreibt reasoning_effort aus dem
 # originalen VSCode-Request. "none" = kein Reasoning (Feld wird entfernt).
+# "passthrough" = Reasoning-Werte des Requests werden nicht angefasst.
 LOCAL_THINKING_MODE: str = os.getenv("LOCAL_THINKING_MODE", "none").strip().lower()
-_VALID_THINKING_MODES = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+_VALID_THINKING_MODES = {"none", "passthrough", "minimal", "low", "medium", "high", "xhigh", "max"}
 # Thinking-OFF-Schalter Worker (Kategorie 'local'): ignoriert ALLE Thinking-
 # Parameter aus dem Client-Request UND der LOCAL_THINKING_MODE-Konfiguration
 # und erzwingt Reasoning AUS (reasoning_effort entfernt,
@@ -2759,11 +2760,15 @@ def _patch_thinking_mode_payload(payload: Dict[str, Any]) -> None:
     """Setzt den konfigurierten Thinking-Mode (LOCAL_THINKING_MODE) im Payload.
 
     Ueberschreibt das reasoning_effort aus dem originalen VSCode-Request:
-      - "none"   -> reasoning_effort wird entfernt, enable_thinking=false
-      - sonst    -> reasoning_effort=<mode> + enable_thinking=true
+      - "none"        -> reasoning_effort wird entfernt, enable_thinking=false
+      - "passthrough" -> Reasoning-Werte des Requests bleiben unveraendert
+      - sonst         -> reasoning_effort=<mode> + enable_thinking=true
     """
     mode = LOCAL_THINKING_MODE
     if mode not in _VALID_THINKING_MODES:
+        return
+    if mode == "passthrough":
+        _log("Thinking-Mode 'passthrough': reasoning_effort des Requests bleibt unveraendert")
         return
     if mode == "none":
         if "reasoning_effort" in payload:

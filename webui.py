@@ -1517,6 +1517,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
       <div class="form-group">
         <label>Thinking Mode (überschreibt reasoning_effort aus dem VSCode-Request)</label>
         <select id="local_thinking_mode">
+          <option value="passthrough">passthrough — Reasoning-Werte des Requests behalten</option>
           <option value="none">none — kein Reasoning</option>
           <option value="minimal">minimal</option>
           <option value="low">low</option>
@@ -1525,7 +1526,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
           <option value="xhigh">xhigh</option>
           <option value="max">max</option>
         </select>
-        <div class="hint">Wird in den ausgehenden Request als reasoning_effort gepatcht (none = Feld entfernt)</div>
+        <div class="hint">Wird in den ausgehenden Request als reasoning_effort gepatcht (none = Feld entfernt, passthrough = Request unverändert)</div>
       </div>
       <div class="form-group">
         <label>Anti-Loop-System-Prompt (optional)</label>
