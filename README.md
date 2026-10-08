@@ -281,6 +281,18 @@ Refactore die Architektur --strong
   jedem Request vorangestellt.
 - **Transparente Modifikationen**: image_url-Sanitizer fur text-only Modelle.
 - **Tool-Result-Capping**: Verhindert Token-Bombing durch grosse grep/read-Results.
+- **Tool-Call-Reparatur**: Lokale Modelle (Qwen & Co.) schreiben Tool-Calls
+  haufig als Markup in den `content` statt als strukturierte `tool_calls`
+  (`<tool_call><function=edit><parameter=path>…</parameter></function>`,
+  Hermes-JSON, `<invoke name=…>`, DSML — auch mit fehlenden Schluss-Tags).
+  Der Proxy parst das Markup zuruck in strukturierte `tool_calls` und haelt es
+  im Live-Stream zuruck, damit der Client das Markup nie zu sehen bekommt
+  (`_parse_text_tool_calls` / `_ToolCallTextShield`). Greift im Stream, im
+  2-Pass-Pfad und in den Co-Worker-Tunnel-Runden. Greift nur, wenn wirklich ein
+  Call erkannt wird — Text, der Markup nur erwaehnt, bleibt unveraendert.
+- **SSE-Terminator**: Jeder Streaming-Turn endet mit `data: [DONE]`. Ohne den
+  Terminator betrachten OpenAI-kompatible Clients (VS Code Copilot,
+  openai-python) den Stream als unvollstandig und brechen den Request ab.
 - **Read-Loop-Detection**: Erkennt wenn ein Modell dieselbe Datei mit denselben
   Zeilen >N mal hintereinander liest (Default: >3) und injiziert eine
   Interventions-Message ("STOP LOOPING!..."). Konfigurierbar via `READ_LOOP_THRESHOLD`

@@ -1832,7 +1832,8 @@ def _contains_tool_calls(text: str) -> bool:
     if not text:
         return False
     return bool(
-        re.search(r'</?(?:tool_call|tool_calls|invoke|function_call)', text)
+        _TOOL_CALL_OPENER_RE.search(text)
+        or re.search(r'</?(?:tool_call|tool_calls|invoke|function_call)', text)
         or re.search(r'<[a-z_]+_tool', text)
         or "callTool" in text
         or "DSML" in text
@@ -1840,6 +1841,411 @@ def _contains_tool_calls(text: str) -> bool:
         or "\uff5c\uff5cinvoke" in text
         or "<｜｜DSML｜｜tool_calls>" in text
     )
+
+
+# ── Text-Tool-Call-Reparatur ────────────────────────────────────────────────
+# Lokale Modelle emittieren Tool-Calls oft NICHT als strukturierte
+# message.tool_calls, sondern als Markup im content:
+#
+#   <tool_call>{"name": "read_file", "arguments": {"filePath": "x"}}</tool_call>
+#   <tool_call><function=edit><parameter=path>a</parameter></function></tool_call>
+#   <function=read_file><parameter=filePath>x</parameter></function>
+#   <invoke name="read_file"><parameter name="filePath">x</parameter></invoke>
+#
+# Ohne Reparatur sieht der Client nur Markup und fuehrt nichts aus — der Turn
+# bricht faktisch ab. Die Helfer hier parsen diese Formen zurueck in
+# strukturierte tool_calls und entfernen das Markup aus dem sichtbaren Text.
+# Defekte Klammern sind der Normalfall: fehlt das Schluss-Tag, wird der Body
+# bis zum naechsten Opener bzw. bis zum Textende genommen.
+
+# Tag-Namen, die als Tool-Call-Opener gelten. Zeichen wie ｜ (U+FF5C) und
+# das DSML-Praefix werden mitgeduldet.
+_TOOL_CALL_OPENER_RE = re.compile(
+    r"<(?:[\uff5c|]{0,2}DSML[\uff5c|]{0,2})?"
+    r"(?P<tag>tool_calls?|function_call|invoke|function)"
+    r"[\uff5c|]{0,2}(?=[=/\s>])(?P<attrs>[^>]{0,400})>",
+    re.IGNORECASE,
+)
+# Optionales Markup-Praefix (｜｜ bzw. ｜｜DSML｜｜) vor jedem Tag-Namen.
+_TC_PFX = r"[\uff5c|]{0,2}(?:DSML[\uff5c|]{0,2})?"
+_QWEN_FUNCTION_RE = re.compile(
+    r"<" + _TC_PFX + r"function[\uff5c|]{0,2}\s*=\s*(?P<name>[^>\s]+)\s*>"
+    r"(?P<body>.*?)(?:</" + _TC_PFX + r"function[\uff5c|]{0,2}\s*>|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+_QWEN_PARAM_RE = re.compile(
+    r"<" + _TC_PFX + r"parameter[\uff5c|]{0,2}\s*=\s*(?P<key>[^>\s]+)\s*>"
+    r"(?P<val>.*?)(?:</" + _TC_PFX + r"parameter[\uff5c|]{0,2}\s*>|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+_XML_PARAM_RE = re.compile(
+    r"<" + _TC_PFX + r"parameter[\uff5c|]{0,2}\s+name\s*=\s*[\"'](?P<key>[^\"']+)[\"'][^>]*>"
+    r"(?P<val>.*?)</" + _TC_PFX + r"parameter[\uff5c|]{0,2}\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_ATTR_NAME_RE = re.compile(r"name\s*=\s*[\"']([^\"']+)[\"']", re.IGNORECASE)
+_TC_NAME_KEYS = ("name", "tool", "tool_name", "recipient_name", "function")
+_TC_ARG_KEYS = ("arguments", "args", "parameters", "parameter", "input", "payload")
+# Erlaubte Tool-Namen: verhindert, dass Markup-Reste als Call durchrutschen.
+_TC_NAME_OK_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
+
+
+def _extract_json_objects(s: str) -> List[str]:
+    """Liefert alle balancierten JSON-Objekte/-Arrays aus s (Klammer-Matching,
+    String-/Escape-aware). Bricht bei abgeschnittenem JSON ab."""
+    out: List[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        if s[i] not in "{[":
+            i += 1
+            continue
+        depth, in_str, esc, j = 0, False, False, i
+        closed = False
+        while j < n:
+            c = s[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+            elif c == '"':
+                in_str = True
+            elif c in "{[":
+                depth += 1
+            elif c in "}]":
+                depth -= 1
+                if depth == 0:
+                    out.append(s[i:j + 1])
+                    closed = True
+                    break
+            j += 1
+        if not closed:
+            break
+        i = j + 1
+    return out
+
+
+def _tc_call_from_obj(obj: Any) -> Optional[Dict[str, Any]]:
+    """Baut aus einem JSON-Objekt {name|tool|function, arguments|parameters}
+    ein Call-Dict. Gibt None zurueck, wenn kein plausibler Name vorhanden ist."""
+    if not isinstance(obj, dict):
+        return None
+    name = ""
+    for key in _TC_NAME_KEYS:
+        val = obj.get(key)
+        if isinstance(val, str) and val.strip():
+            name = val.strip()
+            break
+        if isinstance(val, dict) and isinstance(val.get("name"), str) and val["name"].strip():
+            name = val["name"].strip()
+            break
+    if not _TC_NAME_OK_RE.match(name):
+        return None
+    # Argumente: erst im verschachtelten function-Objekt (OpenAI-Form
+    # {"type":"function","function":{"name":…,"arguments":…}}), dann oben.
+    args: Any = None
+    nested = obj.get("function")
+    for source in (nested if isinstance(nested, dict) else {}, obj):
+        for key in _TC_ARG_KEYS:
+            if key in source:
+                args = source[key]
+                break
+        if args is not None:
+            break
+    if args is None:
+        args = {k: v for k, v in obj.items()
+                if k not in _TC_NAME_KEYS and k not in ("id", "type")}
+    return {"name": name, "arguments": args}
+
+
+def _strip_param_value(val: str) -> str:
+    """Entfernt nur die Formatierungs-Newlines des Markups — Code-Einrueckung
+    und Zeilenumbrueche INNERHALB des Wertes bleiben erhalten."""
+    if val.startswith("\r\n"):
+        val = val[2:]
+    elif val.startswith("\n"):
+        val = val[1:]
+    return val.rstrip()
+
+
+def _text_call_objs(tag: str, attrs: str, body: str) -> List[Dict[str, Any]]:
+    """Extrahiert Call-Objekte aus dem Body eines Tool-Call-Blocks.
+    Unterstuetzt JSON, Qwen/ChatML (<function=...><parameter=...>) und
+    Anthropic-invoke (<invoke name="x"><parameter name="y">v</parameter>)."""
+    body = body or ""
+    # 1) JSON zuerst — deckt Hermes/Qwen-JSON und Tool-JSON-Listen ab.
+    candidates = _extract_json_objects(body)
+    if not candidates:
+        stripped = body.strip()
+        if stripped.startswith(("{", "[")):
+            candidates = [stripped]
+    for cand in candidates:
+        try:
+            parsed = json.loads(cand)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        items = parsed if isinstance(parsed, list) else [parsed]
+        found = [c for c in (_tc_call_from_obj(it) for it in items) if c]
+        if found:
+            return found
+
+    # 2) Name aus dem Opener-Tag (invoke name="x" / function=name)
+    inv_name = ""
+    m = _ATTR_NAME_RE.search(attrs or "")
+    if m:
+        inv_name = m.group(1).strip()
+    elif tag == "function":
+        m2 = re.match(r"\s*=\s*([^\s>]+)", attrs or "")
+        if m2:
+            inv_name = m2.group(1).strip()
+
+    calls: List[Dict[str, Any]] = []
+    if _TC_NAME_OK_RE.match(inv_name):
+        args: Dict[str, Any] = {}
+        for pm in _XML_PARAM_RE.finditer(body):
+            args[pm.group("key").strip()] = _strip_param_value(pm.group("val"))
+        for pm in _QWEN_PARAM_RE.finditer(body):
+            args.setdefault(pm.group("key").strip(), _strip_param_value(pm.group("val")))
+        calls.append({"name": inv_name, "arguments": args})
+
+    # 3) Eingebettete <function=NAME>-Bloecke (auch ohne invoke-Wrapper)
+    for fm in _QWEN_FUNCTION_RE.finditer(body):
+        name = (fm.group("name") or "").strip()
+        if not _TC_NAME_OK_RE.match(name):
+            continue
+        inner = fm.group("body") or ""
+        fargs: Dict[str, Any] = {}
+        for pm in _QWEN_PARAM_RE.finditer(inner):
+            fargs[pm.group("key").strip()] = _strip_param_value(pm.group("val"))
+        for pm in _XML_PARAM_RE.finditer(inner):
+            fargs[pm.group("key").strip()] = _strip_param_value(pm.group("val"))
+        calls.append({"name": name, "arguments": fargs})
+    return calls
+
+
+def _find_text_tool_call_blocks(text: str) -> List[Dict[str, Any]]:
+    """Findet Tool-Call-Markup-Bloecke im Text.
+
+    Fehlt das Schluss-Tag (haeufigster Defekt), reicht der Body bis zum
+    naechsten Opener bzw. bis zum Textende."""
+    matches = list(_TOOL_CALL_OPENER_RE.finditer(text))
+    blocks: List[Dict[str, Any]] = []
+    last_end = -1
+    for i, m in enumerate(matches):
+        if m.start() < last_end:
+            # verschachtelt (z.B. <function=…> innerhalb von <tool_call>) —
+            # der aeussere Block enthaelt den Body bereits.
+            continue
+        tag = m.group("tag").lower()
+        close_re = re.compile(r"</" + _TC_PFX + re.escape(tag) + r"[\uff5c|]{0,2}\s*>",
+                              re.IGNORECASE)
+        cm = close_re.search(text, m.end())
+        if cm:
+            end, body = cm.end(), text[m.end():cm.start()]
+        else:
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            body = text[m.end():end]
+        blocks.append({"tag": tag, "attrs": m.group("attrs") or "",
+                       "body": body, "start": m.start(), "end": end})
+        last_end = end
+    return blocks
+
+
+_TC_RESIDUE_RE = re.compile(
+    r"</?" + _TC_PFX + r"(?:tool_calls?|function_call|invoke|function|parameter)"
+    r"[\uff5c|]{0,2}[^>\n]{0,200}>",
+    re.IGNORECASE,
+)
+
+
+# Ein angebrochener Opener am Chunk-Ende: "<" + optionales Praefix + Anfang
+# eines der bekannten Tag-Namen (noch ohne '>'). Nur echte Praefixe werden
+# gehalten — normaler Text mit "<" (z.B. "a < b") fliesst sofort durch.
+_TC_TAG_NAMES = ("tool_calls", "tool_call", "function_call", "invoke", "function")
+_TC_LEAD_PFX_RE = re.compile(r"^[\uff5c|]{0,2}(?:DSML[\uff5c|]{0,2})?", re.IGNORECASE)
+
+# Nach einem Opener muss innerhalb dieses Fensters ein Call-Signal stehen
+# (verschachteltes Tag oder JSON-Key) — sonst ist der Opener Prosa, die das
+# Markup nur erwaehnt (z.B. "<tool_call> ist veraltet"). Ohne diese Pruefung
+# wuerde der Shield den restlichen Turn zurueckhalten und der Stream stocken.
+_TC_HOLD_GATE: int = 300
+_TC_SIG_RE = re.compile(
+    r"<(?:[\uff5c|]{0,2}DSML[\uff5c|]{0,2})?"
+    r"(?:function|parameter|invoke|tool_calls?|function_call)[\uff5c|]{0,2}[\s=/>]"
+    r"|[{\[]\s*\{?\s*[\"']?(?:name|tool|tool_name|arguments|parameters|args)"
+    r"[\"']?\s*[:=]",
+    re.IGNORECASE,
+)
+
+
+def _partial_tag_suffix_len(text: str) -> int:
+    """Laenge des Textendes, das ein angebrochener Tool-Call-Opener sein koennte
+    (0 = nichts zurueckhalten). Verhindert, dass "<tool_cal" + "l>" durchrutscht."""
+    idx = text.rfind("<")
+    if idx < 0:
+        return 0
+    tail = text[idx + 1:]
+    if len(tail) > 24 or ">" in tail or " " in tail or "\n" in tail or "\t" in tail:
+        return 0
+    tail = _TC_LEAD_PFX_RE.sub("", tail, count=1)
+    if any(name.startswith(tail.lower()) for name in _TC_TAG_NAMES):
+        return len(text) - idx
+    return 0
+
+
+def _strip_tool_call_markup(text: str, spans: List[Tuple[int, int]]) -> str:
+    """Entfernt die Call-Bloecke + uebrig gebliebene Markup-Reste."""
+    if spans:
+        parts: List[str] = []
+        pos = 0
+        for start, end in sorted(spans):
+            if start > pos:
+                parts.append(text[pos:start])
+            pos = max(pos, end)
+        parts.append(text[pos:])
+        text = "".join(parts)
+    text = _TC_RESIDUE_RE.sub("", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _parse_text_tool_calls(text: str, allowed: Optional[set] = None
+                           ) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+    """Repariert Tool-Calls, die als Text im content stehen.
+
+    Returns (bereinigter_text, tool_calls|None). Es wird nur dann Markup
+    entfernt, wenn mindestens ein Call erkannt wurde — legitimer Text, der
+    zufaellig Markup erwaehnt, bleibt unangetastet."""
+    if not isinstance(text, str) or not text or not _contains_tool_calls(text):
+        return text, None
+
+    objs: List[Dict[str, Any]] = []
+    spans: List[Tuple[int, int]] = []
+    for blk in _find_text_tool_call_blocks(text):
+        found = _text_call_objs(blk["tag"], blk["attrs"], blk["body"])
+        if found:
+            objs.extend(found)
+            spans.append((blk["start"], blk["end"]))
+    if not objs:
+        return text, None
+
+    raw = []
+    for i, o in enumerate(objs):
+        args = o.get("arguments")
+        if isinstance(args, str):
+            args_json = _normalize_tool_call_arguments(args)
+        else:
+            try:
+                args_json = json.dumps(args if args is not None else {}, ensure_ascii=False)
+            except (TypeError, ValueError):
+                args_json = "{}"
+        raw.append({
+            "id": f"call_{uuid.uuid4().hex[:12]}",
+            "type": "function",
+            "index": i,
+            "function": {"name": o["name"], "arguments": args_json},
+        })
+    calls = _normalize_tool_calls(raw, allowed)
+    if not calls:
+        return text, None
+    clean = _strip_tool_call_markup(text, spans)
+    _log(f"Tool-Call-Reparatur: {len(calls)} Call(s) aus Text-Markup extrahiert "
+         f"({', '.join(t['function']['name'] for t in calls)})")
+    return clean, calls
+
+
+def _repair_tool_calls_from_text(content: str, tool_calls: Optional[List[Dict[str, Any]]],
+                                 allowed: Optional[set] = None
+                                 ) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+    """Fallback fuer Nicht-Streaming-Pfade: leitet tool_calls aus Text-Markup
+    im content ab, wenn das Backend keine strukturierten tool_calls lieferte."""
+    if tool_calls:
+        return content, tool_calls
+    if not isinstance(content, str) or not content.strip():
+        return content, tool_calls
+    clean, parsed = _parse_text_tool_calls(content, allowed)
+    if parsed:
+        return clean, parsed
+    return content, tool_calls
+
+
+class _ToolCallTextShield:
+    """Haelt verdaechtigen Text zurueck, damit Text-Tool-Calls nicht live als
+    Markup zum Client fliessen.
+
+    Der Shield puffert ab dem ersten Opener-Tag (<tool_call>, <function=…> …)
+    bis zum Turn-Ende. Entpuppt sich der Puffer als Tool-Call, wird er in
+    strukturierte tool_calls umgewandelt (finish_reason=tool_calls); andernfalls
+    wird er unveraendert nachgeliefert. Text vor dem Opener fliesst sofort.
+
+    Ein angebrochener Opener am Chunk-Ende (z.B. "<tool_cal" + "l>") wird
+    ebenfalls zurueckgehalten, damit das Markup nicht doch noch durchrutscht.
+    Stellt sich der Opener als Prosa heraus (kein Call-Signal innerhalb von
+    _TC_HOLD_GATE Zeichen), wird der Puffer sofort freigegeben."""
+
+    def __init__(self) -> None:
+        self.buf = ""          # noch nicht ausgelieferter Text (kein Opener)
+        self.held = ""         # Text ab erkanntem Opener
+        self.active = False
+        self._gate_start = 0   # Offset im held: direkt hinter dem Opener
+        self._committed = False  # Call-Signal gesehen → bis Turn-Ende halten
+
+    def feed(self, text: str) -> str:
+        """Gibt den sofort weiterleitbaren Text zurueck (ggf. "" wenn gehalten)."""
+        if not text:
+            return ""
+        out: List[str] = []
+        pending = text
+        while pending:
+            if self.active:
+                self.held += pending
+                pending = ""
+                if not self._committed:
+                    if _TC_SIG_RE.search(self.held, self._gate_start):
+                        self._committed = True
+                    elif len(self.held) - self._gate_start > _TC_HOLD_GATE:
+                        # Prosa statt Tool-Call: freigeben (der Rest des Turns
+                        # darf nicht bis zum Ende gepuffert bleiben), Tail
+                        # erneut pruefen.
+                        out.append(self.held[:self._gate_start])
+                        pending = self.held[self._gate_start:]
+                        self.held, self.active = "", False
+                        self._committed, self._gate_start, self.buf = False, 0, ""
+                continue
+            self.buf += pending
+            pending = ""
+            m = _TOOL_CALL_OPENER_RE.search(self.buf)
+            if m:
+                out.append(self.buf[:m.start()])
+                self.held = self.buf[m.start():]
+                self._gate_start = m.end() - m.start()
+                self._committed = False
+                self.buf = ""
+                self.active = True
+                continue
+            keep = _partial_tag_suffix_len(self.buf)
+            if keep:
+                out.append(self.buf[:-keep])
+                self.buf = self.buf[-keep:]
+                continue
+            out.append(self.buf)
+            self.buf = ""
+        return "".join(out)
+
+    def finalize(self) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+        """Turn-Ende: (freizugebender_text, tool_calls|None)."""
+        if self.active:
+            held, self.held, self.active = self.held, "", False
+            self._committed, self._gate_start = False, 0
+            _, calls = _parse_text_tool_calls(held)
+            if calls:
+                return "", calls
+            return held, None
+        rest, self.buf = self.buf, ""
+        return rest, None
 
 
 def _normalize_tool_call_arguments(args: Any) -> str:
@@ -3178,6 +3584,7 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
             io_log_backend_response(req_id, model, result, http_status=200)
             message = _extract_choice_message(result)
             content, reasoning_content, tool_calls = _extract_message_parts(result)
+            content, tool_calls = _repair_tool_calls_from_text(content, tool_calls)
             if tool_calls:
                 _log(f"Model returned structured tool_calls: {len(tool_calls)}")
             if reasoning_content:
@@ -3235,6 +3642,7 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
                             result = response2.json()
                             message = _extract_choice_message(result)
                             content, reasoning_content, tool_calls = _extract_message_parts(result)
+                            content, tool_calls = _repair_tool_calls_from_text(content, tool_calls)
                             _log(f"   → Retry mit max_completion_tokens ERFOLGREICH! Model={model_name}")
                             return {
                                 "category": category, "def_idx": def_idx, "status": "ok",
@@ -3267,6 +3675,7 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
                         result = response2.json()
                         message = _extract_choice_message(result)
                         content, reasoning_content, tool_calls = _extract_message_parts(result)
+                        content, tool_calls = _repair_tool_calls_from_text(content, tool_calls)
                         _log(f"   → Retry ohne reasoning_effort ERFOLGREICH!")
                         return {
                             "category": category, "def_idx": def_idx, "status": "ok",
@@ -4572,6 +4981,9 @@ async def _cw_stream_round(sess: Dict[str, Any], queue: asyncio.Queue,
     cw_reason_guard = _TextLoopGuard(enabled=LOOP_GUARD_ENABLED)
     cw_content_guard = _TextLoopGuard(enabled=LOOP_GUARD_ENABLED)
     cw_loop_hit: Optional[Dict[str, Any]] = None
+    # Auch der Co-Worker kann Tool-Calls als Markup in den content schreiben
+    # (Tool-loser Subagent) — Shield + Reparatur wie beim Hauptmodell.
+    cw_shield = _ToolCallTextShield()
 
     async def push_reasoning(rc: str) -> None:
         await queue.put(_format_openai_stream_chunk(
@@ -4614,8 +5026,10 @@ async def _cw_stream_round(sess: Dict[str, Any], queue: asyncio.Queue,
                             if cw_loop_hit is None:
                                 cw_loop_hit = cw_content_guard.feed(c, "content")
                             if cw_loop_hit is None:
-                                content_parts.append(c)
-                                await push_content(c)
+                                visible = cw_shield.feed(c)
+                                if visible:
+                                    content_parts.append(visible)
+                                    await push_content(visible)
                         else:
                             rp, cp = _split_think_chunk(c, think_state)
                             if rp:
@@ -4627,8 +5041,10 @@ async def _cw_stream_round(sess: Dict[str, Any], queue: asyncio.Queue,
                                 if cw_loop_hit is None:
                                     cw_loop_hit = cw_content_guard.feed(cp, "content")
                                 if cw_loop_hit is None:
-                                    content_parts.append(cp)
-                                    await push_content(cp)
+                                    visible = cw_shield.feed(cp)
+                                    if visible:
+                                        content_parts.append(visible)
+                                        await push_content(visible)
                     if cw_loop_hit is not None:
                         # Loop erkannt: Backend-Stream des Co-Workers intern abbrechen.
                         _log(f"CW-Tunnel {sid}: Loop-Guard Treffer "
@@ -4649,8 +5065,24 @@ async def _cw_stream_round(sess: Dict[str, Any], queue: asyncio.Queue,
             if think_state.get("in_think"):
                 await push_reasoning(pending)
             else:
-                content_parts.append(pending)
-                await push_content(pending)
+                visible = cw_shield.feed(pending)
+                if visible:
+                    content_parts.append(visible)
+                    await push_content(visible)
+
+        # Shield aufloesen: Markup-Tool-Calls werden strukturiert (Tunnel-Format
+        # entsteht beim Aufrufer), Nicht-Calls unveraendert nachgeliefert.
+        if status != "loop":
+            flushed, shield_calls = cw_shield.finalize()
+            if flushed:
+                content_parts.append(flushed)
+                await push_content(flushed)
+            elif shield_calls:
+                _accumulate_stream_tool_calls(tc_state, [
+                    {"index": i, "id": tc["id"], "type": "function",
+                     "function": tc["function"]}
+                    for i, tc in enumerate(shield_calls)
+                ])
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -5748,6 +6180,11 @@ async def _call_model_with_fallbacks(body: Dict[str, Any], category: str,
 # Streaming-Formatierung (OpenAI SSE)
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Terminator jeder SSE-Antwort (OpenAI-Protokoll). Wird von _io_tee nach dem
+# regulaeren Generator-Ende gesendet.
+SSE_DONE: str = "data: [DONE]\n\n"
+
+
 def _format_openai_stream_chunk(
     model: str,
     content: str = "",
@@ -6383,6 +6820,11 @@ async def _io_tee(gen: AsyncIterator[str],
         # GeneratorExit (Client-Disconnect) landet nicht in except Exception
         if io_trace_get_turn():
             io_end_turn(end_extra)
+    # Normaler Abschluss: OpenAI-SSE-Terminator. Ohne "data: [DONE]" halten
+    # OpenAI-kompatible Clients (VS Code Copilot, openai-python) den Stream fuer
+    # unvollstaendig und brechen den Turn ab ("Request aborted").
+    io_log_client_sse(SSE_DONE)
+    yield SSE_DONE
 
 
 # Maximale Lebensdauer eines aktiven Calls (Sekunden). Darueber wird der
@@ -7735,6 +8177,9 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
         })
         state["content"] = saved_content
         think_state: Dict[str, Any] = {"in_think": False, "pending": ""}
+        # Text-Tool-Call-Shield: haelt Markup zurueck, das ein Tool-Call sein
+        # koennte (siehe _ToolCallTextShield) — pro Turn frisch.
+        text_shield = _ToolCallTextShield()
         cap_triggered = False
         loop_hit: Optional[Dict[str, Any]] = None
         if loop_guard is not None:
@@ -7873,12 +8318,14 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
                                 restart_requested = True
                                 restart_reason = "loop-guard"
                                 break
-                        state["content"] = (state.get("content") or "") + c
-                        yield _format_openai_stream_chunk(
-                            state.get("model", category), content=c,
-                            include_role=not state.get("role_sent"),
-                            chunk_id=state.get("stream_id"))
-                        state["role_sent"] = True
+                        visible = text_shield.feed(c)
+                        if visible:
+                            state["content"] = (state.get("content") or "") + visible
+                            yield _format_openai_stream_chunk(
+                                state.get("model", category), content=visible,
+                                include_role=not state.get("role_sent"),
+                                chunk_id=state.get("stream_id"))
+                            state["role_sent"] = True
                     else:
                         # <think>...</think> im content (vLLM Qwen3 preserve_thinking)
                         # → als eigenen Reasoning-Context mappen, Rest als content
@@ -7921,12 +8368,14 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
                                     restart_requested = True
                                     restart_reason = "loop-guard"
                                     break
-                            state["content"] = (state.get("content") or "") + content_part
-                            yield _format_openai_stream_chunk(
-                                state.get("model", category), content=content_part,
-                                include_role=not state.get("role_sent"),
-                                chunk_id=state.get("stream_id"))
-                            state["role_sent"] = True
+                            visible = text_shield.feed(content_part)
+                            if visible:
+                                state["content"] = (state.get("content") or "") + visible
+                                yield _format_openai_stream_chunk(
+                                    state.get("model", category), content=visible,
+                                    include_role=not state.get("role_sent"),
+                                    chunk_id=state.get("stream_id"))
+                                state["role_sent"] = True
 
                 tcs = delta.get("tool_calls")
                 if tcs:
@@ -7940,7 +8389,36 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
                 if think_state.get("in_think"):
                     state["reasoning"] = (state.get("reasoning") or "") + pending
                 else:
-                    state["content"] = (state.get("content") or "") + pending
+                    # Sichtbaren Rest (angebrochener <think>-Tag oder Markup)
+                    # durch den Shield — sonst ginge der Text dem Client verloren.
+                    visible = text_shield.feed(pending)
+                    if visible:
+                        state["content"] = (state.get("content") or "") + visible
+                        yield _format_openai_stream_chunk(
+                            state.get("model", category), content=visible,
+                            include_role=not state.get("role_sent"),
+                            chunk_id=state.get("stream_id"))
+                        state["role_sent"] = True
+
+            # ── Text-Tool-Call-Shield aufloesen ──
+            # Der gepufferte Text ab dem ersten Opener-Tag wird jetzt bewertet:
+            # Ist er ein Tool-Call, geht er als strukturierter tool_call an den
+            # Client (finish_reason=tool_calls) statt als Markup-Text.
+            if not restart_requested:
+                flushed, shield_calls = text_shield.finalize()
+                if flushed:
+                    state["content"] = (state.get("content") or "") + flushed
+                    yield _format_openai_stream_chunk(
+                        state.get("model", category), content=flushed,
+                        include_role=not state.get("role_sent"),
+                        chunk_id=state.get("stream_id"))
+                    state["role_sent"] = True
+                elif shield_calls:
+                    _accumulate_stream_tool_calls(state, [
+                        {"index": i, "id": tc["id"], "type": "function",
+                         "function": tc["function"]}
+                        for i, tc in enumerate(shield_calls)
+                    ])
         finally:
             if not task.done():
                 task.cancel()
