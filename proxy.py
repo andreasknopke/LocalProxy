@@ -405,6 +405,12 @@ LOCAL_PRESERVE_THINKING: bool = os.getenv("LOCAL_PRESERVE_THINKING", "true").low
 # "passthrough" = Reasoning-Werte des Requests werden nicht angefasst.
 LOCAL_THINKING_MODE: str = os.getenv("LOCAL_THINKING_MODE", "none").strip().lower()
 _VALID_THINKING_MODES = {"none", "passthrough", "minimal", "low", "medium", "high", "xhigh", "max"}
+# Text-Tool-Call-Shield: haelt Markup im Live-Stream zurueck, das ein Tool-Call
+# sein koennte (lokale Modelle emittieren Calls oft als Text-Markup).
+# Default AUS: Der Shield puffert Text ab dem ersten Opener-Tag und macht das
+# Streaming blockweise (Text kommt in einem Block statt Wort fuer Wort).
+# Nur aktivieren, wenn das Backend Tool-Calls als Text-Markup liefert.
+TOOL_CALL_SHIELD_ENABLED: bool = os.getenv("LOCAL_TOOL_CALL_SHIELD", "false").lower() in {"1", "true", "yes", "y", "on"}
 # Thinking-OFF-Schalter Worker (Kategorie 'local'): ignoriert ALLE Thinking-
 # Parameter aus dem Client-Request UND der LOCAL_THINKING_MODE-Konfiguration
 # und erzwingt Reasoning AUS (reasoning_effort entfernt,
@@ -2246,6 +2252,19 @@ class _ToolCallTextShield:
             return held, None
         rest, self.buf = self.buf, ""
         return rest, None
+
+
+class _NoopTextShield:
+    """Durchlaesseriger Shield: leitet jeden Chunk sofort weiter, ohne zu
+    puffern. Wird verwendet, wenn der Text-Tool-Call-Shield deaktiviert ist
+    (TOOL_CALL_SHIELD_ENABLED=False) oder der Request keine Tools mitlaeuft.
+    Behaelt die gleiche Schnittstelle wie _ToolCallTextShield (feed/finalize)."""
+
+    def feed(self, text: str) -> str:
+        return text
+
+    def finalize(self) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+        return "", None
 
 
 def _normalize_tool_call_arguments(args: Any) -> str:
@@ -8215,6 +8234,12 @@ async def _stream_single_model_events(body: Dict[str, Any], category: str, def_i
                         continue
                     _io_collect(chunk)
                     yield {"type": "chunk", "choice": choices[0]}
+                    # Manche Backends (vLLM, Ollama, LM Studio) liefern usage
+                    # im selben Chunk wie finish_reason (nicht als separaten
+                    # Chunk mit leeren choices). Auch hier extrahieren.
+                    usage = chunk.get("usage")
+                    if isinstance(usage, dict):
+                        yield {"type": "usage", "usage": usage}
 
                 duration = time.perf_counter() - started
                 io_log_backend_response(req_id, model,
@@ -8312,7 +8337,11 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
         think_state: Dict[str, Any] = {"in_think": False, "pending": ""}
         # Text-Tool-Call-Shield: haelt Markup zurueck, das ein Tool-Call sein
         # koennte (siehe _ToolCallTextShield) — pro Turn frisch.
-        text_shield = _ToolCallTextShield()
+        # NUR aktiv, wenn (a) der Schalter an ist UND (b) der Request Tools
+        # mitlaeuft. Ohne Tools gibt es nichts zu reparieren — dann ist der
+        # Shield ein reiner Puffer, der das Streaming blockweise macht.
+        _tools_present = bool(body.get("tools"))
+        text_shield = _ToolCallTextShield() if (TOOL_CALL_SHIELD_ENABLED and _tools_present) else _NoopTextShield()
         cap_triggered = False
         loop_hit: Optional[Dict[str, Any]] = None
         if loop_guard is not None:

@@ -338,6 +338,7 @@ def test_sse_done_constant_format():
 def test_backend_turn_repairs_leaked_text_tool_call(monkeypatch):
     """Tool-Call-Markup im content wird nicht an den Client gestreamt, sondern
     in strukturierte tool_calls umgewandelt (state['tool_calls'])."""
+    monkeypatch.setattr(proxy, "TOOL_CALL_SHIELD_ENABLED", True)
     async def fake_single(body, category, def_idx, inject_hindsight=True, force_no_thinking=False):
         yield {"type": "chunk", "choice": {"delta": {"content": "Ich editiere die Datei.\n"}, "finish_reason": None}}
         yield {"type": "chunk", "choice": {"delta": {"content": "<tool_call>\n<function=edit>\n"}, "finish_reason": None}}
@@ -348,7 +349,8 @@ def test_backend_turn_repairs_leaked_text_tool_call(monkeypatch):
 
     monkeypatch.setattr(proxy, "_stream_single_model_events", fake_single)
     state: Dict[str, Any] = {"stream_id": "s", "role_sent": False}
-    sse = _collect_sse(proxy._stream_backend_turn({"messages": []}, "local", None, state))
+    body = {"messages": [], "tools": [{"type": "function", "function": {"name": "edit"}}]}
+    sse = _collect_sse(proxy._stream_backend_turn(body, "local", None, state))
     joined = "\n".join(sse)
 
     assert "<tool_call>" not in joined
@@ -399,9 +401,11 @@ def test_io_tee_end_to_end_repairs_markup_and_terminates(monkeypatch):
         yield {"type": "done"}
 
     monkeypatch.setattr(proxy, "_stream_single_model_events", fake_single)
+    monkeypatch.setattr(proxy, "TOOL_CALL_SHIELD_ENABLED", True)
     state: Dict[str, Any] = {"stream_id": "s", "role_sent": False}
+    body = {"messages": [], "tools": [{"type": "function", "function": {"name": "edit"}}]}
     sse = _collect_sse(proxy._io_tee(
-        proxy._stream_backend_turn({"messages": []}, "local", None, state)))
+        proxy._stream_backend_turn(body, "local", None, state)))
     joined = "\n".join(sse)
 
     assert joined.rstrip().endswith("data: [DONE]")
