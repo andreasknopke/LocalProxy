@@ -8,6 +8,7 @@ Testet:
   4) Response-Payload (OpenAI-Shape)
 """
 
+import asyncio
 import json
 import os
 import sys
@@ -191,6 +192,243 @@ def test_sanitize_all_images_fallback():
     assert len(content) == 1
     assert content[0]["type"] == "text"
     assert "omitted" in content[0]["text"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2b. image_url in Nicht-User-Nachrichten (Vision-Backends)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_fix_non_user_images_relocates_tool_image_to_user_message():
+    """Screenshot-Tool-Results (role=tool) werden in die User-Nachricht verschoben."""
+    img = {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+    msgs = [
+        {"role": "user", "content": [{"type": "text", "text": "look at the page"}]},
+        {"role": "assistant", "content": "screenshotting"},
+        {"role": "tool", "content": [{"type": "text", "text": "screenshot taken"}, img]},
+    ]
+    moved = proxy._fix_non_user_image_urls_inplace(msgs, relocate=True)
+    assert moved == 1
+    # Tool-Nachricht enthaelt kein Bild mehr
+    tool_parts = msgs[2]["content"]
+    assert all(p.get("type") != "image_url" for p in tool_parts)
+    assert tool_parts[0]["text"] == "screenshot taken"
+    # Bild haengt jetzt an der User-Nachricht, Text bleibt erhalten
+    user_parts = msgs[0]["content"]
+    assert user_parts[0] == {"type": "text", "text": "look at the page"}
+    assert user_parts[-1] == img
+
+
+def test_fix_non_user_images_relocates_into_string_user_content():
+    img = {"type": "image_url", "image_url": {"url": "http://x/img.png"}}
+    msgs = [
+        {"role": "user", "content": "hello"},
+        {"role": "tool", "content": [img]},
+    ]
+    moved = proxy._fix_non_user_image_urls_inplace(msgs, relocate=True)
+    assert moved == 1
+    user_parts = msgs[0]["content"]
+    assert user_parts[0] == {"type": "text", "text": "hello"}
+    assert user_parts[1] == img
+    # Leere Tool-Nachricht bekommt Platzhaltertext
+    assert msgs[1]["content"] == [{"type": "text", "text": proxy._IMAGE_OMITTED_NOTE}]
+
+
+def test_fix_non_user_images_drops_without_user_message():
+    img = {"type": "image_url", "image_url": {"url": "http://x/img.png"}}
+    msgs = [{"role": "tool", "content": [img]}]
+    moved = proxy._fix_non_user_image_urls_inplace(msgs, relocate=True)
+    assert moved == 1
+    assert msgs[0]["content"] == [{"type": "text", "text": proxy._IMAGE_OMITTED_NOTE}]
+
+
+def test_fix_non_user_images_relocate_false_strips():
+    img = {"type": "image_url", "image_url": {"url": "http://x/img.png"}}
+    msgs = [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {"role": "tool", "content": [{"type": "text", "text": "res"}, img]},
+    ]
+    moved = proxy._fix_non_user_image_urls_inplace(msgs, relocate=False)
+    assert moved == 1
+    assert all(p.get("type") != "image_url" for p in msgs[1]["content"])
+    # User-Nachricht bleibt unveraendert
+    assert msgs[0]["content"] == [{"type": "text", "text": "hi"}]
+
+
+def test_fix_non_user_images_keeps_user_images():
+    img = {"type": "image_url", "image_url": {"url": "http://x/img.png"}}
+    msgs = [{"role": "user", "content": [{"type": "text", "text": "hi"}, img]}]
+    moved = proxy._fix_non_user_image_urls_inplace(msgs, relocate=True)
+    assert moved == 0
+    assert msgs[0]["content"][-1] == img
+
+
+def test_build_passthrough_payload_vision_moves_tool_image():
+    """Vision-Kategorie: Tool-Bild wandert in die User-Nachricht statt zu fliegen."""
+    vision_defs = proxy._model_defs("vision")
+    if not vision_defs or not vision_defs[0].get("is_vision"):
+        pytest.skip("vision category not configured with is_vision=True")
+    img = {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+    body = {
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "show page"}]},
+            {"role": "tool", "content": [{"type": "text", "text": "shot"}, img]},
+        ],
+    }
+    payload = proxy._build_passthrough_payload(body, "vision")
+    msgs = payload["messages"]
+    assert all(
+        p.get("type") != "image_url"
+        for p in msgs[1]["content"]
+    ), "Tool-Nachricht darf kein image_url mehr enthalten"
+    assert any(
+        p.get("type") == "image_url" for p in msgs[0]["content"]
+    ), "Bild muss in der User-Nachricht gelandet sein"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2c. 400-Retry: "image_url parts are supported only in user messages"
+# ═══════════════════════════════════════════════════════════════════════════
+
+_IMAGE_400_ERROR = {"error": {"message": "image_url parts are supported only in user messages"}}
+_OK_CHOICE = {"choices": [{"message": {"role": "assistant", "content": "ok", "tool_calls": None}}]}
+
+
+def _vision_local_defs(monkeypatch):
+    monkeypatch.setattr(proxy, "_MODEL_CATEGORIES", {
+        "local": {"api_url": "http://x/v1/chat/completions", "api_key": "",
+                  "model_name": "qwen-vl", "timeout_seconds": 5,
+                  "is_vision": True, "retry_on_timeout": 0},
+    })
+    # Keine I/O-Traces ins Repo schreiben (data/io_traces/).
+    monkeypatch.setattr(proxy, "IO_TRACE_ENABLED", False)
+
+
+def _body_with_tool_image():
+    return {"messages": [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {"role": "tool", "content": [
+            {"type": "text", "text": "screenshot"}, 
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+        ]},
+    ]}
+
+
+def _payload_has_image(payload: Dict[str, Any]) -> bool:
+    for m in payload.get("messages", []) or []:
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, list):
+            if any(isinstance(p, dict) and p.get("type") == "image_url" for p in content):
+                return True
+    return False
+
+
+class _FakeJsonResp:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+        self.text = json.dumps(payload)
+        self.headers: Dict[str, Any] = {}
+
+    def json(self):
+        return self._payload
+
+
+class _FakeStreamResp:
+    def __init__(self, status_code=200, payload=None, lines=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self._lines = lines or []
+        self.headers: Dict[str, Any] = {}
+
+    async def aread(self):
+        return json.dumps(self._payload).encode()
+
+    async def aiter_lines(self):
+        for ln in self._lines:
+            yield ln
+
+
+class _FakeStreamCtx:
+    def __init__(self, resp):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *a):
+        return False
+
+
+async def _collect_events(agen) -> List[Dict[str, Any]]:
+    return [e async for e in agen]
+
+
+def test_call_single_model_retries_after_image_url_400(monkeypatch):
+    """HTTP 400 'image_url parts...' → Payload reparieren und einmal erneut senden."""
+    _vision_local_defs(monkeypatch)
+    posted: List[Dict[str, Any]] = []
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None, headers=None):
+            posted.append(json)
+            if len(posted) == 1:
+                return _FakeJsonResp(_IMAGE_400_ERROR, 400)
+            return _FakeJsonResp(_OK_CHOICE)
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    res = asyncio.run(proxy._call_single_model(_body_with_tool_image(), "local",
+                                               inject_hindsight=False))
+    assert res["status"] == "ok"
+    assert len(posted) == 2, "400 mit image_url muss genau einen Retry ausloesen"
+    assert _payload_has_image(posted[0]) is True
+    assert _payload_has_image(posted[1]) is False, "Retry-Payload darf keine Bilder mehr enthalten"
+
+
+def test_stream_single_model_retries_after_image_url_400(monkeypatch):
+    """Stream-Pfad: 400 mit image_url → Stream schliessen, Payload reparieren,
+    einmal neu oeffnen und den Antwort-Stream normal durchreichen."""
+    _vision_local_defs(monkeypatch)
+    posted: List[Dict[str, Any]] = []
+    responses = [
+        _FakeStreamResp(400, _IMAGE_400_ERROR),
+        _FakeStreamResp(200, {}, lines=[
+            'data: {"choices":[{"delta":{"content":"hi"},"index":0}]}',
+            "data: [DONE]",
+        ]),
+    ]
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def stream(self, method, url, json=None, headers=None):
+            posted.append(json)
+            return _FakeStreamCtx(responses.pop(0))
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    events = asyncio.run(_collect_events(
+        proxy._stream_single_model_events(_body_with_tool_image(), "local",
+                                          inject_hindsight=False)))
+    assert len(posted) == 2, "400 mit image_url muss genau einen Stream-Retry ausloesen"
+    assert _payload_has_image(posted[0]) is True
+    assert _payload_has_image(posted[1]) is False
+    assert any(e.get("type") == "done" for e in events)
+    assert not any(e.get("type") == "error" for e in events)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

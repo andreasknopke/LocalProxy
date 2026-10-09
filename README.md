@@ -20,6 +20,9 @@ VS Code Copilot  --POST /v1/chat/completions-->  FastAPI Gateway
   |  4. Hindsight Recall (System-Message-Prafix)    |
   |  5. Payload bauen + transparente Mods:           |
   |     - image_url strippen (wenn is_vision=false)  |
+  |     - image_url aus Nicht-User-Messages          |
+  |       (reinschieben in die letzte User-Message   |
+  |        oder strippen, wenn is_vision=true)       |
   |     - Tool-Result-Capping (Token-Bombing)       |
   |  6. Request ans Modell --> Stream zuruck        |
   |  7. Background: Hindsight Retain                |
@@ -64,7 +67,10 @@ Jede Kategorie ist vollstandig konfigurierbar:
 - `api_key` — API-Key (Bearer-Token)
 - `model_name` — Name des Modells fur den Endpoint
 - `max_tokens` — max. Antwort-Tokens
-- `is_vision` — wenn `true`, werden image_url-Parts nicht gestrippt
+- `is_vision` — wenn `true`, bleiben Bilder in User-Nachrichten erhalten;
+  Bilder aus Nicht-User-Nachrichten (z.B. Screenshot-Tool-Results) werden in
+  die letzte User-Nachricht verschoben, da das Backend Bilder nur dort
+  akzeptiert. Wenn `false`, werden alle image_url-Parts gestrippt.
 - `timeout_seconds` — Timeout pro Request
 
 ## Co-Worker-Delegation (ask_coworker)
@@ -280,6 +286,11 @@ Refactore die Architektur --strong
   Recall-Ergebnisse werden als `[HINDSIGHT MEMORY CONTEXT]` System-Message
   jedem Request vorangestellt.
 - **Transparente Modifikationen**: image_url-Sanitizer fur text-only Modelle.
+  Vision-Backends akzeptieren Bilder nur in User-Nachrichten ("image_url parts
+  are supported only in user messages"); Bild-Parts aus Tool-Results
+  (Playwright-Screenshots) werden deshalb in die letzte User-Nachricht
+  verschoben. Sollte das Backend trotzdem mit HTTP 400 antworten, repariert der
+  Proxy den Payload und wiederholt den Request einmal (auch im Stream-Pfad).
 - **Tool-Result-Capping**: Verhindert Token-Bombing durch grosse grep/read-Results.
 - **Tool-Call-Reparatur**: Lokale Modelle (Qwen & Co.) schreiben Tool-Calls
   haufig als Markup in den `content` statt als strukturierte `tool_calls`

@@ -2850,6 +2850,63 @@ def _sanitize_image_urls_inplace(messages: List[Dict[str, Any]], label: str = "P
     return removed
 
 
+_IMAGE_OMITTED_NOTE = "[image content omitted: backend accepts images only in user messages]"
+
+
+def _fix_non_user_image_urls_inplace(messages: List[Dict[str, Any]], label: str = "Payload",
+                                     relocate: bool = True) -> int:
+    """Entfernt image_url-Parts aus Nicht-User-Nachrichten.
+
+    Vision-Backends (vLLM/Qwen3-Chat-Template) akzeptieren Bilder NUR in
+    User-Nachrichten. Screenshot-Tool-Results (role=tool) fuehren deshalb zu
+    HTTP 400 "image_url parts are supported only in user messages".
+
+    Mit ``relocate=True`` werden die Bilder an die letzte User-Nachricht
+    angehaengt (das Modell sieht sie dann trotzdem, da Bilder im Prompt
+    funktionieren), sonst verworfen. In beiden Faellen bleibt in der
+    betroffenen Nachricht ein Platzhaltertext stehen.
+    """
+    host: Optional[Dict[str, Any]] = None
+    if relocate:
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                host = msg
+
+    def _as_parts(content: Any) -> List[Dict[str, Any]]:
+        if isinstance(content, list):
+            return list(content)
+        if isinstance(content, str) and content.strip():
+            return [{"type": "text", "text": content}]
+        return []
+
+    affected = 0
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") == "user":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        kept: List[Dict[str, Any]] = []
+        images: List[Dict[str, Any]] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                images.append(part)
+            else:
+                kept.append(part)
+        if not images:
+            continue
+        affected += len(images)
+        if host is not None:
+            host["content"] = _as_parts(host.get("content")) + images
+        if not kept:
+            kept = [{"type": "text", "text": _IMAGE_OMITTED_NOTE}]
+        msg["content"] = kept
+    if affected:
+        verb = "in die letzte User-Nachricht verschoben" if host is not None else "entfernt"
+        _log(f"{label}-Payload: {affected} image_url-Part(s) aus Nicht-User-Nachrichten {verb}")
+    return affected
+
+
 # ── Response-Level Loop-Enforcement ────────────────────────────────────────
 # Letzter Ausweg: Wenn das Modell trotz History-Intervention denselben
 # Read/Search-Loop fortsetzt, werden die offending tool_calls aus der Response
@@ -3388,6 +3445,11 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
 
     if not cat.get("is_vision", False):
         _sanitize_image_urls_inplace(messages, "Passthrough")
+    else:
+        # Vision-Backend: Bilder sind nur in User-Nachrichten erlaubt. Bilder aus
+        # Nicht-User-Nachrichten (z.B. Playwright-Screenshot-Tool-Results) in die
+        # letzte User-Nachricht verschieben, sonst HTTP 400 des Backends.
+        _fix_non_user_image_urls_inplace(messages, "Passthrough", relocate=True)
 
     # Laguna-S-2.1 Sampling + Anti-Loop: derzeit deaktiviert (Laguna nicht mehr im Einsatz)
     # if _is_laguna_model(cat["model_name"]):
@@ -3655,6 +3717,46 @@ async def _call_single_model(body: Dict[str, Any], category: str, def_idx: int =
                             _log(f"   → Retry mit max_completion_tokens auch fehlgeschlagen: HTTP {response2.status_code}")
                     except Exception as retry_exc:
                         _log(f"   → Retry mit max_completion_tokens Exception: {_safe_str(retry_exc)}")
+            # Pruefen ob image_url-Parts ausserhalb von User-Nachrichten liegen
+            # (Vision-Backends erlauben Bilder nur in User-Nachrichten; Screenshot-
+            # Tool-Results landen als role=tool mit image_url im Payload).
+            if "image_url" in err_detail.lower():
+                _log(f"   → 400 deutet auf image_url in Nicht-User-Nachricht hin: {err_detail}")
+                payload_retry = copy.deepcopy(payload)
+                retry_msgs = payload_retry.get("messages", [])
+                removed = 0
+                if isinstance(retry_msgs, list):
+                    removed = _fix_non_user_image_urls_inplace(retry_msgs, "400-Retry", relocate=False)
+                    if not removed:
+                        # Kein Nicht-User-Bild gefunden — letzter Ausweg: alle
+                        # image_url-Parts entfernen.
+                        removed = _sanitize_image_urls_inplace(retry_msgs, "400-Retry")
+                if removed:
+                    _log(f"   → Retry nach image_url-Sanitizer ({removed} Part(s) entfernt)...")
+                    try:
+                        async with httpx.AsyncClient(timeout=_http_timeout) as client:
+                            response2 = await client.post(
+                                api_url, json=payload_retry, headers=_api_headers(api_key),
+                            )
+                        if response2.status_code == 200:
+                            result = response2.json()
+                            message = _extract_choice_message(result)
+                            content, reasoning_content, tool_calls = _extract_message_parts(result)
+                            content, tool_calls = _repair_tool_calls_from_text(content, tool_calls)
+                            _log(f"   → Retry nach image_url-Sanitizer ERFOLGREICH! Model={model}")
+                            return {
+                                "category": category, "def_idx": def_idx, "status": "ok",
+                                "content": content, "message": message,
+                                "tool_calls": tool_calls, "reasoning_content": reasoning_content,
+                                "duration_seconds": time.perf_counter() - started, "usage": result.get("usage"),
+                                "trigger_fallback": False,
+                            }
+                        else:
+                            _log(f"   → Retry nach image_url-Sanitizer auch fehlgeschlagen: HTTP {response2.status_code}")
+                    except Exception as retry_exc_img:
+                        _log(f"   → Retry nach image_url-Sanitizer Exception: {_safe_str(retry_exc_img)}")
+                else:
+                    _log("   → Keine image_url-Parts im Payload gefunden, kein Retry")
             # Pruefen ob reasoning_effort mit tools inkompatibel ist (gpt-5 Serie)
             if "reasoning_effort" in err_detail.lower() and "tools" in err_detail.lower():
                 _log(f"   → 400 deutet auf reasoning_effort-Tools-Inkompatibilitaet hin: {err_detail}")
@@ -8011,18 +8113,49 @@ async def _stream_single_model_events(body: Dict[str, Any], category: str, def_i
                 return
 
             try:
-                if response.status_code != 200:
+                image_retry_done = False
+                while response.status_code != 200:
                     err_detail = await _read_stream_error(response)
-                    duration = time.perf_counter() - started
                     io_log_backend_response(req_id, model, {
                         "error": {"http_status": response.status_code,
                                   "message": err_detail,
                                   "note": f"backend_error: HTTP {response.status_code} (stream open)"}},
                         http_status=response.status_code)
+                    _log(f"Stream STATUS {response.status_code} cat={category}[{def_idx}] "
+                         f"duration={time.perf_counter() - started:.1f}s: {err_detail}")
+
+                    # Vision-Backends lehnen image_url-Parts ausserhalb von
+                    # User-Nachrichten mit HTTP 400 ab (Screenshot-Tool-Results).
+                    # Payload reparieren und den Stream EINMAL neu oeffnen.
+                    if (response.status_code == 400 and not image_retry_done
+                            and "image_url" in err_detail.lower()):
+                        retry_msgs = payload.get("messages", [])
+                        if isinstance(retry_msgs, list):
+                            image_retry_done = True
+                            if entered and stream_ctx is not None:
+                                try:
+                                    await stream_ctx.__aexit__(None, None, None)
+                                except Exception:
+                                    pass
+                                entered = False
+                                stream_ctx = None
+                            payload = copy.deepcopy(payload)
+                            retry_msgs = payload.get("messages", [])
+                            removed = _fix_non_user_image_urls_inplace(retry_msgs, "Stream-400-Retry",
+                                                                      relocate=False)
+                            if not removed:
+                                removed = _sanitize_image_urls_inplace(retry_msgs, "Stream-400-Retry")
+                            _log(f"   → 400 image_url: Payload repariert ({removed} Part(s)), "
+                                 f"Stream-Retry...")
+                            stream_ctx = client.stream("POST", api_url, json=payload,
+                                                       headers=_api_headers(api_key))
+                            response = await stream_ctx.__aenter__()
+                            entered = True
+                            continue
+                        _log("   → 400 image_url: keine messages im Payload, kein Retry")
+
                     duration = time.perf_counter() - started
                     _finish_active_call(req_id, "error", {"duration_seconds": duration, "error": err_detail})
-                    _log(f"Stream STATUS {response.status_code} cat={category}[{def_idx}] "
-                         f"duration={duration:.1f}s: {err_detail}")
                     should_fallback = True
                     if response.status_code == 400:
                         should_fallback = False
