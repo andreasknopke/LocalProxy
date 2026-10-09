@@ -6328,7 +6328,13 @@ def _format_openai_stream_chunk(
     else:
         if reasoning_content is not None:
             delta["reasoning_content"] = reasoning_content
-        delta["content"] = content
+            # Kein leeres "content" neben reasoning_content — VS Code
+            # interpretiert das Vorhandensein von "content" als
+            # Content-Chunk und bufferst den Reasoning-Text.
+            if content:
+                delta["content"] = content
+        else:
+            delta["content"] = content
         if include_role:
             delta["role"] = "assistant"
     cid = chunk_id or f"chatcmpl-spark-{uuid.uuid4().hex}"
