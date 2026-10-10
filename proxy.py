@@ -1334,9 +1334,10 @@ def _detect_reset_flag(text: str) -> bool:
 
 
 def _do_reset() -> None:
-    """Setzt alle Kategorien auf Primary (Idx=0). Loescht Cooldowns."""
+    """Setzt alle Kategorien auf Primary (Idx=0). Loescht Cooldowns und Affinity-Map."""
     for key in ("light", "strong", "vision", "coworker"):
         _CATEGORY_ACTIVE_IDX[key] = 0
+    _AFFINITY_MAP.clear()
     # Cooldowns leeren
     try:
         if COOLDOWN_FILE.exists():
@@ -1344,6 +1345,84 @@ def _do_reset() -> None:
     except OSError:
         pass
     _log("Reset: alle Kategorien auf Primary (Idx=0), Cooldowns geleert")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Prefix-Cache Affinity — Konversation → Backend-Slot
+# ═══════════════════════════════════════════════════════════════════════════
+# Ziel: SGLang RadixAttention / vLLM-Prefix-Cache / llama.cpp treffen auf
+# byte-identische Praefixe. Ohne Affinitaet schaltet ein einzelner Fallback-
+# Erfolg den globalen active_idx um — danach läuft GESAMTER Traffic (alle
+# anderen Konversationen!) auf dem neuen Slot und verliert dessen Cache-Warmup.
+# Hier wird JEDE Konversation per Hash ihrer ersten User-Message an ihren
+# Serving-Slot gepinnt; der globale active_idx bleibt als Default fuer neue
+# Konversationen erhalten.
+
+AFFINITY_ENABLED: bool = os.getenv("AFFINITY_ENABLED", "true").lower() in {"1", "true", "yes", "y", "on"}
+# Pin-Lebensdauer in Sekunden. Bei Lookup-Treffer wird erneuert (LRU + TTL).
+AFFINITY_TTL_SECONDS: float = float(os.getenv("AFFINITY_TTL_SECONDS", "86400"))
+# Maximal gespeicherte Pins (einfache LRU-Evictierung über Dict-Reihenfolge).
+AFFINITY_MAX_ENTRIES: int = int(os.getenv("AFFINITY_MAX_ENTRIES", "256"))
+
+# conv_key → (slot_idx, zuletzt_gesehen_Epoche)
+_AFFINITY_MAP: Dict[str, Tuple[int, float]] = {}
+
+
+def _conversation_key(messages: Sequence[Dict[str, Any]]) -> str:
+    """Stabiler Schlüssel für eine Konversation: Hash der ERSTEN nicht-leeren
+    User-Message. Die Historie hängt pro Turn nur hinten an — die erste
+    User-Message bleibt über alle Turns hinweg byte-identisch, also auch dieser
+    Schlüssel. Model-Flags werden vor dem Hashen entfernt, damit das Ergebnis
+    unabhängig davon ist, ob der Aufrufer sie bereits gestrippt hat."""
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        text = _message_text(msg)
+        if not text.strip():
+            continue
+        norm = _MODEL_FLAG_PATTERN.sub("", text).strip().lower()[:4096]
+        return hashlib.blake2b(norm.encode("utf-8"), digest_size=10).hexdigest()
+    return ""
+
+
+def _affinity_lookup(conv_key: str, category: str) -> Optional[int]:
+    """Pinned Slot fuer Konversation oder None (kein Pin/expired/Slot weggefallen)."""
+    if not AFFINITY_ENABLED or not conv_key:
+        return None
+    entry = _AFFINITY_MAP.get(conv_key)
+    if entry is None:
+        return None
+    idx, seen = entry
+    if time.time() - seen > AFFINITY_TTL_SECONDS:
+        del _AFFINITY_MAP[conv_key]
+        return None
+    defs = _model_defs(category)
+    if idx >= len(defs):  # Config geändert — Pin ungültig
+        del _AFFINITY_MAP[conv_key]
+        return None
+    # LRU-Erneuerung: ans Ende der Einfügereihenfolge verschieben.
+    _AFFINITY_MAP.pop(conv_key)
+    _AFFINITY_MAP[conv_key] = entry
+    return idx
+
+
+def _affinity_record(conv_key: str, category: str, slot_idx: int) -> None:
+    """Pin setzen/erneuern: welche Konversation welchen Slot bedient hat."""
+    if not AFFINITY_ENABLED or not conv_key:
+        return
+    defs = _model_defs(category)
+    if len(defs) <= 1 or slot_idx >= len(defs):
+        # Einzel-Slot-Kategorien: nichts zu disambiguieren — Map sauber halten.
+        return
+    prev = _AFFINITY_MAP.pop(conv_key, None)
+    _AFFINITY_MAP[conv_key] = (slot_idx, time.time())
+    while len(_AFFINITY_MAP) > max(1, AFFINITY_MAX_ENTRIES):
+        oldest = next(iter(_AFFINITY_MAP))
+        _AFFINITY_MAP.pop(oldest, None)
+    if prev is not None and prev[0] != slot_idx:
+        _log(f"Affinity: Pin aktualisiert → slot {slot_idx} für conv={conv_key[:8]}")
+    elif prev is None and len(defs) > 1:
+        _log(f"Affinity: neuer Pin slot {slot_idx} für conv={conv_key[:8]}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -6216,7 +6295,16 @@ async def _call_model_with_fallbacks(body: Dict[str, Any], category: str,
                 "content": f"Kategorie '{category}' hat keine konfigurierten Modelle"},
                 "used_idx": 0, "used_model": "(none)", "attempts": []}
 
-    start_idx = force_start_idx if force_start_idx is not None else _CATEGORY_ACTIVE_IDX.get(category, 0)
+    # Prefix-Cache-Affinity: Konversation an ihren zuletzt bedienenden Slot pinnen.
+    # Schlaegt den globalen active_idx (der durch einen einzelnen Fallback fuer ALLE
+    # Konversationen umschaltet), aber NICHT force_start_idx (explizite User-Wahl).
+    conv_key = _conversation_key(body.get("messages", []))
+    aff_idx = _affinity_lookup(conv_key, category) if force_start_idx is None else None
+
+    if aff_idx is not None:
+        start_idx = aff_idx
+    else:
+        start_idx = force_start_idx if force_start_idx is not None else _CATEGORY_ACTIVE_IDX.get(category, 0)
     if start_idx >= len(defs):
         start_idx = 0
         _CATEGORY_ACTIVE_IDX[category] = 0
@@ -6253,6 +6341,8 @@ async def _call_model_with_fallbacks(body: Dict[str, Any], category: str,
 
             if result.get("status") == "ok":
                 _log(f"Fallback SUCCESS: {category}[{curr_idx}] = {defs[curr_idx].get('model_name', '?')}")
+                # Prefix-Cache-Affinity: Serving-Slot fuer diese Konversation merken.
+                _affinity_record(conv_key, category, curr_idx)
                 # Bei Erfolg: active_idx auf dieses Modell setzen (permanent)
                 if curr_idx != start_idx:
                     _CATEGORY_ACTIVE_IDX[category] = curr_idx
@@ -6319,7 +6409,9 @@ def _format_openai_stream_chunk(
     if finish_reason and not tool_calls and not content and not include_role and not reasoning_content:
         pass
     elif tool_calls is not None:
-        delta["content"] = None
+        # KEIN "content" Feld in Tool-Call-Chunks — VS Code Copilot
+        # interpretiert "content": null als Content-Chunk und rendert
+        # den Tool-Call als Text statt ihn auszuführen.
         if reasoning_content is not None:
             delta["reasoning_content"] = reasoning_content
         delta["tool_calls"] = tool_calls
@@ -7392,10 +7484,16 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
          f"{' Slot='+str(flag_slot) if flag_slot else ''}), "
          f"Idx={active_idx}, Modell={active_model}")
 
+    # I/O-Trace: Routing-Entscheidung dokumentieren (Affinity-Pin falls vorhanden)
+    _trace_conv_key = _conversation_key(msgs)
+    _trace_aff_idx = _affinity_lookup(_trace_conv_key, category) if force_start_idx is None else None
+
     if body.get("stream"):
         return StreamingResponse(
             _io_tee(_stream_events(body, category, force_start_idx),
-                    end_extra={"category": category, "stream": True, "status": "ok"}),
+                    end_extra={"category": category, "stream": True, "status": "ok",
+                               "conv_key": _trace_conv_key or None,
+                               "affinity_idx": _trace_aff_idx}),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
                      "X-Accel-Buffering": "no"},
@@ -7426,6 +7524,8 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     _spawn(_hindsight.retain_async(body, content))
     io_log_final(response_payload)
     io_end_turn({"category": category, "stream": False,
+                 "conv_key": _trace_conv_key or None,
+                 "affinity_idx": _trace_aff_idx,
                  "status": "ok" if not outcome.get("all_failed") else "all_failed"})
     return JSONResponse(content=response_payload)
 
@@ -8353,7 +8453,11 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
         if loop_guard is not None:
             loop_guard = _TextLoopGuard(enabled=True)
 
-        start_idx = force_start_idx if force_start_idx is not None else _CATEGORY_ACTIVE_IDX.get(category, 0)
+        # Prefix-Cache-Affinity: Konversationsschlüssel vor dem Turn berechnen.
+        _conv_key = _conversation_key(body.get("messages", []))
+        _aff_idx = _affinity_lookup(_conv_key, category) if force_start_idx is None else None
+        start_idx = _aff_idx if _aff_idx is not None else (
+            force_start_idx if force_start_idx is not None else _CATEGORY_ACTIVE_IDX.get(category, 0))
         if start_idx >= len(defs):
             start_idx = 0
         indices: List[int] = [start_idx] + [i for i in range(len(defs)) if i != start_idx]
@@ -8384,6 +8488,7 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
                         elif ev_type == "done":
                             # Erfolg: aktiven Index merken (wie non-streaming Fallback)
                             _CATEGORY_ACTIVE_IDX[category] = idx
+                            _affinity_record(_conv_key, category, idx)
                             await queue.put(ev)
                             return
                         elif ev_type == "error":
@@ -8713,7 +8818,7 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
                 _cw_archive_session(s)
         if resume_state.get("fwd_calls"):
             yield _format_openai_stream_chunk(
-                body.get("model", category), include_role=True,
+                body.get("model", category),
                 tool_calls=resume_state["fwd_calls"], chunk_id=stream_id)
             yield _format_openai_stream_chunk(body.get("model", category),
                                               finish_reason="tool_calls",
@@ -8798,16 +8903,18 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
                 return
             # Nur coworker-Calls entfernen, VS-Code-Tools durchreichen
             yield _format_openai_stream_chunk(
-                model, include_role=True,
+                model, include_role=not state.get("role_sent"),
                 tool_calls=_build_forward_tool_calls(other_calls), chunk_id=stream_id)
+            state["role_sent"] = True
             yield _format_openai_stream_chunk(model, finish_reason="tool_calls", chunk_id=stream_id)
             return
 
         # ── Nur VS-Code-Tools: an Copilot durchreichen ──
         if not coworker_calls and not dispatch_calls and not collect_calls:
             yield _format_openai_stream_chunk(
-                model, include_role=True,
+                model, include_role=not state.get("role_sent"),
                 tool_calls=_build_forward_tool_calls(tool_calls), chunk_id=stream_id)
+            state["role_sent"] = True
             yield _format_openai_stream_chunk(model, finish_reason="tool_calls", chunk_id=stream_id)
             if state.get("usage"):
                 yield _format_usage_stream_chunk(model, state["usage"], chunk_id=stream_id)
@@ -8859,7 +8966,7 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
             # unlock) — dispatches sind intern beantwortet, collect nie.
             if other_calls:
                 yield _format_openai_stream_chunk(
-                    model, include_role=True,
+                    model,
                     tool_calls=_build_forward_tool_calls(other_calls), chunk_id=stream_id)
                 yield _format_openai_stream_chunk(model, finish_reason="tool_calls", chunk_id=stream_id)
                 return
@@ -8977,7 +9084,9 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
                 for i, tc in enumerate(fwd_calls):
                     tc["index"] = i
             yield _format_openai_stream_chunk(
-                model, include_role=True, tool_calls=fwd_calls, chunk_id=stream_id)
+                model, include_role=not state.get("role_sent"),
+                tool_calls=fwd_calls, chunk_id=stream_id)
+            state["role_sent"] = True
             yield _format_openai_stream_chunk(model, finish_reason="tool_calls",
                                               chunk_id=stream_id)
             if state.get("usage"):
@@ -9076,6 +9185,12 @@ async def healthz(request: Request):
         },
         "hindsight_enabled": HINDSIGHT_ENABLED,
         "hindsight_backend": "qdrant" if _hindsight._use_qdrant else "jsonl",
+        "affinity": {
+            "enabled": AFFINITY_ENABLED,
+            "ttl_seconds": AFFINITY_TTL_SECONDS,
+            "max_entries": AFFINITY_MAX_ENTRIES,
+            "pinned_conversations": len(_AFFINITY_MAP),
+        },
         "debug_enabled": DEBUG_ENABLED,
         "tool_result_cap": TOOL_RESULT_CAP,
         "reasoning_cap_chars": REASONING_CAP_CHARS,
