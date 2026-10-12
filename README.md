@@ -137,6 +137,18 @@ fuehrt alle aus.
   `COWORKER_MAX_DELEGATIONS`, `COWORKER_TASK_CAP`, `COWORKER_RESULT_CAP`,
   `COWORKER_FILES_CAP`, `COWORKER_HEALTH_INTERVAL`, `COWORKER_PROBE_TIMEOUT`,
   `COWORKER_SYSTEM_PROMPT`
+- **Ohne gesetzte `COWORKER_API_URL` existiert kein Co-Worker**: alle
+  Co-Worker-Calls werden unterlassen — Datei-Kontext-Extraktion, Delegation,
+  Dispatch, Tunnel-Resume und Status-Notizen bleiben aus; aufgerufene
+  Co-Worker-Tools werden verworfen und das Hauptmodell arbeitet direkt weiter.
+
+### Anti-Loop-System-Prompt (lokale Modelle)
+
+`LOCAL_ANTI_LOOP_SYSTEM_PROMPT` (Env oder `tokens.local_sampling.anti_loop_system_prompt`)
+wird bei **allen lokalen Modellen** (Kategorie `local`) in die bestehende erste
+System-Message **gemerged** — keine zweite system-Message (Jinja-Templates
+verbieten `system` nach Position 0). Leer = keine Injektion; die Injektion ist
+idempotent (Marker `[LOCAL ANTI-LOOP RULES]`).
 
 ### Prefill-Progress-Polling (llama.cpp)
 

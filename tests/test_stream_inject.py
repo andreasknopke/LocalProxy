@@ -46,6 +46,21 @@ except Exception as e:
 pytestmark = pytest.mark.skipif(not HAS_PROXY, reason=SKIP_REASON)
 
 
+@pytest.fixture(autouse=True)
+def _coworker_api_url_set(monkeypatch):
+    """Co-Worker mit gesetzter API-URL konfigurieren. Ohne API-URL gilt der
+    Co-Worker als nicht vorhanden und ALLE Co-Worker-Calls werden verworfen —
+    Tests, die Delegation ueben, brauchen diese Konfiguration. Tests, die
+    COWORKER_ENABLED explizit auf False setzen, bleiben davon unberuehrt."""
+    monkeypatch.setattr(proxy, "_MODEL_CATEGORIES", {
+        **proxy._MODEL_CATEGORIES,
+        "coworker": {"api_url": "http://spark:30000/v1/chat/completions",
+                     "api_key": "", "model_name": "qwen3.8-27b",
+                     "max_tokens": 4096, "is_vision": False,
+                     "timeout_seconds": 60},
+    })
+
+
 def _collect_sse(agen) -> List[str]:
     """Sammelt alle Strings eines Async-Generators in eine Liste."""
     return asyncio.run(_collect_async(agen))

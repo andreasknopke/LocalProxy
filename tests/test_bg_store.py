@@ -47,6 +47,20 @@ def _tc(name: str, args: Dict[str, Any], tid: str = "call_x") -> Dict[str, Any]:
             "function": {"name": name, "arguments": json.dumps(args)}}
 
 
+@pytest.fixture(autouse=True)
+def _coworker_api_url_set(monkeypatch):
+    """Co-Worker mit gesetzter API-URL konfigurieren. Ohne API-URL gilt der
+    Co-Worker als nicht vorhanden und ALLE Co-Worker-Calls werden verworfen —
+    Tests, die COWORKER_ENABLED=True setzen, brauchen diese Konfiguration."""
+    monkeypatch.setattr(proxy, "_MODEL_CATEGORIES", {
+        **proxy._MODEL_CATEGORIES,
+        "coworker": {"api_url": "http://spark:30000/v1/chat/completions",
+                     "api_key": "", "model_name": "qwen3.8-27b",
+                     "max_tokens": 4096, "is_vision": False,
+                     "timeout_seconds": 60},
+    })
+
+
 # ── Task-Store ─────────────────────────────────────────────────────────────
 
 def test_register_and_await_done(monkeypatch):

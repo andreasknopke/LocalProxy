@@ -1682,18 +1682,36 @@ def test_inject_local_anti_loop_system_no_existing_system():
     assert msgs[1]["role"] == "user"
 
 
-def test_inject_local_anti_loop_system_after_existing_system():
-    """Anti-Loop-Prompt wird NACH existierender system-Message eingefuegt."""
+def test_inject_local_anti_loop_system_merges_into_existing_system():
+    """Anti-Loop-Prompt wird IN die bestehende erste System-Message gemerged —
+    keine zweite system-Message (Jinja-Templates verbieten system nach Pos 0)."""
     msgs = [
         {"role": "system", "content": "You are helpful."},
         {"role": "user", "content": "hello"},
     ]
     proxy._inject_local_anti_loop_system(msgs)
+    assert len(msgs) == 2
     assert msgs[0]["role"] == "system"
-    assert msgs[0]["content"] == "You are helpful."
-    assert msgs[1]["role"] == "system"
-    assert "NEVER call the same tool" in msgs[1]["content"]
-    assert msgs[2]["role"] == "user"
+    assert msgs[0]["content"].startswith("You are helpful.")
+    assert "NEVER call the same tool" in msgs[0]["content"]
+    assert msgs[1]["role"] == "user"
+
+
+def test_inject_local_anti_loop_system_idempotent():
+    """Mehrfach-Aufruf (Fallback-Runden) fuellt die System-Message nicht weiter voll."""
+    msgs = [{"role": "system", "content": "You are helpful."}]
+    proxy._inject_local_anti_loop_system(msgs)
+    once = msgs[0]["content"]
+    proxy._inject_local_anti_loop_system(msgs)
+    assert msgs[0]["content"] == once
+
+
+def test_inject_local_anti_loop_system_empty_prompt_noop(monkeypatch):
+    """Leerer Prompt -> keine Injektion."""
+    monkeypatch.setattr(proxy, "LOCAL_ANTI_LOOP_SYSTEM_PROMPT", "   ")
+    msgs = [{"role": "system", "content": "A"}]
+    proxy._inject_local_anti_loop_system(msgs)
+    assert msgs[0]["content"] == "A"
 
 
 def test_clean_payload_keeps_top_k_for_local():

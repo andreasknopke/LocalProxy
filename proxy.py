@@ -3493,27 +3493,34 @@ def _patch_qwen_anti_loop_payload(payload: Dict[str, Any], model_name: str) -> N
         _log(f"Qwen-Anti-Loop: {'; '.join(fixes)} (model={model_name})")
 
 
+_ANTI_LOOP_MARKER: str = "[LOCAL ANTI-LOOP RULES]"
+
+
 def _inject_local_anti_loop_system(messages: List[Dict[str, Any]]) -> None:
-    """Injiziert Anti-Loop-System-Prompt fuer Laguna-S-2.1 Modelle.
+    """Fuegt den Anti-Loop-System-Prompt IN die bestehende erste System-Message
+    ein — fuer ALLE lokalen Modelle, sofern der Prompt nicht leer ist.
 
-    Wird NACH der ersten System-Message (falls vorhanden) eingefuegt,
-    damit der Modell-eigene System-Prompt Vorrang hat.
+    Merge statt eigener system-Message: Jinja-Challenge-Templates (Qwen etc.)
+    verbieten system-Nachrichten nach Position 0 ("System message must be at
+    the beginning"). Der Modell-eigene Prompt bleibt vorn erhalten, die
+    Anti-Loop-Regeln stehen als abschliessende Anweisung der Praembel.
 
-    ACHTUNG: Wuerde eine ZWEITE system-Message erzeugen — Jinja-Challenge-
-    Templates (Qwen etc.) verbieten system nach Position 0. Bei Reaktivierung:
-    in die erste system-Message mergen (siehe _inject_coworker_tool /
-    _inject_hindsight_context).
+    Idempotent ueber den Marker — Mehrfach-Injektion bei Mehrfach-Aufruf
+    (Fallback-Runden, Restarts) wird vermieden.
     """
-    if not LOCAL_ANTI_LOOP_SYSTEM_PROMPT.strip():
+    prompt = LOCAL_ANTI_LOOP_SYSTEM_PROMPT.strip()
+    if not prompt:
         return
-    insert_idx = 0
-    if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
-        insert_idx = 1
-    messages.insert(insert_idx, {
-        "role": "system",
-        "content": LOCAL_ANTI_LOOP_SYSTEM_PROMPT,
-    })
-    _log("Local-Anti-Loop-System-Prompt injiziert")
+    block = f"{_ANTI_LOOP_MARKER}\n{prompt}"
+    first = messages[0] if messages and isinstance(messages[0], dict) else None
+    if first is not None and first.get("role") == "system":
+        content = str(first.get("content") or "")
+        if _ANTI_LOOP_MARKER in content:
+            return
+        first["content"] = content.rstrip() + "\n\n" + block
+    else:
+        messages.insert(0, {"role": "system", "content": block})
+    _log("Local-Anti-Loop-System-Prompt in erste System-Message gemerged")
 
 
 def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int = 0,
@@ -3549,10 +3556,10 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
         # letzte User-Nachricht verschieben, sonst HTTP 400 des Backends.
         _fix_non_user_image_urls_inplace(messages, "Passthrough", relocate=True)
 
-    # Laguna-S-2.1 Sampling + Anti-Loop: derzeit deaktiviert (Laguna nicht mehr im Einsatz)
-    # if _is_laguna_model(cat["model_name"]):
-    #     _patch_local_sampling_payload(payload)
-    #     _inject_local_anti_loop_system(messages)
+    # Anti-Loop-System-Prompt: fuer ALLE lokalen Modelle, wenn nicht leer
+    # (Merge in die erste System-Message, keine zweite system-Message).
+    if category == "local":
+        _inject_local_anti_loop_system(messages)
 
     _patch_max_tokens_payload(payload, cat)
     _patch_thinking_mode_payload(payload)
@@ -4244,8 +4251,41 @@ _SHUTDOWN_CANCEL_NOTE: str = (
 
 
 def _coworker_configured() -> bool:
-    """True wenn die coworker-Kategorie eine gueltige Definition hat."""
+    """True wenn die coworker-Kategorie eine gueltige Definition hat.
+    Ohne gesetzte COWORKER_API_URL (leere Base-URL) liefert _model_defs([])
+    → False. Eine nicht gesetzte API URL bedeutet: KEIN Co-Worker vorhanden,
+    alle Co-Worker-Calls sind zu unterlassen."""
     return bool(_model_defs("coworker"))
+
+
+def _coworker_tool_names() -> Set[str]:
+    return {_COWORKER_TOOL_NAME, _COWORKER_DISPATCH_TOOL_NAME, _COWORKER_COLLECT_TOOL_NAME}
+
+
+def _strip_coworker_tool_calls(tool_calls: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+    """Entfernt alle Co-Worker-Tool-Calls aus einer Tool-Call-Liste, wenn der
+    Co-Worker nicht aktiv ist (Delegation deaktiviert ODER API-URL nicht
+    gesetzt). Ein Call ins Leere wird so unmoeglich — auch wenn das Modell
+    die Tools aus der History oder halluziniert aufruft."""
+    if not tool_calls or _coworker_active():
+        return tool_calls
+    names = _coworker_tool_names()
+    kept = [tc for tc in tool_calls
+            if str((tc.get("function") or {}).get("name", "")) not in names]
+    if len(kept) != len(tool_calls):
+        _log("Co-Worker-Tool-Calls verworfen: Co-Worker nicht aktiv "
+             "(COWORKER_ENABLED/Aus oder API-URL nicht gesetzt)")
+    return kept or None
+
+
+def _coworker_active() -> bool:
+    """True nur dann, wenn Co-Worker-Delegation eingeschaltet UND ein
+    Co-Worker-Backend mit API-URL konfiguriert ist. ALLE Co-Worker-Pfade
+    (Datei-Kontext-Extraktion, Delegation, Dispatch, Tunnel-Resume,
+    Status-Notizen) muessen daran gekoppelt sein — ohne gesetzte API-URL
+    darf kein Co-Worker-Anteil hueten, selbst wenn der Nutzer die Tools
+    versehentlich aufruft."""
+    return COWORKER_ENABLED and _coworker_configured()
 
 
 async def _probe_coworker() -> bool:
@@ -5969,7 +6009,8 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
     # Datei-Kontext aus der Chat-History einmalig extrahieren — der Co-Worker
     # bekommt IMMER die relevanten Dateiinhalte, auch wenn das Hauptmodell sie
     # nicht in task/context uebernommen hat.
-    files_context = _extract_conversation_files(body.get("messages"), COWORKER_FILES_CAP)
+    files_context = (_extract_conversation_files(body.get("messages"), COWORKER_FILES_CAP)
+                     if _coworker_active() else "")
     if files_context:
         _log(f"Co-Worker-Delegation: {len(files_context)} chars Datei-Kontext "
              f"automatisch angehaengt")
@@ -5977,7 +6018,7 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
     # ── CW-Tunnel-Resume (non-streaming): pausierte Sessions weiterfahren ──
     # Tunnel-tool_calls werden als normale tool_calls in der Response an den
     # Client zurueckgegeben — auch non-streaming Clients sind Executor.
-    if _CW_RESUME_PENDING:
+    if _CW_RESUME_PENDING and _coworker_active():
         resumed = _CW_RESUME_PENDING[:]
         _CW_RESUME_PENDING.clear()
         _log(f"CW-Tunnel-Resume (non-stream): {len(resumed)} Session(s)")
@@ -5996,13 +6037,15 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
     while True:
         outcome = await _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
         result = outcome.get("result", {})
-        tool_calls = result.get("tool_calls")
+        tool_calls = _strip_coworker_tool_calls(result.get("tool_calls"))
         if not tool_calls:
-            return outcome  # fertig: keine Tool-Calls
+            result["tool_calls"] = None
+            return outcome  # fertig: keine (Co-Worker-)Tool-Calls mehr
+        result["tool_calls"] = tool_calls
         dispatch_calls, collect_calls, ask_calls, other_calls = _partition_tool_calls(tool_calls)
         coworker_calls = ask_calls
         # ── Deterministische Verteilung: manage_todo_list → Co-Worker ──
-        if (COWORKER_AUTO_DISPATCH and COWORKER_ENABLED and COWORKER_FORK_JOIN
+        if (COWORKER_AUTO_DISPATCH and _coworker_active() and COWORKER_FORK_JOIN
                 and _COWORKER_HEALTH_CACHE.get("reachable", False)):
             todo_titles = _extract_not_started_todos(other_calls)
             if todo_titles:
@@ -7438,7 +7481,7 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     # Concurrency (max_parallel=1) ist waehrend ein Task laeuft nicht anpingbar;
     # ein Re-Probe wuerde reachable=False setzen und dispatch/collect aus der
     # Worker-Tool-Liste reissen, genau wenn der Worker collecten will.
-    if category == "local" and COWORKER_ENABLED and _coworker_configured():
+    if category == "local" and _coworker_active():
         if float(_COWORKER_HEALTH_CACHE.get("checked_at", 0.0)) <= 0.0:
             await _probe_coworker()
             _log(f"Co-Worker Cold-Start-Probe: "
@@ -7451,7 +7494,7 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     # Notiz beschallt und kann seine eigene Todo-Kette nicht mehr abarbeiten
     # (beobachtet 2026-08-29: 839 chars in JEDEM Turn, Turns 09:13-09:20).
     # Notiz erscheint pro (task_id, status)-Kombination genau einmal.
-    if (category == "local" and COWORKER_ENABLED and COWORKER_FORK_JOIN
+    if (category == "local" and _coworker_active() and COWORKER_FORK_JOIN
             and _COWORKER_BG_TASKS):
         status = _coworker_status_line()
         if status:
@@ -7466,7 +7509,7 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     _CW_RESUME_PENDING.clear()
     tunnel_tool_msgs = _cw_collect_tunnel_tool_msgs(msgs)
     if tunnel_tool_msgs:
-        if category == "local":
+        if category == "local" and _coworker_active():
             resumed = _cw_resume_sessions(tunnel_tool_msgs)
             _CW_RESUME_PENDING.extend(sess for sess, _n in resumed)
             removed = _cw_strip_tunnel_from_messages(msgs)
@@ -8787,7 +8830,8 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
     # Datei-Kontext aus der Chat-History einmalig extrahieren — der Co-Worker
     # bekommt IMMER die relevanten Dateiinhalte, auch wenn das Hauptmodell sie
     # nicht in task/context uebernommen hat.
-    files_context = _extract_conversation_files(body.get("messages"), COWORKER_FILES_CAP)
+    files_context = (_extract_conversation_files(body.get("messages"), COWORKER_FILES_CAP)
+                     if _coworker_active() else "")
     if files_context:
         _log(f"Co-Worker-Stream: {len(files_context)} chars Datei-Kontext "
              f"automatisch angehaengt")
@@ -8800,7 +8844,7 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
     # Sessions absorbiert, History bereinigt). Jetzt: Sessions weitertreiben.
     # Enden sie mit tool_calls → erneut pausieren (finish 'tool_calls').
     # Werden sie final → ask/result-Paare an die History, dann Main-Runde.
-    if _CW_RESUME_PENDING:
+    if _CW_RESUME_PENDING and _coworker_active():
         resumed_sessions = _CW_RESUME_PENDING[:]
         _CW_RESUME_PENDING.clear()
         _log(f"CW-Tunnel-Resume (Stream): {len(resumed_sessions)} Session(s)")
@@ -8864,6 +8908,22 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
                 _spawn(_hindsight.retain_async(body, content))
             return
 
+        tool_calls = _strip_coworker_tool_calls(tool_calls)
+        if not tool_calls:
+            # Nur Co-Worker-Calls, aber Co-Worker nicht aktiv → Modell soll
+            # direkt weiterarbeiten (Turn wie "keine Tool-Calls" beenden).
+            if not (state.get("content") or "").strip():
+                yield _format_openai_stream_chunk(
+                    model,
+                    content="\n\n[Proxy] Co-Worker ist nicht konfiguriert "
+                            "(API-URL nicht gesetzt) — die Delegation wurde "
+                            "verworfen. Bitte arbeite die Aufgabe selbst weiter.",
+                    include_role=not state.get("role_sent"), chunk_id=stream_id)
+                state["role_sent"] = True
+            yield _format_openai_stream_chunk(model, "", finish_reason="stop", chunk_id=stream_id)
+            if state.get("usage"):
+                yield _format_usage_stream_chunk(model, state["usage"], chunk_id=stream_id)
+            return
         dispatch_calls, collect_calls, ask_calls, other_calls = _partition_tool_calls(tool_calls)
         coworker_calls = ask_calls
 
@@ -8871,7 +8931,7 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
         # Sobald das Hauptmodell eine Task-Liste anlegt, verteilt der Proxy
         # alle 'not-started' Todos automatisch an den Co-Worker — unabhaengig
         # von der (nicht-deterministischen) Modell-Entscheidung.
-        if (COWORKER_AUTO_DISPATCH and COWORKER_ENABLED and COWORKER_FORK_JOIN
+        if (COWORKER_AUTO_DISPATCH and _coworker_active() and COWORKER_FORK_JOIN
                 and _COWORKER_HEALTH_CACHE.get("reachable", False)):
             todo_titles = _extract_not_started_todos(other_calls)
             if todo_titles:
