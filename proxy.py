@@ -7089,13 +7089,6 @@ async def _io_tee(gen: AsyncIterator[str],
     yield SSE_DONE
 
 
-# Maximale Lebensdauer eines aktiven Calls (Sekunden). Darueber wird der
-# Call als 'stale' (verwaist) markiert und automatisch bereinigt.
-# Default: 15 Minuten — praeventiert, dass abgebrochene Tasks (Client-Disconnect)
-# den Heartbeat ewig laufen lassen.
-_ACTIVE_CALL_HARD_TIMEOUT: int = int(os.getenv("ACTIVE_CALL_HARD_TIMEOUT", "900"))
-
-
 def _register_active_call(call_id: str, info: Dict[str, Any]) -> None:
     info = dict(info)
     info["started_at"] = time.time()
@@ -7106,9 +7099,11 @@ def _register_active_call(call_id: str, info: Dict[str, Any]) -> None:
 
 async def _active_call_heartbeat(call_id: str) -> None:
     """Heartbeat fuer aktive Calls. Logt alle 30s die verstrichene Zeit.
-    Self-Cleaning: Calls die laenger als _ACTIVE_CALL_HARD_TIMEOUT leben
-    (z.B. weil der Client abgebrochen ist und CancelledError nicht richtig
-    aufgeraeumt hat) werden automatisch als stale entfernt.
+
+    Bewusst OHNE Hard-Timeout: lange Thinking-Bloecke bei schwierigen Aufgaben
+    koennen jeden festen Rahmen sprengen und wuerden den laufenden Call
+    faelschlich als verwaist abreissen. Beendet wird ein Call ausschliesslich
+    durch _finish_active_call (done/error/cancelled).
     """
     while call_id in _ACTIVE_CALLS:
         await asyncio.sleep(30)
@@ -7116,12 +7111,6 @@ async def _active_call_heartbeat(call_id: str) -> None:
         if not info:
             return
         elapsed = time.time() - info.get("started_at", time.time())
-        if elapsed > _ACTIVE_CALL_HARD_TIMEOUT:
-            _log(f"[{call_id}] STALE CALL: {elapsed:.0f}s alt — automatisch bereinigt "
-                 f"(category={info.get('agent_key','?')}, model={info.get('model','?')}). "
-                 f"Client-Disconnect oder fehlende Bereinigung vermutet.")
-            _ACTIVE_CALLS.pop(call_id, None)
-            return
         _log(f"[{call_id}] aktiver Call seit {elapsed:.0f}s "
              f"(category={info.get('agent_key','?')}, model={info.get('model','?')})")
 
@@ -7133,28 +7122,6 @@ def _finish_active_call(call_id: str, status: str = "done",
         return
     elapsed = time.time() - info.get("started_at", time.time())
     _log(f"[{call_id}] Call beendet nach {elapsed:.0f}s ({status})")
-
-
-def _purge_stale_active_calls() -> int:
-    """Entfernt alle aktiven Calls, die das Hard-Timeout ueberschritten haben.
-    Wird beim Startup (Persistenz ueber Restart) und periodisch aufgerufen.
-    Gibt die Anzahl der entfernten Calls zurueck.
-    """
-    now = time.time()
-    stale_ids: List[str] = []
-    for cid, info in _ACTIVE_CALLS.items():
-        elapsed = now - info.get("started_at", now)
-        if elapsed > _ACTIVE_CALL_HARD_TIMEOUT:
-            stale_ids.append(cid)
-    for cid in stale_ids:
-        info = _ACTIVE_CALLS.pop(cid, None)
-        if info:
-            elapsed = now - info.get("started_at", now)
-            _log(f"[{cid}] STALE CALL purge: {elapsed:.0f}s alt "
-                 f"(category={info.get('agent_key','?')}, model={info.get('model','?')})")
-    if stale_ids:
-        _log(f"Startup-Sweep: {len(stale_ids)} stale active call(s) bereinigt")
-    return len(stale_ids)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -7286,10 +7253,6 @@ async def _lifespan(app: FastAPI):
     _log(f"   Auth:    {'enabled' if PROXY_AUTH_ENABLED else 'disabled'}")
     _log(f"   Debug:   {'enabled' if DEBUG_ENABLED else 'disabled'}")
     _log(f"   Tool-Cap: {TOOL_RESULT_CAP if TOOL_RESULT_CAP > 0 else 'off'}")
-
-    # Stale active calls bereinigen (Vorfahre aus vorherigem Prozess-Lauf,
-    # falls _ACTIVE_CALLS persistiert wurde oder der Prozess neu startete)
-    _purge_stale_active_calls()
 
     # Co-Worker-Health-Loop starten (Startup-Probe + periodischer Check)
     _spawn(_coworker_health_loop())
