@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+import base64
+import httpx
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
 CONFIG_PATH = Path(os.getenv("LOCALPROXY_CONFIG", "data/config.json"))
 PROFILES_DIR = CONFIG_PATH.parent / "profiles"
@@ -629,6 +631,91 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .log-ok { color: #3fb950; }
 .log-webui { color: #a371f7; }
 .log-req { color: #79c0ff; }
+
+/* ============ CHAT ============ */
+.chat-layout { display: flex; gap: 16px; align-items: stretch; min-height: 520px; }
+.chat-sidebar {
+  width: 250px; flex-shrink: 0; background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); display: flex; flex-direction: column; overflow: hidden;
+}
+.chat-sidebar-header { padding: 10px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; }
+.chat-sidebar-header .btn { flex: 1; padding: 8px 10px; font-size: 0.8rem; }
+.chat-session-list { flex: 1; overflow-y: auto; max-height: 600px; }
+.chat-session {
+  padding: 10px 12px; border-bottom: 1px solid var(--border); cursor: pointer; position: relative;
+}
+.chat-session:hover { background: var(--surface2); }
+.chat-session.active { background: var(--surface2); border-left: 2px solid var(--accent); }
+.chat-session .title {
+  font-size: 0.82rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  margin-bottom: 2px; padding-right: 16px;
+}
+.chat-session .meta { font-size: 0.68rem; color: var(--text2); display: flex; gap: 6px; align-items: center; }
+.chat-session .del {
+  position: absolute; top: 8px; right: 8px; border: none; background: none; color: var(--text2);
+  cursor: pointer; font-size: 0.85rem; line-height: 1; opacity: 0; padding: 2px 4px;
+}
+.chat-session:hover .del { opacity: 1; }
+.chat-session .del:hover { color: var(--danger); }
+.chat-empty { padding: 24px 16px; font-size: 0.78rem; color: var(--text2); text-align: center; }
+.chat-main {
+  flex: 1; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  display: flex; flex-direction: column; overflow: hidden; min-width: 0;
+}
+.chat-toolbar {
+  padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 10px; align-items: center;
+  flex-wrap: wrap;
+}
+.chat-toolbar select { width: auto; padding: 6px 10px; font-size: 0.82rem; }
+.chat-toolbar .vision-badge { font-size: 0.7rem; color: var(--warn); }
+.chat-toolbar .spacer { flex: 1; }
+.chat-title-input {
+  background: none; border: 1px solid transparent; color: var(--text); font-size: 0.85rem;
+  font-weight: 600; padding: 4px 6px; max-width: 260px;
+}
+.chat-title-input:hover, .chat-title-input:focus { border-color: var(--border); outline: none; }
+.chat-log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; min-height: 340px; max-height: 60vh; }
+.chat-msg { display: flex; flex-direction: column; gap: 4px; max-width: 85%; }
+.chat-msg.user { align-self: flex-end; align-items: flex-end; }
+.chat-msg.assistant { align-self: flex-start; }
+.chat-msg .role { font-size: 0.68rem; color: var(--text2); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+.chat-msg .body {
+  background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 10px 14px; font-size: 0.88rem; white-space: pre-wrap; word-wrap: break-word; width: 100%;
+}
+.chat-msg.user .body { background: #1f6feb22; border-color: #1f6feb55; }
+.chat-msg .body img { max-width: 320px; border-radius: 6px; margin-top: 6px; display: block; }
+.chat-msg pre.codeblock {
+  background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 10px;
+  overflow-x: auto; font-size: 0.8rem; margin: 6px 0; font-family: ui-monospace, monospace;
+}
+.chat-msg details.reasoning { margin-top: 6px; font-size: 0.75rem; color: var(--text2); }
+.chat-msg details.reasoning summary { cursor: pointer; }
+.chat-msg details.reasoning pre { white-space: pre-wrap; margin-top: 4px; max-height: 200px; overflow-y: auto; }
+.chat-attachments { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 12px 8px; }
+.chat-attachment {
+  background: var(--surface2); border: 1px solid var(--border); border-radius: 6px;
+  font-size: 0.72rem; padding: 4px 8px; display: flex; gap: 6px; align-items: center; max-width: 300px;
+}
+.chat-attachment .thumb { width: 28px; height: 28px; object-fit: cover; border-radius: 4px; }
+.chat-attachment button { border: none; background: none; color: var(--text2); cursor: pointer; }
+.chat-attachment button:hover { color: var(--danger); }
+.chat-input-row { border-top: 1px solid var(--border); padding: 10px 12px; display: flex; gap: 8px; align-items: flex-end; }
+.chat-input-row textarea {
+  flex: 1; resize: none; min-height: 44px; max-height: 180px; font-family: var(--font); font-size: 0.9rem;
+}
+.chat-input-row .icon-btn {
+  width: 38px; height: 38px; border: 1px solid var(--border); background: var(--surface2); color: var(--text2);
+  border-radius: 8px; cursor: pointer; font-size: 1.05rem; flex-shrink: 0;
+}
+.chat-input-row .icon-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.chat-input-row .icon-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.chat-input-row .send-btn { background: var(--accent2); border: none; color: #fff; font-weight: 600; }
+.chat-input-row .send-btn:hover:not(:disabled) { background: #2ea043; }
+.chat-status { font-size: 0.7rem; color: var(--text2); padding: 0 12px 6px; min-height: 16px; }
+.chat-status.err { color: var(--danger); }
+.chat-welcome { margin: auto; text-align: center; color: var(--text2); font-size: 0.85rem; padding: 30px; }
+
 </style>
 </head>
 <body>
@@ -643,6 +730,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
   <button data-section="models" class="active">Modelle</button>
   <button data-section="hindsight">Hindsight</button>
   <button data-section="proxy">Proxy</button>
+  <button data-section="chat">Chat</button>
   <button data-section="logs">Logs</button>
 </nav>
 <main>
@@ -1566,6 +1654,42 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
     </div>
   </section>
 
+
+  <!-- ====== SEKTION: CHAT ====== -->
+  <section id="section-chat">
+    <div class="chat-layout">
+      <div class="chat-sidebar">
+        <div class="chat-sidebar-header">
+          <button class="btn btn-primary" onclick="chatNew()">+ Neuer Chat</button>
+        </div>
+        <div class="chat-session-list" id="chatSessionList">
+          <div class="chat-empty">Noch keine Chats.</div>
+        </div>
+      </div>
+      <div class="chat-main">
+        <div class="chat-toolbar">
+          <input type="text" class="chat-title-input" id="chatTitle" placeholder="Titel…" onblur="chatRename()" />
+          <span class="spacer"></span>
+          <select id="chatModelSelect" title="Modell-Kategorie"></select>
+          <span class="vision-badge" id="chatVisionBadge" style="display:none">Bildanalyse an</span>
+        </div>
+        <div class="chat-log" id="chatLog">
+          <div class="chat-welcome">Noch keine Nachricht.<br/>Tippe links auf <b>Neuer Chat</b> und leg los.</div>
+        </div>
+        <div class="chat-attachments" id="chatAttachments"></div>
+        <div class="chat-status" id="chatStatus"></div>
+        <div class="chat-input-row">
+          <button class="icon-btn" id="chatFileBtn" onclick="document.getElementById('chatFileInput').click()" title="Datei anhängen (Text / Bild)">+</button>
+          <input type="file" id="chatFileInput" multiple style="display:none" onchange="chatFilesPicked(this)" />
+          <textarea id="chatInput" placeholder="Nachricht…  (Shift+Enter = Zeilenumbruch, Enter = senden)" rows="1"
+                    oninput="chatAutoGrow(this)" onkeydown="chatKeydown(event)"></textarea>
+          <button class="icon-btn send-btn" id="chatSendBtn" onclick="chatSend()" title="Senden">&#10148;</button>
+          <button class="icon-btn" id="chatStopBtn" onclick="chatAbort()" title="Stop" style="display:none">&#9632;</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <div class="actions">
     <button class="btn btn-primary" onclick="saveConfig()">Konfiguration speichern</button>
     <button class="btn btn-danger" onclick="restartProxy()">Proxy neustarten</button>
@@ -2114,9 +2238,319 @@ function togglePw(btn) {
   btn.textContent = show ? '🙈' : '👁';
 }
 
+
+// ============ CHAT ============
+const CHAT = { session: null, messages: [], streaming: false, abort: null, files: [], models: null };
+const CHAT_MIME_IMG = /^(image\/(png|jpeg|jpg|gif|webp|bmp|svg\+xml))$/i;
+
+async function chatInit() {
+  try {
+    const r = await fetch('/webui/api/chat/models'); CHAT.models = (await r.json()).categories;
+    chatBuildModelSelect();
+    await chatLoadSessions();
+    const last = (CHAT.session);
+    if (!CHAT.session) { const s = await fetch('/webui/api/chat/sessions'); const j = await s.json();
+      if (j.sessions && j.sessions.length) chatOpen(j.sessions[0].id, true); }
+  } catch (e) { chatStatus('Chat-Setup-Fehler: ' + e.message, true); }
+}
+
+function chatBuildModelSelect() {
+  const sel = document.getElementById('chatModelSelect');
+  sel.innerHTML = '';
+  for (const cat of ['local', 'coworker', 'light', 'strong', 'vision']) {
+    const slots = (CHAT.models[cat] && CHAT.models[cat].slots) || [];
+    slots.forEach((s, i) => {
+      if (!s.configured && cat !== 'local' && s.model_name === '') return;
+      const o = document.createElement('option');
+      o.value = s.identifier;
+      o.textContent = cat + (i > 0 ? '-' + (i + 1) : '') + (s.label ? ' — ' + s.label : '');
+      sel.appendChild(o);
+    });
+  }
+  sel.value = CHAT.models.local.slots[0] ? CHAT.models.local.slots[0].identifier : 'local';
+  sel.onchange = () => { if (CHAT.session) chatSaveModel(); chatUpdateVisionBadge(); };
+  chatUpdateVisionBadge();
+}
+
+function chatCurrentSlot() {
+  const id = document.getElementById('chatModelSelect').value || 'local';
+  const m = id.match(/^(local|coworker|light|strong|vision)(\d*)$/);
+  if (!m) return { is_vision: false };
+  const slots = (CHAT.models[m[1]] && CHAT.models[m[1]].slots) || [];
+  return slots[m[2] ? parseInt(m[2]) - 1 : 0] || { is_vision: false };
+}
+
+function chatUpdateVisionBadge() {
+  const on = !!chatCurrentSlot().is_vision;
+  document.getElementById('chatVisionBadge').style.display = on ? '' : 'none';
+  const hint = document.getElementById('chatFileBtn');
+  hint.title = on ? 'Text oder Bild anhängen (Vision aktiv)' : 'Nur Textdateien anhängbar — Bildanalyse ist bei diesem Modell nicht scharfgeschaltet';
+}
+
+async function chatLoadSessions() {
+  const r = await fetch('/webui/api/chat/sessions'); const j = await r.json();
+  const list = document.getElementById('chatSessionList');
+  if (!j.sessions || !j.sessions.length) { list.innerHTML = '<div class="chat-empty">Noch keine Chats.</div>'; return; }
+  list.innerHTML = '';
+  for (const s of j.sessions) {
+    const d = document.createElement('div');
+    d.className = 'chat-session' + (CHAT.session && CHAT.session.id === s.id ? ' active' : '');
+    const dt = new Date(s.updated_at * 1000);
+    d.innerHTML = '<div class="title"></div><div class="meta"><span>' + s.category +
+      (s.slot ? s.slot + 1 : '') + '</span><span>' +
+      (dt.toLocaleDateString() === new Date().toLocaleDateString() ? dt.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : dt.toLocaleDateString()) +
+      '</span></div><button class="del" title="Löschen">×</button>';
+    d.querySelector('.title').textContent = s.title;
+    d.onclick = (e) => { if (!e.target.classList.contains('del')) chatOpen(s.id); };
+    d.querySelector('.del').onclick = (e) => { e.stopPropagation(); chatDelete(s.id); };
+    list.appendChild(d);
+  }
+}
+
+async function chatNew() {
+  const id = document.getElementById('chatModelSelect').value || 'local';
+  const m = id.match(/^(local|coworker|light|strong|vision)(\d*)$/);
+  const body = { category: m ? m[1] : 'local', slot: m && m[2] ? parseInt(m[2]) - 1 : 0 };
+  const r = await fetch('/webui/api/chat/sessions', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  CHAT.session = await r.json();
+  CHAT.session.slot = body.slot;
+  CHAT.messages = CHAT.session.messages = [];
+  document.getElementById('chatModelSelect').value = id;
+  chatUpdateVisionBadge();
+  chatRender(); chatLoadSessions();
+  document.getElementById('chatInput').focus();
+}
+
+async function chatOpen(id, silent) {
+  if (CHAT.streaming) { chatStatus('Bitte warte bis die Antwort fertig ist oder drücke Stop.', true); return; }
+  const r = await fetch('/webui/api/chat/sessions/' + id);
+  if (!r.ok) { chatStatus('Chat konnte nicht geladen werden.', true); return; }
+  CHAT.session = await r.json();
+  CHAT.messages = CHAT.session.messages || [];
+  if (CHAT.session.category) {
+    const sel = document.getElementById('chatModelSelect');
+    const want = (CHAT.session.slot ? CHAT.session.category + (CHAT.session.slot + 1) : CHAT.session.category);
+    if (sel.querySelector('option[value="' + want + '"]')) sel.value = want;
+  }
+  chatUpdateVisionBadge();
+  chatRender(); chatLoadSessions();
+}
+
+async function chatDelete(id) {
+  if (!confirm('Diesen Chat löschen?')) return;
+  await fetch('/webui/api/chat/sessions/' + id, { method: 'DELETE' });
+  if (CHAT.session && CHAT.session.id === id) { CHAT.session = null; CHAT.messages = []; chatRender(); }
+  chatLoadSessions();
+}
+
+async function chatRename() {
+  const t = document.getElementById('chatTitle').value.trim();
+  if (!CHAT.session || !t || t === CHAT.session.title) return;
+  CHAT.session.title = t;
+  await fetch('/webui/api/chat/sessions/' + CHAT.session.id, { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ title: t }) });
+  chatLoadSessions();
+}
+
+async function chatSaveModel() {
+  if (!CHAT.session) return;
+  const id = document.getElementById('chatModelSelect').value || 'local';
+  const m = id.match(/^(local|coworker|light|strong|vision)(\d*)$/);
+  if (!m) return;
+  CHAT.session.category = m[1]; CHAT.session.slot = m[2] ? parseInt(m[2]) - 1 : 0;
+  await fetch('/webui/api/chat/sessions/' + CHAT.session.id, { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ category: m[1], slot: CHAT.session.slot }) });
+}
+
+function chatRender() {
+  const log = document.getElementById('chatLog');
+  document.getElementById('chatTitle').value = CHAT.session ? CHAT.session.title : '';
+  document.getElementById('chatAttachments').innerHTML = '';
+  chatRenderAttachments();
+  if (!CHAT.session || !CHAT.messages.length) {
+    log.innerHTML = '<div class="chat-welcome">Noch keine Nachricht.<br/>Tippe links auf <b>Neuer Chat</b> und leg los.</div>';
+    return;
+  }
+  log.innerHTML = '';
+  for (const m of CHAT.messages) log.appendChild(chatRenderMsg(m));
+  log.scrollTop = log.scrollHeight;
+}
+
+function chatRenderMsg(m) {
+  const div = document.createElement('div');
+  div.className = 'chat-msg ' + (m.role === 'user' ? 'user' : 'assistant');
+  const role = document.createElement('div'); role.className = 'role';
+  role.textContent = m.role === 'user' ? 'Du' : (document.getElementById('chatModelSelect').value || 'assistant');
+  div.appendChild(role);
+  const body = document.createElement('div'); body.className = 'body';
+  if (typeof m.content === 'string') {
+    body.innerHTML = chatFormat(m.content);
+  } else if (Array.isArray(m.content)) {
+    for (const p of m.content) {
+      if (p.type === 'text') body.innerHTML += chatFormat(p.text || '');
+      else if (p.type === 'image_url') {
+        const img = document.createElement('img'); img.src = p.image_url.url; img.alt = 'Bild';
+        img.onclick = () => window.open(p.image_url.url, '_blank');
+        body.appendChild(img);
+      }
+    }
+  }
+  div.appendChild(body);
+  return div;
+}
+
+function chatFormat(s) {
+  let esc = s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  esc = esc.replace(/```(\w*)\n([\s\S]*?)```/g, (m0, l, code) => '<pre class="codeblock">' + code + '</pre>');
+  esc = esc.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  return esc;
+}
+
+function chatFilesPicked(input) {
+  for (const f of input.files) {
+    if (f.size > 10 * 1024 * 1024) { chatStatus(f.name + ': > 10 MB, übersprungen.', true); continue; }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const data = String(reader.result).split(',')[1] || '';
+      const isImg = /^image\//.test(f.type);
+      if (!isImg && !/\.(txt|md|csv|log|py|js|ts|json|yaml|yml|toml|html|css|c|cpp|h|rs|go|java|sql|xml|sh|ini|conf)$/i.test(f.name) && !f.type.startsWith('text/')) {
+        chatStatus(f.name + ': Nur Textdateien oder Bilder.', true); return;
+      }
+      if (CHAT.files.length >= 12) { chatStatus('Max. 12 Dateien pro Nachricht.', true); return; }
+      CHAT.files.push({ name: f.name, mime: f.type || 'application/octet-stream', data, isImg });
+      chatRenderAttachments();
+    };
+    reader.readAsDataURL(f);
+  }
+  input.value = '';
+}
+
+function chatRenderAttachments() {
+  const box = document.getElementById('chatAttachments');
+  box.innerHTML = '';
+  CHAT.files.forEach((f, i) => {
+    const d = document.createElement('div'); d.className = 'chat-attachment';
+    if (f.isImg) { const t = document.createElement('img'); t.className = 'thumb'; t.src = 'data:' + f.mime + ';base64,' + f.data; d.appendChild(t); }
+    const s = document.createElement('span');
+    s.textContent = f.name + ' (' + Math.round(f.data.length * 3 / 4 / 1024) + ' KB)';
+    s.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    d.appendChild(s);
+    const b = document.createElement('button'); b.textContent = '×';
+    b.onclick = () => { CHAT.files.splice(i, 1); chatRenderAttachments(); };
+    d.appendChild(b);
+    box.appendChild(d);
+  });
+}
+
+function chatAutoGrow(t) { t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, 180) + 'px'; }
+function chatKeydown(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!CHAT.streaming) chatSend(); }
+}
+
+async function chatSend() {
+  const input = document.getElementById('chatInput');
+  const text = input.value;
+  if ((!text.trim() && !CHAT.files.length) || CHAT.streaming) return;
+  if (!CHAT.session) await chatNew();
+  const hasImg = CHAT.files.some(f => f.isImg);
+  if (hasImg && !chatCurrentSlot().is_vision)
+    chatStatus('Hinweis: dieses Modell hat keinen Vision-Support — Bilder werden serverseitig entfernt.', true);
+  CHAT.streaming = true;
+  document.getElementById('chatSendBtn').style.display = 'none';
+  document.getElementById('chatStopBtn').style.display = '';
+  chatStatus('Sende…');
+  const log = document.getElementById('chatLog');
+  if (!CHAT.messages.length) log.innerHTML = '';
+  const bodyModel = document.getElementById('chatModelSelect').value || 'local';
+  const userMsg = { role: 'user', content: [] };
+  if (text.trim()) userMsg.content.push({ type: 'text', text: text });
+  for (const f of CHAT.files) if (f.isImg) userMsg.content.push({ type: 'image_url', image_url: { url: 'data:' + f.mime + ';base64,' + f.data } });
+  CHAT.messages.push(userMsg);
+  log.appendChild(chatRenderMsg(userMsg));
+  const asstEl = document.createElement('div');
+  asstEl.className = 'chat-msg assistant';
+  const asstRole = document.createElement('div'); asstRole.className = 'role'; asstRole.textContent = bodyModel;
+  asstEl.appendChild(asstRole);
+  const asstBody = document.createElement('div'); asstBody.className = 'body';
+  asstBody.innerHTML = '<span class="hint">Denkt nach…</span>';
+  asstEl.appendChild(asstBody);
+  log.appendChild(asstEl);
+  const payload = { session: CHAT.session.id, content: text, model: bodyModel, files: CHAT.files.map(f => ({ name: f.name, mime: f.mime, data: f.data })) };
+  CHAT.files = []; chatRenderAttachments();
+  input.value = ''; chatAutoGrow(input);
+  let full = ''; let reasoning = ''; let gotError = false;
+  const paint = () => {
+    let html = '';
+    if (reasoning) html += '<details class="reasoning" open><summary>Reasoning</summary><pre></pre></details>';
+    html += chatFormat(full || '…');
+    asstBody.innerHTML = html;
+    if (reasoning) { const pre = asstBody.querySelector('details.reasoning pre'); if (pre) pre.textContent = reasoning; }
+    log.scrollTop = log.scrollHeight;
+  };
+  try {
+    const ctrl = new AbortController(); CHAT.abort = ctrl;
+    const r = await fetch('/webui/api/chat/stream', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload), signal: ctrl.signal });
+    if (!r.ok) {
+      gotError = true;
+      const err = (await r.text()).slice(0, 500);
+      asstBody.innerHTML = '<span style="color:var(--danger)">' + chatFormat('Fehler HTTP ' + r.status + ': ' + err) + '</span>';
+      chatStatus('Server-Fehler.', true);
+    } else {
+      const reader = r.body.getReader(); const dec = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
+          for (const line of block.split('\n')) {
+            const t = line.trim();
+            if (!t.startsWith('data:')) continue;
+            const d = t.slice(5).trim();
+            if (d === '[DONE]') continue;
+            let j; try { j = JSON.parse(d); } catch (e) { continue; }
+            if (j.error) { gotError = true; full = full || ('[Fehler] ' + j.error); asstBody.innerHTML = '<span style="color:var(--danger)">' + chatFormat(full) + '</span>'; chatStatus('Backend-Fehler.', true); }
+            else if (j.content) { if (full === '…') full = ''; full += j.content; paint(); }
+            else if (j.reasoning) { reasoning += j.reasoning; paint(); }
+          }
+        }
+      }
+      if (!full && !gotError) full = '[Keine Antwort erhalten]';
+      if (!gotError) paint();
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') { asstBody.innerHTML += ' <span style="color:var(--warn)">[abgebrochen]</span>'; }
+    else { gotError = true; asstBody.innerHTML = '<span style="color:var(--danger)">' + chatFormat('Netzfehler: ' + e.message) + '</span>'; }
+  } finally {
+    CHAT.streaming = false; CHAT.abort = null;
+    document.getElementById('chatStopBtn').style.display = 'none';
+    document.getElementById('chatSendBtn').style.display = '';
+    setTimeout(() => { if (!CHAT.streaming) chatStatus(''); }, 2500);
+    if (CHAT.session) {
+      const rr = await fetch('/webui/api/chat/sessions/' + CHAT.session.id);
+      if (rr.ok) { const fresh = await rr.json(); if (fresh && Array.isArray(fresh.messages)) {
+        if (fresh.messages.length >= CHAT.messages.length) { CHAT.session = fresh; CHAT.messages = fresh.messages; }
+      } chatRender(); chatLoadSessions(); }
+    }
+  }
+}
+
+function chatAbort() {
+  if (CHAT.abort) CHAT.abort.abort();
+}
+
+function chatStatus(msg, isErr) {
+  const el = document.getElementById('chatStatus');
+  el.textContent = msg || '';
+  el.className = 'chat-status' + (isErr ? ' err' : '');
+}
+
 // ============ INIT ============
 loadConfig();
 loadIdentifiers();
+chatInit();
 // Fuege Show/Hide-Buttons zu allen Passwortfeldern hinzu
 document.querySelectorAll('input[type=password]').forEach(function(inp) {
   var wrapper = document.createElement('span');
@@ -2200,8 +2634,366 @@ def _trigger_restart() -> None:
     _th.Thread(target=_do_restart, daemon=True).start()
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Chat — integriertes Chatfenster mit Session-Persistenz (data/chats/)
+# ═══════════════════════════════════════════════════════════════════════════
+
+CHAT_DIR = CONFIG_PATH.parent / "chats"
+CHAT_MAX_UPLOAD_BYTES = int(os.getenv("CHAT_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
+CHAT_MAX_TOTAL_UPLOAD_BYTES = int(os.getenv("CHAT_MAX_TOTAL_UPLOAD_BYTES", str(20 * 1024 * 1024)))
+CHAT_MAX_DOC_CHARS = int(os.getenv("CHAT_MAX_DOC_CHARS", "200000"))
+CHAT_MAX_SESSIONS = 500
+_CHAT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_CHAT_CATEGORIES = ("local", "coworker", "light", "strong", "vision")
+_TEXT_MIME_EXT = {
+    ".txt": "text/plain", ".md": "text/markdown", ".csv": "text/csv",
+    ".log": "text/plain", ".py": "text/x-python", ".js": "text/javascript",
+    ".ts": "text/typescript", ".json": "application/json", ".yaml": "application/yaml",
+    ".yml": "application/yaml", ".toml": "application/toml", ".html": "text/html",
+    ".css": "text/css", ".c": "text/x-c", ".cpp": "text/x-c++", ".h": "text/x-c",
+    ".rs": "text/rust", ".go": "text/go", ".java": "text/java", ".sql": "text/sql",
+    ".xml": "text/xml", ".sh": "text/x-sh", ".ini": "text/plain", ".conf": "text/plain",
+}
+
+
+def _chat_path(chat_id: str) -> Path:
+    if not _CHAT_ID_RE.fullmatch(chat_id):
+        raise HTTPException(status_code=400, detail="Ungueltige Chat-ID")
+    return CHAT_DIR / f"{chat_id}.json"
+
+
+def _chat_atomic_write(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _chat_save(chat: Dict[str, Any]) -> None:
+    _chat_atomic_write(_chat_path(chat["id"]), chat)
+
+
+def _chat_index_load() -> List[Dict[str, Any]]:
+    p = CHAT_DIR / "index.json"
+    if not p.exists():
+        return []
+    try:
+        idx = json.loads(p.read_text(encoding="utf-8"))
+        return [e for e in idx if isinstance(e, dict)] if isinstance(idx, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _chat_index_entry(chat: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": chat["id"],
+        "title": chat.get("title") or "Neuer Chat",
+        "category": chat.get("category", "local"),
+        "slot": chat.get("slot", 0),
+        "updated_at": chat.get("updated_at", 0),
+    }
+
+
+def _chat_index_update(entry: Dict[str, Any]) -> None:
+    idx = [e for e in _chat_index_load() if e.get("id") != entry["id"]]
+    idx.insert(0, entry)
+    idx.sort(key=lambda e: e.get("updated_at", 0), reverse=True)
+    _chat_atomic_write(CHAT_DIR / "index.json", idx[:CHAT_MAX_SESSIONS])
+
+
+def _chat_index_remove(chat_id: str) -> None:
+    _chat_atomic_write(CHAT_DIR / "index.json",
+                       [e for e in _chat_index_load() if e.get("id") != chat_id])
+
+
+def _chat_load(chat_id: str) -> Dict[str, Any]:
+    path = _chat_path(chat_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Chat nicht gefunden")
+    try:
+        chat = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise HTTPException(status_code=500, detail=f"Chat korrupt: {exc}")
+    if not isinstance(chat, dict) or "messages" not in chat:
+        raise HTTPException(status_code=500, detail="Chat korrupt")
+    return chat
+
+
+def _chat_title_from(text: str) -> str:
+    first = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    return (first[:60] + "\u2026") if len(first) > 60 else (first or "Neuer Chat")
+
+
+def _chat_text_from_parts(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(p.get("text", "") for p in content
+                        if isinstance(p, dict) and p.get("type") == "text")
+    return ""
+
+
+def _is_probably_text(raw: bytes) -> bool:
+    if not raw:
+        return False
+    if b"\x00" in raw[:1024]:
+        return False
+    try:
+        raw[:20000].decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        return False
+
+
+def _chat_slot_identifier(category: str, slot: int) -> str:
+    return category if slot <= 0 else f"{category}{slot + 1}"
+
+
+def _register_chat_routes(webapp: FastAPI) -> None:
+    """Chat-API und SSE-Relueber ueber den lokalen /v1/chat/completions-Endpunkt."""
+
+    @webapp.get("/api/chat/models")
+    async def chat_models():
+        cfg = _load_config()
+        cats: Dict[str, Any] = {}
+        for key in _CHAT_CATEGORIES:
+            cat = cfg.get("model_categories", {}).get(key)
+            slots = cat if isinstance(cat, list) else ([cat] if isinstance(cat, dict) else [])
+            entries = []
+            for i, d in enumerate(slots):
+                if not isinstance(d, dict):
+                    continue
+                identifier = _chat_slot_identifier(key, i)
+                entries.append({
+                    "identifier": identifier,
+                    "label": str(d.get("label") or d.get("model_name") or identifier),
+                    "model_name": str(d.get("model_name", "")),
+                    "is_vision": bool(d.get("is_vision", False)),
+                    "configured": bool(d.get("api_url") and d.get("model_name")),
+                })
+            cats[key] = {"slots": entries}
+        return JSONResponse(content={
+            "categories": cats,
+            "default_category": cfg.get("default_category", "local"),
+        })
+
+    @webapp.get("/api/chat/sessions")
+    async def chat_sessions():
+        idx = _chat_index_load()
+        idx.sort(key=lambda e: e.get("updated_at", 0), reverse=True)
+        return JSONResponse(content={"sessions": idx[:200]})
+
+    @webapp.post("/api/chat/sessions")
+    async def chat_create(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        cat = str(body.get("category") or "local")
+        if cat not in _CHAT_CATEGORIES:
+            cat = "local"
+        try:
+            slot = max(0, int(body.get("slot") or 0))
+        except (TypeError, ValueError):
+            slot = 0
+        chat = {
+            "id": uuid.uuid4().hex,
+            "title": "Neuer Chat",
+            "category": cat,
+            "slot": slot,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "messages": [],
+        }
+        _chat_save(chat)
+        _chat_index_update(_chat_index_entry(chat))
+        return JSONResponse(content=chat)
+
+    @webapp.get("/api/chat/sessions/{chat_id}")
+    async def chat_get(chat_id: str):
+        return JSONResponse(content=_chat_load(chat_id))
+
+    @webapp.patch("/api/chat/sessions/{chat_id}")
+    async def chat_patch(chat_id: str, request: Request):
+        chat = _chat_load(chat_id)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Ungueltiges JSON")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Ungueltiger Body")
+        if body.get("title"):
+            t = str(body["title"]).strip()
+            if t:
+                chat["title"] = t[:120]
+        if body.get("category") in _CHAT_CATEGORIES:
+            chat["category"] = body["category"]
+            if "slot" in body:
+                try:
+                    chat["slot"] = max(0, int(body["slot"]))
+                except (TypeError, ValueError):
+                    pass
+        chat["updated_at"] = time.time()
+        _chat_save(chat)
+        _chat_index_update(_chat_index_entry(chat))
+        return JSONResponse(content=_chat_index_entry(chat))
+
+    @webapp.delete("/api/chat/sessions/{chat_id}")
+    async def chat_delete(chat_id: str):
+        path = _chat_path(chat_id)
+        if path.exists():
+            path.unlink()
+        _chat_index_remove(chat_id)
+        return JSONResponse(content={"status": "ok"})
+
+    @webapp.post("/api/chat/stream")
+    async def chat_stream(request: Request):
+        """Chat-Turn: user-Nachricht persists, Antwort als SSE-Zeile fuer fetch()."""
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Ungueltiges JSON")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Ungueltiger Body")
+
+        chat_id = str(body.get("session") or "")
+        chat = _chat_load(chat_id)
+        user_text = str(body.get("content") or "")
+
+        # Bild-/Dokument-Uploads (base64) → parts, persistent im Chat-Verlauf.
+        parts: List[Dict[str, Any]] = []
+        try:
+            files_in = body.get("files") or []
+        except Exception:
+            files_in = []
+        if not isinstance(files_in, list) or len(files_in) > 12:
+            raise HTTPException(status_code=400, detail="max. 12 Dateien pro Nachricht")
+
+        doc_chunks: List[str] = []
+        total_bytes = 0
+        for f in files_in:
+            if not isinstance(f, dict):
+                continue
+            name = str(f.get("name") or "datei")[:200].replace("\n", " ")
+            mime = str(f.get("mime") or "")
+            b64 = str(f.get("data") or "")
+            if not b64:
+                continue
+            try:
+                raw = base64.b64decode(b64 + "=" * (-len(b64) % 4))
+            except Exception:
+                raise HTTPException(status_code=400, detail=f"{name}: ungueltes Base64")
+            total_bytes += len(raw)
+            if len(raw) > CHAT_MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail=f"{name}: zu groß (max. {CHAT_MAX_UPLOAD_BYTES // (1024 * 1024)} MB)")
+            if mime.startswith("image/"):
+                if not mime.startswith("image/"):
+                    raise HTTPException(status_code=415, detail=f"{name}: Nur Text und Bilder (max. 12 Dateien).")
+                parts.append({"type": "image_url",
+                              "image_url": {"url": f"data:{mime};base64,{b64}"}})
+            elif mime.startswith("text/") or _TEXT_MIME_EXT.get(os.path.splitext(name)[1].lower()):
+                text = raw.decode("utf-8", errors="replace")[:CHAT_MAX_DOC_CHARS]
+                doc_chunks.append(f"Datei '{name}':\n```\n{text}\n```")
+            elif _is_probably_text(raw):
+                text = raw.decode("utf-8", errors="replace")[:CHAT_MAX_DOC_CHARS]
+                doc_chunks.append(f"Datei '{name}':\n```\n{text}\n```")
+            else:
+                raise HTTPException(status_code=415,
+                                    detail=f"{name}: Nur Text-Dateien und Bilder sind unterstuetzt (PDF/Binaer geht hier nicht).")
+        if total_bytes > CHAT_MAX_TOTAL_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Gesamt-Upload zu groß (max. 20 MB)")
+
+        text_content = user_text
+        if doc_chunks:
+            text_content = ((user_text + "\n\n") if user_text else "") + "\n\n".join(doc_chunks)
+        if text_content:
+            parts.insert(0, {"type": "text", "text": text_content})
+        if not parts:
+            raise HTTPException(status_code=400, detail="Leere Nachricht")
+        user_msg = {"role": "user", "content": parts}
+
+        if not any(m.get("role") == "user" for m in chat["messages"]):
+            chat["title"] = _chat_title_from(_chat_text_from_parts(text_content))
+        chat["messages"].append(user_msg)
+        chat["updated_at"] = time.time()
+        _chat_save(chat)
+        _chat_index_update(_chat_index_entry(chat))
+
+        # Payload an /v1/chat/completions — history unveraendert (der Proxy
+        # entfernt image_parts selbstaendig, wenn das Backend kein Vision hat).
+        api_messages = [{"role": m["role"], "content": m.get("content", "")}
+                        for m in chat["messages"]
+                        if isinstance(m, dict) and m.get("role") in ("user", "assistant", "system")]
+        identifier = str(body.get("model") or _chat_slot_identifier(chat["category"], int(chat.get("slot", 0))))
+        payload = {"model": identifier, "messages": api_messages, "stream": True}
+
+        port = os.getenv("PROXY_PORT") or str(_load_config().get("proxy", {}).get("port", 9001))
+        url = f"http://127.0.0.1:{port}/v1/chat/completions"
+        headers: Dict[str, str] = {}
+        key = os.getenv("PROXY_API_KEY") or str(_load_config().get("proxy", {}).get("api_key", "") or "")
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+
+        async def relay():
+            content_chunks: List[str] = []
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=15.0)) as hc:
+                    async with hc.stream("POST", url, json=payload, headers=headers) as r:
+                        if r.status_code != 200:
+                            err = (await r.aread()).decode("utf-8", errors="replace")[:800]
+                            _log(f"Chat-Backend HTTP {r.status_code}: {err}")
+                            yield f"data: {json.dumps({'error': f'Backend HTTP {r.status_code}: {err}'})}\n\n"
+                        else:
+                            buf = ""
+                            async for raw_bytes in r.aiter_raw():
+                                buf += raw_bytes.decode("utf-8", errors="replace")
+                                while "\n" in buf:
+                                    line, buf = buf.split("\n", 1)
+                                    line = line.strip()
+                                    if not line.startswith("data:"):
+                                        continue
+                                    payload_s = line[5:].strip()
+                                    if payload_s == "[DONE]":
+                                        break
+                                    try:
+                                        chunk = json.loads(payload_s)
+                                    except json.JSONDecodeError:
+                                        continue
+                                    delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
+                                    c = delta.get("content")
+                                    rc = delta.get("reasoning_content")
+                                    if isinstance(c, str) and c:
+                                        content_chunks.append(c)
+                                        yield f"data: {json.dumps({'content': c})}\n\n"
+                                    elif isinstance(rc, str) and rc:
+                                        yield f"data: {json.dumps({'reasoning': rc})}\n\n"
+                            yield "data: [DONE]\n\n"
+            except Exception as exc:
+                _log(f"Chat-Stream Fehler: {exc}")
+                yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+            finally:
+                final = "".join(content_chunks) or "[Keine Antwort erhalten]"
+                chat["messages"].append({"role": "assistant", "content": final})
+                chat["updated_at"] = time.time()
+                try:
+                    _chat_save(chat)
+                    _chat_index_update(_chat_index_entry(chat))
+                except Exception as exc:
+                    _log(f"Chat-Speichern fehlgeschlagen: {exc}")
+
+        return StreamingResponse(relay(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache"})
+
+
 def create_webui_app() -> FastAPI:
     webapp = FastAPI(docs_url=None, openapi_url=None, redoc_url=None)
+    _register_chat_routes(webapp)
 
     @webapp.middleware("http")
     async def _auth_middleware(request: Request, call_next):
