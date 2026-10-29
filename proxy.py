@@ -170,6 +170,7 @@ def _safe_str(val: object) -> str:
 # ── Webinterface ───────────────────────────────────────────────────────────
 try:
     from webui import mount_webui, _load_config as _webui_load_config
+    from webui import _save_config as _webui_save_config
     _WEBUI_AVAILABLE = True
 except Exception:
     _WEBUI_AVAILABLE = False
@@ -364,6 +365,15 @@ PROXY_API_KEY: str = os.getenv("PROXY_API_KEY", "")
 if PROXY_AUTH_ENABLED and not PROXY_API_KEY:
     PROXY_API_KEY = "localfox-" + secrets.token_hex(16)
     _log(f"Auto-generated PROXY_API_KEY: {PROXY_API_KEY}")
+    # Persistieren, damit die WebUI (Chat-Relay, die den Key aus config.json
+    # liest) denselben Key kennt — sonst erhaelt der Chat 401 vom Proxy.
+    if _WEBUI_AVAILABLE:
+        try:
+            _cfg = _webui_load_config()
+            _cfg.setdefault("proxy", {})["api_key"] = PROXY_API_KEY
+            _webui_save_config(_cfg)
+        except Exception as _exc:
+            _log(f"PROXY_API_KEY konnte nicht in config.json persistiert werden: {_exc}")
 
 # ── Hindsight / Qdrant ─────────────────────────────────────────────────────
 HINDSIGHT_ENABLED: bool = os.getenv("HINDSIGHT_ENABLED", "true").lower() in {"1", "true", "yes", "y", "on"}

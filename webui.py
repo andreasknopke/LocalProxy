@@ -667,6 +667,11 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
   flex-wrap: wrap;
 }
 .chat-toolbar select { width: auto; padding: 6px 10px; font-size: 0.82rem; }
+.chat-toolbar .web-research-toggle {
+  font-size: 0.78rem; color: var(--text2); display: flex; align-items: center; gap: 5px; cursor: pointer;
+  user-select: none;
+}
+.chat-toolbar .web-research-toggle input { accent-color: var(--accent); margin: 0; }
 .chat-toolbar .vision-badge { font-size: 0.7rem; color: var(--warn); }
 .chat-toolbar .spacer { flex: 1; }
 .chat-title-input {
@@ -1671,6 +1676,9 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
           <input type="text" class="chat-title-input" id="chatTitle" placeholder="Titel…" onblur="chatRename()" />
           <span class="spacer"></span>
           <select id="chatModelSelect" title="Modell-Kategorie"></select>
+          <label class="web-research-toggle" title="Modell darf das Web durchsuchen (Bing / DuckDuckGo)">
+            <input type="checkbox" id="chatWebResearch" /> Web-Recherche
+          </label>
           <span class="vision-badge" id="chatVisionBadge" style="display:none">Bildanalyse an</span>
         </div>
         <div class="chat-log" id="chatLog">
@@ -2473,7 +2481,8 @@ async function chatSend() {
   asstBody.innerHTML = '<span class="hint">Denkt nach…</span>';
   asstEl.appendChild(asstBody);
   log.appendChild(asstEl);
-  const payload = { session: CHAT.session.id, content: text, model: bodyModel, files: CHAT.files.map(f => ({ name: f.name, mime: f.mime, data: f.data })) };
+  const webResearch = document.getElementById('chatWebResearch').checked;
+  const payload = { session: CHAT.session.id, content: text, model: bodyModel, web_research: webResearch, files: CHAT.files.map(f => ({ name: f.name, mime: f.mime, data: f.data })) };
   CHAT.files = []; chatRenderAttachments();
   input.value = ''; chatAutoGrow(input);
   let full = ''; let reasoning = ''; let gotError = false;
@@ -2514,6 +2523,7 @@ async function chatSend() {
             if (j.error) { gotError = true; full = full || ('[Fehler] ' + j.error); asstBody.innerHTML = '<span style="color:var(--danger)">' + chatFormat(full) + '</span>'; chatStatus('Backend-Fehler.', true); }
             else if (j.content) { if (full === '…') full = ''; full += j.content; paint(); }
             else if (j.reasoning) { reasoning += j.reasoning; paint(); }
+            else if (j.status) { chatStatus(j.status); if (full === '…') asstBody.innerHTML = '<span class="hint">' + chatFormat(j.status) + '</span>'; }
           }
         }
       }
@@ -2753,6 +2763,229 @@ def _chat_slot_identifier(category: str, slot: int) -> str:
     return category if slot <= 0 else f"{category}{slot + 1}"
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Web-Recherche: HTML-Suche (Bing, Fallback DuckDuckGo) + Tool-Loop fuer den lokalen Chat.
+# Der Proxy bleibt ein reiner Pass-Through; der Tool-Loop laeuft hier, weil
+# nur der WebUI-Chat ihn braucht.
+# ═══════════════════════════════════════════════════════════════════════════
+
+WEB_RESEARCH_MAX_ROUNDS = 5
+WEB_RESEARCH_MAX_RESULTS = 8
+WEB_RESEARCH_MAX_TOOL_CHARS = 6000
+_DDG_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+
+WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "Sucht das Web (Bing, Fallback DuckDuckGo) nach aktuellen Informationen. "
+            "Gibt eine Liste von Treffern mit Titel, URL und Kurzbeschreibung zurueck. "
+            "Nutze dieses Tool fuer Fakten, aktuelle Ereignisse und Quellen, die du zitieren sollst."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Die Suchanfrage (kurz und praezise).",
+                }
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+
+def _strip_html(s: str) -> str:
+    import html as _html
+    s = re.sub(r"<[^>]+>", "", s or "")
+    return _html.unescape(s).strip()
+
+
+def _ddg_real_url(href: str) -> str:
+    """Entpackt DuckDuckGo-Redirect-Links (//duckduckgo.com/l/?uddg=...) zur echten URL."""
+    import urllib.parse
+    href = (href or "").strip()
+    if href.startswith("//"):
+        href = "https:" + href
+    if "duckduckgo.com/l/" in href or "uddg=" in href:
+        try:
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+            if "uddg" in q:
+                return q["uddg"][0]
+        except Exception:
+            pass
+    return href
+
+
+def _bing_real_url(href: str) -> str:
+    """Entpackt Bing-Redirect-Links (bing.com/ck/a?...u=<base64>) zur echten URL."""
+    import urllib.parse
+    import base64
+    href = (href or "").strip().replace("&amp;", "&")
+    if "bing.com/ck/a" in href:
+        try:
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+            u = q.get("u", [""])[0]
+            if u:
+                body = u[2:] if u.startswith("a1") else u
+                pad = body + "=" * (-len(body) % 4)
+                return base64.b64decode(pad).decode("utf-8", "replace")
+        except Exception:
+            pass
+    return href
+
+
+async def _web_search_bing(query: str, max_results: int) -> List[Dict[str, str]]:
+    """Bing-HTML-Suche (Primärquelle)."""
+    headers = {"User-Agent": _DDG_UA}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0), follow_redirects=True) as hc:
+        r = await hc.get("https://www.bing.com/search", params={"q": query}, headers=headers)
+        r.raise_for_status()
+        html = r.text
+    blocks = re.findall(r'<li class="b_algo".*?</li>', html, re.S)
+    results: List[Dict[str, str]] = []
+    for b in blocks[:max_results]:
+        m = re.search(r'<h2>.*?<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', b, re.S)
+        if not m:
+            continue
+        s = re.search(r'<p[^>]*>(.*?)</p>', b, re.S)
+        results.append({
+            "title": _strip_html(m.group(2)),
+            "url": _bing_real_url(m.group(1)),
+            "snippet": _strip_html(s.group(1)) if s else "",
+        })
+    return results
+
+
+async def _web_search_ddg(query: str, max_results: int) -> List[Dict[str, str]]:
+    """DuckDuckGo-HTML-Suche (Fallback)."""
+    headers = {"User-Agent": _DDG_UA}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0), follow_redirects=True) as hc:
+        r = await hc.get("https://html.duckduckgo.com/html/", params={"q": query}, headers=headers)
+        r.raise_for_status()
+        html = r.text
+    anchors = re.findall(r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, re.S)
+    snippets = re.findall(r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>', html, re.S)
+    results: List[Dict[str, str]] = []
+    for i, (href, title) in enumerate(anchors[:max_results]):
+        snippet = _strip_html(snippets[i]) if i < len(snippets) else ""
+        results.append({
+            "title": _strip_html(title),
+            "url": _ddg_real_url(href),
+            "snippet": snippet,
+        })
+    return results
+
+
+async def _web_search(query: str, max_results: int = WEB_RESEARCH_MAX_RESULTS) -> List[Dict[str, str]]:
+    """Web-Suche: Bing als Primärquelle, DuckDuckGo als Fallback. Liefert [{title, url, snippet}]."""
+    errors: List[str] = []
+    for engine in (_web_search_bing, _web_search_ddg):
+        try:
+            results = await engine(query, max_results)
+            if results:
+                return results
+            errors.append(f"{engine.__name__}: keine Treffer")
+        except Exception as exc:
+            errors.append(f"{engine.__name__}: {exc}")
+    raise RuntimeError("; ".join(errors) or "Suche fehlgeschlagen")
+
+
+async def _chat_web_research(api_messages: List[Dict[str, Any]], url: str,
+                             headers: Dict[str, str], model: str):
+    """Web-Recherche-Loop: ruft den Proxy nicht-streamend mit dem web_search-Tool auf,
+    fuehrt Suchanfragen serverseitig aus und wiederholt, bis das Modell antwortet.
+    Yields SSE-Events: {'status': ...}, {'content': ...} oder {'error': ...}."""
+    messages = list(api_messages)
+    hint = (
+        "Du kannst das Tool web_search nutzen, um das Web zu durchsuchen. "
+        "Nutze es fuer Fakten, aktuelle Informationen und Quellen. "
+        "Zitiere am Ende deiner Antwort die verwendeten Quellen mit URLs. "
+        "Wenn du genug Informationen hast, antworte direkt ohne weiteren Tool-Call."
+    )
+    if any(m.get("role") == "system" for m in messages):
+        for m in messages:
+            if m.get("role") == "system":
+                m["content"] = f"{m.get('content', '')}\n\n{hint}".strip()
+                break
+    else:
+        messages.insert(0, {"role": "system", "content": hint})
+
+    seen_queries: Set[str] = set()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=15.0)) as hc:
+        for round_no in range(WEB_RESEARCH_MAX_ROUNDS):
+            payload = {"model": model, "messages": messages, "stream": False,
+                       "tools": [WEB_SEARCH_TOOL], "tool_choice": "auto"}
+            yield {"status": f"Web-Recherche: Runde {round_no + 1}…"}
+            r = await hc.post(url, json=payload, headers=headers)
+            if r.status_code != 200:
+                yield {"error": f"Backend HTTP {r.status_code}: {r.text[:400]}"}
+                return
+            data = r.json()
+            choice = (data.get("choices") or [{}])[0]
+            msg = choice.get("message") or {}
+            tool_calls = msg.get("tool_calls") or []
+            if not tool_calls:
+                content = msg.get("content") or ""
+                if content:
+                    yield {"content": content}
+                return
+            # Tool-Calls ausfuehren und Ergebnis als tool-Nachricht anhaengen.
+            messages.append({
+                "role": "assistant",
+                "content": msg.get("content"),
+                "tool_calls": tool_calls,
+            })
+            for idx, tc in enumerate(tool_calls):
+                fn = tc.get("function") or {}
+                name = fn.get("name")
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                call_id = tc.get("id") or f"call_{round_no}_{idx}"
+                result_text: Optional[str] = None
+                if name != "web_search":
+                    result_text = f"Unbekanntes Tool: {name}"
+                else:
+                    query = str(args.get("query") or "").strip()
+                    if not query:
+                        result_text = "Keine Suchanfrage angegeben."
+                    elif query in seen_queries:
+                        result_text = ("Diese Anfrage wurde bereits durchgefuehrt. "
+                                   "Nutze die bisherigen Ergebnisse oder eine andere Suchanfrage.")
+                    else:
+                        seen_queries.add(query)
+                        yield {"status": f"Suche: {query[:80]}"}
+                        try:
+                            results = await _web_search(query)
+                        except Exception as exc:
+                            results = []
+                            result_text = f"Suche fehlgeschlagen: {exc}"
+                        if result_text is None:
+                            if results:
+                                parts = [f"{i}. {res['title']}\n   URL: {res['url']}\n   {res['snippet']}"
+                                         for i, res in enumerate(results, 1)]
+                                result_text = "Suchergebnisse:\n" + "\n\n".join(parts)
+                            else:
+                                result_text = "Keine Treffer fuer diese Suchanfrage."
+                messages.append({"role": "tool", "tool_call_id": call_id,
+                                 "content": result_text[:WEB_RESEARCH_MAX_TOOL_CHARS]})
+        # Rundenlimit erreicht: zwingend finale Antwort ohne Tools.
+        yield {"status": "Web-Recherche: Rundenlimit erreicht, fasse zusammen…"}
+        payload = {"model": model, "messages": messages, "stream": False}
+        r = await hc.post(url, json=payload, headers=headers)
+        if r.status_code == 200:
+            data = r.json()
+            choice = (data.get("choices") or [{}])[0]
+            content = (choice.get("message") or {}).get("content") or ""
+            if content:
+                yield {"content": content}
+
+
 def _register_chat_routes(webapp: FastAPI) -> None:
     """Chat-API und SSE-Relueber ueber den lokalen /v1/chat/completions-Endpunkt."""
 
@@ -2931,6 +3164,7 @@ def _register_chat_routes(webapp: FastAPI) -> None:
                         for m in chat["messages"]
                         if isinstance(m, dict) and m.get("role") in ("user", "assistant", "system")]
         identifier = str(body.get("model") or _chat_slot_identifier(chat["category"], int(chat.get("slot", 0))))
+        web_research = bool(body.get("web_research"))
         payload = {"model": identifier, "messages": api_messages, "stream": True}
 
         port = os.getenv("PROXY_PORT") or str(_load_config().get("proxy", {}).get("port", 9001))
@@ -2943,37 +3177,50 @@ def _register_chat_routes(webapp: FastAPI) -> None:
         async def relay():
             content_chunks: List[str] = []
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=15.0)) as hc:
-                    async with hc.stream("POST", url, json=payload, headers=headers) as r:
-                        if r.status_code != 200:
-                            err = (await r.aread()).decode("utf-8", errors="replace")[:800]
-                            _log(f"Chat-Backend HTTP {r.status_code}: {err}")
-                            yield f"data: {json.dumps({'error': f'Backend HTTP {r.status_code}: {err}'})}\n\n"
-                        else:
-                            buf = ""
-                            async for raw_bytes in r.aiter_raw():
-                                buf += raw_bytes.decode("utf-8", errors="replace")
-                                while "\n" in buf:
-                                    line, buf = buf.split("\n", 1)
-                                    line = line.strip()
-                                    if not line.startswith("data:"):
-                                        continue
-                                    payload_s = line[5:].strip()
-                                    if payload_s == "[DONE]":
-                                        break
-                                    try:
-                                        chunk = json.loads(payload_s)
-                                    except json.JSONDecodeError:
-                                        continue
-                                    delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
-                                    c = delta.get("content")
-                                    rc = delta.get("reasoning_content")
-                                    if isinstance(c, str) and c:
-                                        content_chunks.append(c)
-                                        yield f"data: {json.dumps({'content': c})}\n\n"
-                                    elif isinstance(rc, str) and rc:
-                                        yield f"data: {json.dumps({'reasoning': rc})}\n\n"
-                            yield "data: [DONE]\n\n"
+                if web_research:
+                    # Web-Recherche-Loop: nicht-streamende Proxy-Aufrufe mit
+                    # web_search-Tool; nur die finale Antwort wird persistiert.
+                    async for ev in _chat_web_research(api_messages, url, headers, identifier):
+                        if "content" in ev:
+                            content_chunks.append(ev["content"])
+                            yield f"data: {json.dumps({'content': ev['content']})}\n\n"
+                        elif "status" in ev:
+                            yield f"data: {json.dumps({'status': ev['status']})}\n\n"
+                        elif "error" in ev:
+                            yield f"data: {json.dumps({'error': ev['error']})}\n\n"
+                    yield "data: [DONE]\n\n"
+                else:
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=15.0)) as hc:
+                        async with hc.stream("POST", url, json=payload, headers=headers) as r:
+                            if r.status_code != 200:
+                                err = (await r.aread()).decode("utf-8", errors="replace")[:800]
+                                _log(f"Chat-Backend HTTP {r.status_code}: {err}")
+                                yield f"data: {json.dumps({'error': f'Backend HTTP {r.status_code}: {err}'})}\n\n"
+                            else:
+                                buf = ""
+                                async for raw_bytes in r.aiter_raw():
+                                    buf += raw_bytes.decode("utf-8", errors="replace")
+                                    while "\n" in buf:
+                                        line, buf = buf.split("\n", 1)
+                                        line = line.strip()
+                                        if not line.startswith("data:"):
+                                            continue
+                                        payload_s = line[5:].strip()
+                                        if payload_s == "[DONE]":
+                                            break
+                                        try:
+                                            chunk = json.loads(payload_s)
+                                        except json.JSONDecodeError:
+                                            continue
+                                        delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
+                                        c = delta.get("content")
+                                        rc = delta.get("reasoning_content")
+                                        if isinstance(c, str) and c:
+                                            content_chunks.append(c)
+                                            yield f"data: {json.dumps({'content': c})}\n\n"
+                                        elif isinstance(rc, str) and rc:
+                                            yield f"data: {json.dumps({'reasoning': rc})}\n\n"
+                                yield "data: [DONE]\n\n"
             except Exception as exc:
                 _log(f"Chat-Stream Fehler: {exc}")
                 yield f"data: {json.dumps({'error': str(exc)})}\n\n"
