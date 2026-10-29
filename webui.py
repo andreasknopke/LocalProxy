@@ -2903,8 +2903,9 @@ async def _chat_web_research(api_messages: List[Dict[str, Any]], url: str,
     hint = (
         "Du kannst das Tool web_search nutzen, um das Web zu durchsuchen. "
         "Nutze es fuer Fakten, aktuelle Informationen und Quellen. "
+        "Fuehre maximal 2-3 Suchanfragen durch, dann antworte. "
         "Zitiere am Ende deiner Antwort die verwendeten Quellen mit URLs. "
-        "Wenn du genug Informationen hast, antworte direkt ohne weiteren Tool-Call."
+        "Sobald du genug Informationen hast, antworte direkt in Text OHNE weiteren Tool-Call."
     )
     if any(m.get("role") == "system" for m in messages):
         for m in messages:
@@ -2915,6 +2916,7 @@ async def _chat_web_research(api_messages: List[Dict[str, Any]], url: str,
         messages.insert(0, {"role": "system", "content": hint})
 
     seen_queries: Set[str] = set()
+    collected: List[str] = []  # gesammelte Suchergebnisse (Fallback bei leerer Antwort)
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=15.0)) as hc:
         for round_no in range(WEB_RESEARCH_MAX_ROUNDS):
             payload = {"model": model, "messages": messages, "stream": False,
@@ -2930,6 +2932,9 @@ async def _chat_web_research(api_messages: List[Dict[str, Any]], url: str,
             tool_calls = msg.get("tool_calls") or []
             if not tool_calls:
                 content = msg.get("content") or ""
+                if not content and collected:
+                    content = ("Die Zusammenfassung ist fehlgeschlagen — hier sind die "
+                               "gesammelten Suchergebnisse:\n\n" + "\n\n".join(collected))
                 if content:
                     yield {"content": content}
                 return
@@ -2970,20 +2975,34 @@ async def _chat_web_research(api_messages: List[Dict[str, Any]], url: str,
                                 parts = [f"{i}. {res['title']}\n   URL: {res['url']}\n   {res['snippet']}"
                                          for i, res in enumerate(results, 1)]
                                 result_text = "Suchergebnisse:\n" + "\n\n".join(parts)
+                                collected.append(f"### Suche: {query}\n{result_text}")
                             else:
                                 result_text = "Keine Treffer fuer diese Suchanfrage."
                 messages.append({"role": "tool", "tool_call_id": call_id,
                                  "content": result_text[:WEB_RESEARCH_MAX_TOOL_CHARS]})
         # Rundenlimit erreicht: zwingend finale Antwort ohne Tools.
         yield {"status": "Web-Recherche: Rundenlimit erreicht, fasse zusammen…"}
+        messages.append({"role": "user", "content": (
+            "Du hast jetzt genug recherchiert. Fasse die gesammelten Suchergebnisse zusammen "
+            "und antworte direkt auf die ursprüngliche Frage. Zitiere die Quellen mit URLs. "
+            "Nutze keine Tools mehr — antworte jetzt in Text."
+        )})
         payload = {"model": model, "messages": messages, "stream": False}
         r = await hc.post(url, json=payload, headers=headers)
+        content = ""
         if r.status_code == 200:
             data = r.json()
             choice = (data.get("choices") or [{}])[0]
             content = (choice.get("message") or {}).get("content") or ""
-            if content:
-                yield {"content": content}
+        if not content:
+            # Fallback: das Modell hat leer geantwortet — gib die rohen
+            # Suchergebnisse aus, damit der Nutzer trotzdem etwas bekommt.
+            if collected:
+                content = ("Die Zusammenfassung ist fehlgeschlagen — hier sind die "
+                           "gesammelten Suchergebnisse:\n\n" + "\n\n".join(collected))
+            else:
+                content = "Die Web-Recherche lieferte keine verwertbaren Ergebnisse."
+        yield {"content": content}
 
 
 def _register_chat_routes(webapp: FastAPI) -> None:
