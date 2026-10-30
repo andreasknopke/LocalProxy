@@ -257,6 +257,43 @@ nicht injiziert.
 Delegation-Loop) + Fork-Join-Faelle in `tests/test_stream_inject.py`
 (dispatch/collect-Streaming, mixed-turn).
 
+## WebUI-Chat-Agenten-Tools
+
+Der lokale Chat in der WebUI ist kein reines Modell-Frontend: Das Chat-Modell
+darf serverseitige **Tools** aufrufen, die direkt auf dem Host ausgefuehrt
+werden (Agenten-Loop mit Live-Status im Chatfenster). Der Proxy selbst bleibt
+ein reiner Pass-Through — der Loop laeuft ausschliesslich im WebUI-Backend.
+
+Verfuegbare Tools (jeweils per Checkbox in WebUI → Einstellungen → *Tools*
+schaltbar; Config-Key `tools.<name>.enabled`):
+
+| Tool | Funktion |
+|------|----------|
+| `web_search` | Websuche (Bing, Fallback DuckDuckGo) mit Quellen-Zitation |
+| `run_opencode` | Delegiert komplette Programmieraufgaben an den lokalen OpenCode-CLI-Agenten (`opencode run --auto`) |
+| `open_code_continue` | Setzt eine bestehende OpenCode-Sitzung desselben Chats fort (Session-ID wird pro Chat persistiert, Kontext bleibt erhalten) |
+| `shell_exec` | Einzelne Shell-Befehle lokal; destruktive/systemkritische Befehle werden blockiert |
+| `net_ping` | ICMP-Erreichbarkeitspruefung von Netzwerkgeraeten |
+| `net_ports` | TCP-Portcheck auf LAN-Geraeten (read-only, max. 5 Hosts × 12 Ports) |
+
+Konfiguration unter `tools`:
+
+```jsonc
+"tools": {
+  "opencode_run": {
+    "binary": "~/.opencode/bin/opencode",   // Pfad zur opencode-CLI
+    "default_working_dir": "",              // leer = Home des Proxy-Prozesses
+    "timeout_seconds": 900
+  },
+  "shell_exec": { "timeout_seconds": 180 }
+}
+```
+
+Umgebungsvariablen: `CHAT_AGENT_MAX_ROUNDS` (max. Tool-Runden pro Turn,
+Default 8), `CHAT_TOOL_RESULT_CAP` (Max.-Groesse eines Tool-Ergebnisses in
+Zeichen, Default 6000). Prozess-Ausgaben werden live als Status-Zeilen
+gestreamt und bei Timeout abgebrochen (Prozessgruppe SIGTERM→SIGKILL).
+
 ## Quickstart
 
 ```powershell

@@ -5,13 +5,17 @@ Modernes Single-Page-Dashboard: 4 Modell-Kategorien, Hindsight, Proxy.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import logging.handlers
 import os
 import re
 import secrets
+import shlex
+import shutil
 import signal
+import socket
 import time
 import uuid
 from pathlib import Path
@@ -25,6 +29,22 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 CONFIG_PATH = Path(os.getenv("LOCALPROXY_CONFIG", "data/config.json"))
 PROFILES_DIR = CONFIG_PATH.parent / "profiles"
 LOG_FILE = os.getenv("LOG_FILE", str(Path(__file__).parent / "data" / "proxy.log"))
+
+# Defaults der Chat-Agenten-Tools (Sektion 'tools' in config.json). Steht hier
+# oben, weil DEFAULT_CONFIG es referenziert; _tool_cfg() mischt saved+default.
+_DEFAULT_CHAT_TOOLS_CFG: Dict[str, Any] = {
+    "web_search": {"enabled": True},
+    "opencode_run": {
+        "enabled": True,
+        "binary": os.path.expanduser("~/.opencode/bin/opencode"),
+        "default_working_dir": "",
+        "timeout_seconds": 900,
+    },
+    "open_code_continue": {"enabled": True},
+    "shell_exec": {"enabled": True, "timeout_seconds": 180},
+    "net_ping": {"enabled": True},
+    "net_ports": {"enabled": True},
+}
 
 
 # Rotierende Logdatei (5 MB x 3 Backups) — teilt sich die Datei mit proxy.py
@@ -255,6 +275,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         ],
     },
     "default_category": "light",
+    "tools": _DEFAULT_CHAT_TOOLS_CFG,
     "proxy": {
         "port": 9001,
         "auth_enabled": True,
@@ -667,11 +688,16 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
   flex-wrap: wrap;
 }
 .chat-toolbar select { width: auto; padding: 6px 10px; font-size: 0.82rem; }
-.chat-toolbar .web-research-toggle {
-  font-size: 0.78rem; color: var(--text2); display: flex; align-items: center; gap: 5px; cursor: pointer;
-  user-select: none;
+.chat-toolbar .tool-toggles {
+  display: flex; gap: 4px; flex-wrap: wrap;
 }
-.chat-toolbar .web-research-toggle input { accent-color: var(--accent); margin: 0; }
+.chat-toolbar .tool-chip {
+  font-size: 0.72rem; color: var(--text2); background: rgba(255,255,255,0.04);
+  border: 1px solid var(--border); border-radius: 999px; padding: 3px 9px;
+  display: inline-flex; align-items: center; gap: 5px; cursor: default; user-select: none;
+}
+.chat-toolbar .tool-chip.active { color: var(--accent); border-color: var(--accent); opacity: 1; }
+.chat-toolbar .tool-chip:not(.active) { opacity: 0.55; }
 .chat-toolbar .vision-badge { font-size: 0.7rem; color: var(--warn); }
 .chat-toolbar .spacer { flex: 1; }
 .chat-title-input {
@@ -693,6 +719,11 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .chat-msg pre.codeblock {
   background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 10px;
   overflow-x: auto; font-size: 0.8rem; margin: 6px 0; font-family: ui-monospace, monospace;
+}
+.chat-msg .tool-progress {
+  font-size: 0.74rem; color: var(--warn); background: rgba(255,255,255,0.03);
+  border-left: 2px solid var(--accent); padding: 4px 8px; margin-bottom: 6px;
+  white-space: pre-wrap; word-break: break-word; max-height: 120px; overflow-y: auto;
 }
 .chat-msg details.reasoning { margin-top: 6px; font-size: 0.75rem; color: var(--text2); }
 .chat-msg details.reasoning summary { cursor: pointer; }
@@ -735,6 +766,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
   <button data-section="models" class="active">Modelle</button>
   <button data-section="hindsight">Hindsight</button>
   <button data-section="proxy">Proxy</button>
+  <button data-section="tools">Tools</button>
   <button data-section="chat">Chat</button>
   <button data-section="logs">Logs</button>
 </nav>
@@ -1629,6 +1661,42 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
     </div>
   </section>
 
+  <!-- ====== SEKTION: TOOLS ====== -->
+  <section id="section-tools">
+    <div class="card" style="padding:16px;max-width:820px">
+      <h3>Serverseitige Chat-Tools</h3>
+      <p class="hint" style="margin-top:-4px;margin-bottom:14px">Das Chat-Modell darf diese Werkzeuge direkt auf dem Host ausf&uuml;hren (Agenten-Loop mit Live-Fortschritt im Chatfenster). Deaktiviert werden sie hier &uuml;bersprungen.</p>
+      <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:16px">
+        <label style="font-size:0.85rem;display:flex;align-items:center;gap:8px"><input type="checkbox" id="tool_web_search" style="accent-color:var(--accent)"> <b>web_search</b> — Websuche (Bing/DuckDuckGo) mit Quellen-Zitation</label>
+        <label style="font-size:0.85rem;display:flex;align-items:center;gap:8px"><input type="checkbox" id="tool_opencode_run" style="accent-color:var(--accent)"> <b>run_opencode</b> — eigenst&auml;ndiger OpenCode-Agent f&uuml;r Programmieraufgaben (Dateien, Tests, Repos)</label>
+        <label style="font-size:0.85rem;display:flex;align-items:center;gap:8px"><input type="checkbox" id="tool_open_code_continue" style="accent-color:var(--accent)"> <b>open_code_continue</b> — Fortsetzung einer bestehenden OpenCode-Sitzung dieses Chats (Kontext bleibt erhalten)</label>
+        <label style="font-size:0.85rem;display:flex;align-items:center;gap:8px"><input type="checkbox" id="tool_shell_exec" style="accent-color:var(--accent)"> <b>shell_exec</b> — einzelne Shell-Befehle lokal (destruktive Befehle werden blockiert)</label>
+        <label style="font-size:0.85rem;display:flex;align-items:center;gap:8px"><input type="checkbox" id="tool_net_ping" style="accent-color:var(--accent)"> <b>net_ping</b> — ICMP-Erreichbarkeitspr&uuml;fung von Netzwerkger&auml;ten</label>
+        <label style="font-size:0.85rem;display:flex;align-items:center;gap:8px"><input type="checkbox" id="tool_net_ports" style="accent-color:var(--accent)"> <b>net_ports</b> — TCP-Portcheck auf LAN-Ger&auml;ten (read-only)</label>
+      </div>
+      <div class="form-group" style="max-width:520px">
+        <label for="opencode_binary">OpenCode-Binary-Pfad</label>
+        <input type="text" id="opencode_binary" placeholder="~/.opencode/bin/opencode">
+        <div class="hint">Pfad zur opencode-CLI. Wird f&uuml;r run_opencode und open_code_continue verwendet.</div>
+      </div>
+      <div class="form-group" style="max-width:520px">
+        <label for="opencode_default_working_dir">Standard-Arbeitsverzeichnis (optional)</label>
+        <input type="text" id="opencode_default_working_dir" placeholder="/home/user/projekte — leer = Home des Proxy-Prozesses">
+        <div class="hint">Wird verwendet, wenn das Modell kein working_dir angibt.</div>
+      </div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap">
+        <div class="form-group" style="max-width:240px">
+          <label for="opencode_timeout_seconds">OpenCode-Timeout (s)</label>
+          <input type="number" id="opencode_timeout_seconds" min="30" max="7200">
+        </div>
+        <div class="form-group" style="max-width:240px">
+          <label for="shell_timeout_seconds">Shell-Timeout (s)</label>
+          <input type="number" id="shell_timeout_seconds" min="10" max="3600">
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- ====== SEKTION: LOGS ====== -->
   <section id="section-logs">
     <div class="card" style="padding:12px">
@@ -1676,9 +1744,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
           <input type="text" class="chat-title-input" id="chatTitle" placeholder="Titel…" onblur="chatRename()" />
           <span class="spacer"></span>
           <select id="chatModelSelect" title="Modell-Kategorie"></select>
-          <label class="web-research-toggle" title="Immer Websuche aktivieren. Ohne Haken wird sie automatisch gestartet, wenn du darum bittest (z.B. 'recherchiere das im Netz')">
-            <input type="checkbox" id="chatWebResearch" /> Immer recherchieren
-          </label>
+          <div class="tool-toggles" id="chatToolChips" title="Serverseitige Tools des Chats — aktiviert ueber die Einstellungen (Sektion 'tools')"></div>
           <span class="vision-badge" id="chatVisionBadge" style="display:none">Bildanalyse an</span>
         </div>
         <div class="chat-log" id="chatLog">
@@ -1759,6 +1825,23 @@ async function loadIdentifiers() {
   }
 }
 
+const CHAT_TOOL_LABELS = { web_search: 'Web-Suche', opencode_run: 'OpenCode', open_code_continue: 'OpenCode-Fortsetzung', shell_exec: 'Shell-Befehle', net_ping: 'Ping', net_ports: 'Port-Check' };
+
+function chatRenderToolChips(cfg) {
+  const box = document.getElementById('chatToolChips');
+  if (!box) return;
+  box.innerHTML = '';
+  const tools = (cfg && cfg.tools) || {};
+  for (const name of Object.keys(tools)) {
+    const on = !!(tools[name] && tools[name].enabled !== false);
+    const chip = document.createElement('span');
+    chip.className = 'tool-chip' + (on ? ' active' : '');
+    chip.textContent = (CHAT_TOOL_LABELS[name] || name) + (on ? '' : ' (aus)');
+    chip.title = on ? 'Serverseitiges Tool aktiv — das Modell darf es im Chat nutzen.' : 'Deaktiviert (Einstellungen → Sektion "tools").';
+    box.appendChild(chip);
+  }
+}
+
 // ============ LOAD CONFIG ============
 async function loadConfig() {
   try {
@@ -1829,6 +1912,19 @@ async function loadConfig() {
     document.getElementById('proxy_port').value = px.port || 9001;
     document.getElementById('proxy_auth_enabled').checked = px.auth_enabled !== false;
     document.getElementById('proxy_api_key').value = px.api_key || '';
+
+    // Chat-Tools (Agenten-Loop)
+    const tl = cfg.tools || {};
+    for (const name of ['web_search','opencode_run','open_code_continue','shell_exec','net_ping','net_ports']) {
+      const el = document.getElementById('tool_' + name);
+      if (el) el.checked = !!(tl[name] && tl[name].enabled !== false);
+    }
+    const oc = tl.opencode_run || {};
+    document.getElementById('opencode_binary').value = oc.binary || '~/.opencode/bin/opencode';
+    document.getElementById('opencode_default_working_dir').value = oc.default_working_dir || '';
+    document.getElementById('opencode_timeout_seconds').value = oc.timeout_seconds || 900;
+    document.getElementById('shell_timeout_seconds').value = (tl.shell_exec || {}).timeout_seconds || 180;
+    chatRenderToolChips(cfg);
 
     // Tokens
     const tk = cfg.tokens || {};
@@ -2041,7 +2137,23 @@ async function saveConfig() {
       thinking_mode: document.getElementById('local_thinking_mode').value || 'none',
       thinking_off: document.getElementById('local_thinking_off')?.checked ?? false,
       anti_loop_system_prompt: document.getElementById('local_anti_loop_system_prompt').value || '',
+    };
+
+  cfg.tools = {
+    web_search: { enabled: document.getElementById('tool_web_search').checked },
+    opencode_run: {
+      enabled: document.getElementById('tool_opencode_run').checked,
+      binary: document.getElementById('opencode_binary').value.trim() || '~/.opencode/bin/opencode',
+      default_working_dir: document.getElementById('opencode_default_working_dir').value.trim(),
+      timeout_seconds: parseInt(document.getElementById('opencode_timeout_seconds').value) || 900,
     },
+    open_code_continue: { enabled: document.getElementById('tool_open_code_continue').checked },
+    shell_exec: {
+      enabled: document.getElementById('tool_shell_exec').checked,
+      timeout_seconds: parseInt(document.getElementById('shell_timeout_seconds').value) || 180,
+    },
+    net_ping: { enabled: document.getElementById('tool_net_ping').checked },
+    net_ports: { enabled: document.getElementById('tool_net_ports').checked },
   };
 
   try {
@@ -2481,15 +2593,15 @@ async function chatSend() {
   asstBody.innerHTML = '<span class="hint">Denkt nach…</span>';
   asstEl.appendChild(asstBody);
   log.appendChild(asstEl);
-  const webResearch = document.getElementById('chatWebResearch').checked;
-  const payload = { session: CHAT.session.id, content: text, model: bodyModel, web_research: webResearch, files: CHAT.files.map(f => ({ name: f.name, mime: f.mime, data: f.data })) };
+  const payload = { session: CHAT.session.id, content: text, model: bodyModel, files: CHAT.files.map(f => ({ name: f.name, mime: f.mime, data: f.data })) };
   CHAT.files = []; chatRenderAttachments();
   input.value = ''; chatAutoGrow(input);
-  let full = ''; let reasoning = ''; let gotError = false;
+  let full = ''; let reasoning = ''; let gotError = false; let lastStatus = null;
   const paint = () => {
     let html = '';
-    if (reasoning) html += '<details class="reasoning" open><summary>Reasoning</summary><pre></pre></details>';
-    html += chatFormat(full || '…');
+    if (lastStatus && !full) html += '<div class="tool-progress">' + chatFormat(lastStatus) + '</div>';
+    if (reasoning) html += '<details class="reasoning"><summary>Reasoning</summary><pre></pre></details>';
+    html += chatFormat(full || (!gotError ? '…' : ''));
     asstBody.innerHTML = html;
     if (reasoning) { const pre = asstBody.querySelector('details.reasoning pre'); if (pre) pre.textContent = reasoning; }
     log.scrollTop = log.scrollHeight;
@@ -2521,9 +2633,9 @@ async function chatSend() {
             if (d === '[DONE]') continue;
             let j; try { j = JSON.parse(d); } catch (e) { continue; }
             if (j.error) { gotError = true; full = full || ('[Fehler] ' + j.error); asstBody.innerHTML = '<span style="color:var(--danger)">' + chatFormat(full) + '</span>'; chatStatus('Backend-Fehler.', true); }
-            else if (j.content) { if (full === '…') full = ''; full += j.content; paint(); }
+            else if (j.content) { full += j.content; lastStatus = null; paint(); }
             else if (j.reasoning) { reasoning += j.reasoning; paint(); }
-            else if (j.status) { chatStatus(j.status); if (full === '…') asstBody.innerHTML = '<span class="hint">' + chatFormat(j.status) + '</span>'; }
+            else if (j.status) { lastStatus = j.status; chatStatus(j.status); paint(); }
           }
         }
       }
@@ -2557,8 +2669,10 @@ function chatStatus(msg, isErr) {
   el.className = 'chat-status' + (isErr ? ' err' : '');
 }
 
+async function _initChatTools() { try { const r = await fetch('/webui/api/config'); chatRenderToolChips(await r.json()); } catch (e) {} }
+
 // ============ INIT ============
-loadConfig();
+loadConfig().then(_initChatTools);
 loadIdentifiers();
 chatInit();
 // Fuege Show/Hide-Buttons zu allen Passwortfeldern hinzu
@@ -2763,17 +2877,476 @@ def _chat_slot_identifier(category: str, slot: int) -> str:
     return category if slot <= 0 else f"{category}{slot + 1}"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Web-Recherche: HTML-Suche (Bing, Fallback DuckDuckGo) + Tool-Loop fuer den lokalen Chat.
-# Der Proxy bleibt ein reiner Pass-Through; der Tool-Loop laeuft hier, weil
-# nur der WebUI-Chat ihn braucht.
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# Chat-Tools — generischer Agent-Loop
+# Das Modell bekommt OpenAI-Tool-Definitionen und darf serverseitig Tools
+# aufrufen; der Loop fuehrt sie aus und reicht die Ergebnisse zurueck, bis
+# das Modell antwortet oder ein Rundenlimit greift. Web-Recherche ist damit
+# nur noch eines von vielen Tools — weitere (OpenCode, Shell, Netzwerk)
+# lassen sich ueber CHAT_TOOLS registrieren. Jeder Executor ist ein Async-
+# Generator, der {'status': ...}-Events fuer Live-Fortschritt liefert und
+# am Ende genau ein {'result': str} anhaengt.
+# ═══════════════════════════════════════════════════════════════════════
 
-WEB_RESEARCH_MAX_ROUNDS = 5
-WEB_RESEARCH_MAX_RESULTS = 8
-WEB_RESEARCH_MAX_TOOL_CHARS = 6000
-_DDG_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-           "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+CHAT_TOOL_MAX_ROUNDS = int(os.getenv("CHAT_AGENT_MAX_ROUNDS", "8"))
+CHAT_TOOL_RESULT_CAP = int(os.getenv("CHAT_TOOL_RESULT_CAP", str(40_000)))
+
+
+class ToolContext:
+    """Pro-Turn-Kontext, den alle Chat-Tools teilen."""
+
+    def __init__(self, chat_id: str):
+        self.chat_id = chat_id
+        # OpenCode-Sessions pro Chat: {task_key: ses_ID} — bleibt ueber
+        # mehrere Turns erhalten, damit open_code_continue funktioniert.
+        self.opencode_sessions: Dict[str, str] = {}
+        # Bereits durchgefuehrte Suchanfragen (Dedup).
+        self.seen_queries: Set[str] = set()
+        # Abbruch: wird vom SSE-Relay gesetzt, wenn der Nutzer Stop drueckt.
+        self.abort_event = asyncio.Event()
+
+    @property
+    def aborted(self) -> bool:
+        return self.abort_event.is_set()
+
+
+def _tool_cfg(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Tool-Einstellungen aus config.json ('tools'-Sektion), mit Defaults gemischt."""
+    saved = (cfg or {}).get("tools") or {}
+    out: Dict[str, Any] = {}
+    for name, defaults in _DEFAULT_CHAT_TOOLS_CFG.items():
+        merged = dict(defaults)
+        if isinstance(saved.get(name), dict):
+            merged.update({k: v for k, v in saved[name].items()})
+        out[name] = merged
+    return out
+
+
+OPENCODE_RUN_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "run_opencode",
+        "description": (
+            "Startet eine eigenstaendige OpenCode-Agent-Sitzung auf dem Host fuer "
+            "Programmieraufgaben: Code schreiben oder aendern, Dateien lesen/schreiben, "
+            "Tests ausfuehren, Repositories analysieren, Befehle im Projekt starten. "
+            "Das Tool wartet bis die Aufgabe fertig ist und liefert die Ergebnis-Ausgabe "
+            "zurueck. Fuer Folgearbeiten am selben Thema open_code_continue mit demselben "
+            "task_key nutzen."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "Die komplette, selbstverstaendliche Aufgabenstellung f"
+                                   "uer den Agenten.",
+                },
+                "working_dir": {
+                    "type": "string",
+                    "description": "Optionales Arbeitsverzeichnis des Projekts (absoluter Pfad).",
+                },
+            },
+            "required": ["task"],
+        },
+    },
+}
+
+OPENCODE_CONTINUE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "open_code_continue",
+        "description": (
+            "Setzt eine bestehende OpenCode-Sitzung dieses Chats fort — der Agent behaelt "
+            "den kompletten Kontext seiner vorherigen Arbeit bei. task_key muss exakt der "
+            "Key sein, der beim letzten run_opencode zurueckgemeldet wurde."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_key": {"type": "string", "description": "Der Key der zu fortsetzenden Sitzung."},
+                "message": {"type": "string", "description": "Folgeanweisung an den Agenten."},
+            },
+            "required": ["task_key", "message"],
+        },
+    },
+}
+
+SHELL_EXEC_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "shell_exec",
+        "description": (
+            "Fuehrt EINEN einzelnen Shell-Befehl auf dem Host aus und liefert stdout/stderr "
+            "sowie Exit-Code zurueck. Bevorzugt read-only Befehle (ls, cat, git log/status/diff, "
+            "curl -I, systemctl status, df …). Destruktive oder systemkritische Befehle werden "
+            "abgelehnt. Fuer mehrstufige Programmieraufgaben stattdessen run_opencode nutzen."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Der einzelne Befehl (eine Zeile, ohne Newlines)."},
+                "working_dir": {"type": "string", "description": "Optionales Arbeitsverzeichnis."},
+            },
+            "required": ["command"],
+        },
+    },
+}
+
+NET_PING_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "net_ping",
+        "description": "Prueft per ICMP-Ping, ob ein Rechner im Netzwerk erreichbar ist.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Hostname oder IP des Ziels."},
+            },
+            "required": ["host"],
+        },
+    },
+}
+
+NET_PORTS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "net_ports",
+        "description": (
+            "Prueft TCP-Ports auf LAN-Geraeten (welche Dienste laufen/erreichbar sind) und "
+            "gibt pro Port offen/geschlossen zurueck."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "hosts": {
+                    "type": "array", "items": {"type": "string"}, "maxItems": 5,
+                    "description": "Hostnamen/IPs der Ziele (max. 5).",
+                },
+                "ports": {
+                    "type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 65535},
+                    "maxItems": 12,
+                    "description": "Zu pruefende Ports (max. 12).",
+                },
+            },
+            "required": ["hosts", "ports"],
+        },
+    },
+}
+
+
+async def _stream_cmd(cmd: List[str], cwd: Optional[str], timeout_s: int,
+                      prefix: str, ctx: ToolContext, sink: Dict[str, Any]):
+    """Fuehrt einen Prozess aus; yields {'status': ...}-Events fuer jede neue
+    stdout-Zeile. Am Ende werden sink['output'], sink['rc'] und sink['timed_out'] gesetzt."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        cwd=cwd, start_new_session=True,
+    )
+    chunks: List[str] = []
+    buf = ""
+    deadline = time.monotonic() + max(timeout_s, 5)
+    timed_out = False
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or ctx.aborted:
+            timed_out = True
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception:
+                pass
+            break
+        try:
+            raw = await asyncio.wait_for(proc.stdout.read(4096), timeout=min(remaining, 25))
+        except asyncio.TimeoutError:
+            yield {"status": f"{prefix}: laeuft…"}
+            continue
+        if not raw:
+            break
+        text = raw.decode("utf-8", errors="replace")
+        chunks.append(text)
+        buf += text
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
+            line = line.strip()
+            if line:
+                yield {"status": f"{prefix} — {line[-280:]}"}
+    rc: Optional[int] = None
+    for _ in range(50):
+        try:
+            rc = await asyncio.wait_for(proc.wait(), timeout=1.0)
+            break
+        except asyncio.TimeoutError:
+            if timed_out:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+                break
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
+        rc = -9
+    output = "".join(chunks) + buf
+    sink["output"] = output[:CHAT_TOOL_RESULT_CAP * 3]
+    sink["rc"] = rc
+    sink["timed_out"] = timed_out
+
+
+def _tail_lines(text: str, n: int) -> str:
+    lines = (text or "").strip().splitlines()
+    return "\n".join(lines[-n:])
+
+
+# ── Tool-Executors ───────────────────────────────────────────────────────
+
+async def _tool_web_search(ctx: ToolContext, args: Dict[str, Any]):
+    query = str(args.get("query") or "").strip()
+    if not query:
+        yield {"result": "Keine Suchanfrage angegeben."}
+        return
+    if query in ctx.seen_queries:
+        yield {"result": ("Diese Anfrage wurde bereits durchgefuehrt. Nutze die bisherigen "
+                          "Ergebnisse oder eine andere Suchanfrage.")}
+        return
+    ctx.seen_queries.add(query)
+    yield {"status": f"Websuche: {query[:80]}"}
+    try:
+        results = await _web_search(query)
+    except Exception as exc:
+        yield {"result": f"Suche fehlgeschlagen: {exc}"}
+        return
+    if results:
+        parts = [f"{i}. {res['title']}\n   URL: {res['url']}\n   {res['snippet']}"
+                 for i, res in enumerate(results, 1)]
+        yield {"result": "Suchergebnisse:\n" + "\n\n".join(parts)}
+    else:
+        yield {"result": "Keine Treffer fuer diese Suchanfrage."}
+
+
+_OPENCODE_KEY_RE = re.compile(r"\W+")
+
+
+def _opencode_task_key(task: str) -> str:
+    key = _OPENCODE_KEY_RE.sub("_", task.lower())[:48].strip("_")
+    return key or "aufgabe"
+
+
+def _opencode_cwd(working_dir: str, cfg: Dict[str, Any]) -> Optional[str]:
+    wd = os.path.expanduser(str(working_dir or cfg.get("default_working_dir") or ""))
+    return wd if wd and Path(wd).is_dir() else None
+
+
+async def _run_opencode_cmd(cfg: Dict[str, Any], cmd_args: List[str], cwd: Optional[str],
+                            label: str, session_key: str, ctx: ToolContext):
+    """Gemeinsamer Kuerper fuer run/continue: streamt den Prozess live als
+    Status-Events, merkt die OpenCode-Session-ID unter session_key und liefert
+    das formatierte Ergebnis."""
+    binary = str(cfg.get("binary") or "")
+    timeout_s = int(cfg.get("timeout_seconds") or 900)
+    full_cmd = [binary] + cmd_args
+    t0 = time.monotonic()
+    sink: Dict[str, Any] = {}
+    try:
+        async for ev in _stream_cmd(full_cmd, cwd, timeout_s, label, ctx, sink):
+            yield ev
+    except FileNotFoundError:
+        yield {"result": f"Fehler: OpenCode-Binary nicht gefunden unter '{binary}'. "
+                         "Pfad in den WebUI-Einstellungen (tools.opencode_run.binary) pruefen."}
+        return
+    except Exception as exc:
+        yield {"result": f"Fehler bei {label}: {exc}"}
+        return
+    out = (sink.get("output") or "").strip()
+    rc = sink.get("rc")
+    dur = int(time.monotonic() - t0)
+    # Session-ID ernten — open_code_continue braucht sie fuer Folgeturns.
+    m = re.search(r"(ses_[A-Za-z0-9]+)", out)
+    if m:
+        ctx.opencode_sessions[session_key] = m.group(1)
+    tail = _tail_lines(out, 60)
+    head = out.splitlines()[0][:200] if out else ""
+    key_note = f"\ntask_key: {session_key}" if not sink.get("timed_out") else ""
+    if rc == 0:
+        result = (f"OpenCode fertig nach {dur}s.\nErste Zeile: {head}\n\n"
+                  f"Ausgabe/Antwort:\n{tail}{key_note}")
+    elif sink.get("timed_out"):
+        result = (f"OpenCode lief ueber das Timeout ({timeout_s}s) hinaus bzw. wurde abgebrochen. "
+                 f"Bisherige Ausgabe:\n{tail}")
+    else:
+        result = f"OpenCode endete mit Exit-Code {rc}.\nAusgabe:\n{tail}"
+    yield {"result": result}
+
+
+async def _tool_opencode_run(ctx: ToolContext, args: Dict[str, Any]):
+    task = str(args.get("task") or "").strip()[:8000]
+    if not task:
+        yield {"result": "Keine Aufgabe angegeben."}
+        return
+    cfg = _tool_cfg()["opencode_run"]
+    key = _opencode_task_key(task)
+    cmd_args = ["run", "--auto"]
+    sid = ctx.opencode_sessions.get(key)
+    if sid:
+        cmd_args += ["-s", sid]
+    cmd_args.append(task)
+    cwd = _opencode_cwd(str(args.get("working_dir") or ""), cfg)
+    async for ev in _run_opencode_cmd(cfg, cmd_args, cwd, f"OpenCode [{key}]", key, ctx):
+        yield ev
+
+
+async def _tool_open_code_continue(ctx: ToolContext, args: Dict[str, Any]):
+    key = re.sub(r"\W+", "_", str(args.get("task_key") or "").lower())[:48].strip("_")
+    message = str(args.get("message") or "").strip()[:8000]
+    if not key or not message:
+        yield {"result": "task_key und message sind erforderlich."}
+        return
+    sid = ctx.opencode_sessions.get(key)
+    if not sid:
+        known = ", ".join(sorted(ctx.opencode_sessions)) or "(keine)"
+        yield {"result": f"Keine OpenCode-Sitzung mit dem Key '{key}' bekannt. Bekannte Keys: {known}."}
+        return
+    cfg = _tool_cfg()["opencode_run"]
+    async for ev in _run_opencode_cmd(cfg, ["run", "--auto", "-s", sid, message],
+                                      _opencode_cwd("", cfg),
+                                      f"OpenCode [{key}] (Fortsetzung)", key, ctx):
+        yield ev
+
+
+_SHELL_BLOCKED_COMMANDS = {
+    "rm", "rmdir", "dd", "mkfs", "fdisk", "parted", "shutdown", "reboot",
+    "halt", "poweroff", "init", "systemctl", "service", "useradd", "userdel",
+    "passwd", "chmod", "chown", "mount", "umount", "iptables", "ufw",
+    "killall", "pkill", "mv", "ln", "tee", "truncate", "shred", "wipefs",
+}
+
+
+def _shell_check(cmdline: str) -> Optional[str]:
+    """Liefert einen Ablehnungsgrund oder None, wenn der Befehl erlaubt ist."""
+    s = cmdline.strip()
+    if "\n" in s or "\r" in s:
+        return "Nur einzelne Zeilen ohne Newlines werden ausgefuehrt."
+    try:
+        tokens = shlex.split(s)
+    except ValueError as exc:
+        return f"Befehl konnte nicht geparst werden: {exc}"
+    if not tokens:
+        return "Leerer Befehl."
+    head = Path(tokens[0]).name
+    if head in _SHELL_BLOCKED_COMMANDS:
+        return f"'{head}' ist aus Sicherheitsgruenden blockiert."
+    # Pipeline-/Subshell-Teile ebenfalls pruefen.
+    rest = re.findall(r"[|;&]\s*([A-Za-z_][\w.-]*)", s)
+    bad = [t for t in rest if t in _SHELL_BLOCKED_COMMANDS]
+    if bad:
+        return f"Geblockte Befehle im Kommando: {', '.join(bad)}."
+    return None
+
+
+async def _tool_shell_exec(ctx: ToolContext, args: Dict[str, Any]):
+    cmdline = str(args.get("command") or "").strip()[:2000]
+    reason = _shell_check(cmdline) if cmdline else "Kein Befehl angegeben."
+    if reason:
+        yield {"result": f"Befehl abgelehnt: {reason}"}
+        return
+    cfg = _tool_cfg()["shell_exec"]
+    wd_arg = os.path.expanduser(str(args.get("working_dir") or ""))
+    cwd = wd_arg if wd_arg and Path(wd_arg).is_dir() else None
+    sink: Dict[str, Any] = {}
+    label = f"Shell: {cmdline[:120]}"
+    try:
+        async for ev in _stream_cmd(["/bin/sh", "-c", cmdline], cwd,
+                                    int(cfg.get("timeout_seconds") or 180), "Shell", ctx, sink):
+            yield ev
+    except Exception as exc:
+        yield {"result": f"Fehler bei Shell-Ausfuehrung: {exc}"}
+        return
+    out = (sink.get("output") or "").rstrip()
+    rc = sink.get("rc")
+    tail = _tail_lines(out, 60) or "(keine Ausgabe)"
+    status_note = " bzw. wurde abgebrochen" if sink.get("timed_out") else ""
+    yield {"result": f"Exit-Code: {rc}{status_note}\n\nAusgabe:\n{tail}"}
+
+
+async def _probe_port(host: str, port: int) -> bool:
+    def _connect():
+        with socket.create_connection((host, port), timeout=1.5):
+            pass
+
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, _connect)
+        return True
+    except OSError:
+        return False
+
+
+async def _tool_net_ping(ctx: ToolContext, args: Dict[str, Any]):
+    host = str(args.get("host") or "").strip()
+    if not host:
+        yield {"result": "Kein Host angegeben."}
+        return
+    ping_bin = shutil.which("ping")
+    if not ping_bin:
+        yield {"result": "'ping' ist auf diesem System nicht verfuegbar — nutze net_ports mit einem bekannten Port."}
+        return
+    sink: Dict[str, Any] = {}
+    try:
+        async for ev in _stream_cmd([ping_bin, "-c", "3", "-W", "2", host], None, 15,
+                                    f"Ping {host}", ctx, sink):
+            yield ev
+    except Exception as exc:
+        yield {"result": f"Ping fehlgeschlagen: {exc}"}
+        return
+    out = (sink.get("output") or "").strip()
+    m = re.search(r"(\d+(?:\.\d+)?)% packet loss", out)
+    loss = m.group(1) if m else "?"
+    tmo = re.search(r"time=(\d+\.?\d*) ms", out)
+    rtt = f"{tmo.group(1)} ms" if tmo else ""
+    if sink.get("rc") == 0 and float(loss.replace(",", ".")) < 100:
+        yield {"result": f"{host} erreichbar ({loss}% Packetverlust, RTT ~{rtt})."}
+    elif sink.get("rc") == 0:
+        yield {"result": f"{host} NICHT erreichbar (100% Packetverlust)."}
+    else:
+        yield {"result": f"Ping nach '{host}' fehlgeschlagen:\n{_tail_lines(out, 8)}"}
+
+
+async def _tool_net_ports(ctx: ToolContext, args: Dict[str, Any]):
+    hosts_raw = args.get("hosts") or []
+    ports_raw = args.get("ports") or []
+    hosts = [str(h).strip()[:64] for h in hosts_raw][:5] if isinstance(hosts_raw, list) else []
+    ports: List[int] = []
+    if isinstance(ports_raw, list):
+        for p in ports_raw[:12]:
+            try:
+                ip_ = int(p)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= ip_ <= 65535:
+                ports.append(ip_)
+    if not hosts or not ports:
+        yield {"result": "hosts und ports sind erforderlich (max. 5 Hosts, max. 12 Ports)."}
+        return
+    probes = [(h, p) for h in hosts for p in ports]
+    results = await asyncio.gather(*[_probe_port(h, p) for h, p in probes])
+    open_pairs = [(h, p) for (h, p), ok in zip(probes, results) if ok]
+    if not open_pairs:
+        yield {"result": f"Keine offenen Ports gefunden.\nGeprueft: {len(results)} Kombinationen."}
+        return
+    by_host: Dict[str, List[int]] = {}
+    for h, p in open_pairs:
+        by_host.setdefault(h, []).append(p)
+    lines = ["Offene Ports:"]
+    for h in sorted(by_host):
+        lines.append("- " + h + ": " + ", ".join(str(p) + "/tcp" for p in sorted(set(by_host[h]))))
+    closed_count = len(results) - len(open_pairs)
+    lines.append("")
+    lines.append(f"Geprueft: {len(results)} Kombinationen, davon {closed_count} geschlossen.")
+    yield {"result": "\n".join(lines)}
+
+
 
 WEB_SEARCH_TOOL = {
     "type": "function",
@@ -2797,48 +3370,6 @@ WEB_SEARCH_TOOL = {
     },
 }
 
-
-def _strip_html(s: str) -> str:
-    import html as _html
-    s = re.sub(r"<[^>]+>", "", s or "")
-    return _html.unescape(s).strip()
-
-
-# Intent-Erkennung: startet die Web-Recherche automatisch, wenn der Nutzer
-# darum bittet — wie bei Chatbots, die Tools immer anbieten lassen.
-_WEB_RESEARCH_INTENT_RE = re.compile(
-    r"\b(recherchier\w*|recherche\b|nachschlagen?\b|nachschau\w*"
-    r"|im\s+netz\b|ins\s+net\b|aus\s+dem\s+(internet|netz)\b"
-    r"|im\s+internet\b|online\s+(suchen?|nachlesen?)\b"
-    r"|aktuell(e)?\s+(lage|stand|info\w*)\b"
-    r"|weitere\s+informationen?\b"
-    r"|research\w*|look\s+(this|that)\s+up|google\s+it|search\s+(the\s+web|online)"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
-def _chat_wants_web_research(user_text: str) -> bool:
-    """True, wenn die Nachricht explizit nach Websuche/recherchieren fragt."""
-    return bool(_WEB_RESEARCH_INTENT_RE.search(user_text or ""))
-
-
-def _ddg_real_url(href: str) -> str:
-    """Entpackt DuckDuckGo-Redirect-Links (//duckduckgo.com/l/?uddg=...) zur echten URL."""
-    import urllib.parse
-    href = (href or "").strip()
-    if href.startswith("//"):
-        href = "https:" + href
-    if "duckduckgo.com/l/" in href or "uddg=" in href:
-        try:
-            q = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
-            if "uddg" in q:
-                return q["uddg"][0]
-        except Exception:
-            pass
-    return href
-
-
 def _bing_real_url(href: str) -> str:
     """Entpackt Bing-Redirect-Links (bing.com/ck/a?...u=<base64>) zur echten URL."""
     import urllib.parse
@@ -2856,6 +3387,20 @@ def _bing_real_url(href: str) -> str:
             pass
     return href
 
+def _ddg_real_url(href: str) -> str:
+    """Entpackt DuckDuckGo-Redirect-Links (//duckduckgo.com/l/?uddg=...) zur echten URL."""
+    import urllib.parse
+    href = (href or "").strip()
+    if href.startswith("//"):
+        href = "https:" + href
+    if "duckduckgo.com/l/" in href or "uddg=" in href:
+        try:
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+            if "uddg" in q:
+                return q["uddg"][0]
+        except Exception:
+            pass
+    return href
 
 async def _web_search_bing(query: str, max_results: int) -> List[Dict[str, str]]:
     """Bing-HTML-Suche (Primärquelle)."""
@@ -2878,7 +3423,6 @@ async def _web_search_bing(query: str, max_results: int) -> List[Dict[str, str]]
         })
     return results
 
-
 async def _web_search_ddg(query: str, max_results: int) -> List[Dict[str, str]]:
     """DuckDuckGo-HTML-Suche (Fallback)."""
     headers = {"User-Agent": _DDG_UA}
@@ -2898,8 +3442,7 @@ async def _web_search_ddg(query: str, max_results: int) -> List[Dict[str, str]]:
         })
     return results
 
-
-async def _web_search(query: str, max_results: int = WEB_RESEARCH_MAX_RESULTS) -> List[Dict[str, str]]:
+async def _web_search(query: str, max_results: int = 8) -> List[Dict[str, str]]:
     """Web-Suche: Bing als Primärquelle, DuckDuckGo als Fallback. Liefert [{title, url, snippet}]."""
     errors: List[str] = []
     for engine in (_web_search_bing, _web_search_ddg):
@@ -2912,20 +3455,89 @@ async def _web_search(query: str, max_results: int = WEB_RESEARCH_MAX_RESULTS) -
             errors.append(f"{engine.__name__}: {exc}")
     raise RuntimeError("; ".join(errors) or "Suche fehlgeschlagen")
 
+# ── Registry & Agent-Loop ────────────────────────────────────────────────
 
-async def _chat_web_research(api_messages: List[Dict[str, Any]], url: str,
-                             headers: Dict[str, str], model: str):
-    """Web-Recherche-Loop: ruft den Proxy nicht-streamend mit dem web_search-Tool auf,
-    fuehrt Suchanfragen serverseitig aus und wiederholt, bis das Modell antwortet.
-    Yields SSE-Events: {'status': ...}, {'content': ...} oder {'error': ...}."""
-    messages = list(api_messages)
-    hint = (
-        "Du kannst das Tool web_search nutzen, um das Web zu durchsuchen. "
-        "Nutze es fuer Fakten, aktuelle Informationen und Quellen. "
-        "Fuehre maximal 2-3 Suchanfragen durch, dann antworte. "
-        "Zitiere am Ende deiner Antwort die verwendeten Quellen mit URLs. "
-        "Sobald du genug Informationen hast, antworte direkt in Text OHNE weiteren Tool-Call."
+CHAT_TOOLS: Dict[str, Dict[str, Any]] = {
+    "web_search": {
+        "definition": WEB_SEARCH_TOOL,
+        "hint": "web_search(query) — Websuche mit Quellen",
+        "executor": _tool_web_search,
+    },
+    "opencode_run": {
+        "definition": OPENCODE_RUN_TOOL,
+        "hint": ("run_opencode(task[, working_dir]) — delegiert komplette Programmier-/Datei-"
+                 "Aufgaben an einen eigenstaendigen OpenCode-Agenten"),
+        "executor": _tool_opencode_run,
+    },
+    "open_code_continue": {
+        "definition": OPENCODE_CONTINUE_TOOL,
+        "hint": "open_code_continue(task_key, message) — setzt eine bestehende OpenCode-Sitzung fort",
+        "executor": _tool_open_code_continue,
+    },
+    "shell_exec": {
+        "definition": SHELL_EXEC_TOOL,
+        "hint": "shell_exec(command[, working_dir]) — ein einzelner lokaler Shell-Befehl",
+        "executor": _tool_shell_exec,
+    },
+    "net_ping": {
+        "definition": NET_PING_TOOL,
+        "hint": "net_ping(host) — ICMP-Erreichbarkeitspruefung",
+        "executor": _tool_net_ping,
+    },
+    "net_ports": {
+        "definition": NET_PORTS_TOOL,
+        "hint": "net_ports(hosts, ports) — TCP-Portscan auf LAN-Geraeten (read-only)",
+        "executor": _tool_net_ports,
+    },
+}
+
+
+def _chat_tool_system_hint(enabled_names: List[str], cfg: Dict[str, Any]) -> str:
+    tool_lines = [f"- {CHAT_TOOLS[n]['hint']}" for n in enabled_names if n in CHAT_TOOLS]
+    return (
+        "Du kannst serverseitig Tools aufrufen — sie werden direkt auf dem Host ausgef"
+        "uehrt und ihre Ergebnisse kommen zu dir zurueck.\n"
+        + "\n".join(tool_lines) + "\n\nRegeln:\n"
+        "- Waehle das einfachste passende Tool. Fuer mehrstufige Programmieraufgaben IMMER "
+        "run_opencode statt shell_exec nutzen; shell_exec nur fuer schnelle Einzelbefehle.\n"
+        "- Bei Folgefragen oder Nachbesserungen zum selben Thema: open_code_continue mit dem "
+        "genannten task_key (der Agent behaelt dann seinen Kontext).\n"
+        f"- Fuehre maximal {max(CHAT_TOOL_MAX_ROUNDS - 1, 2)} Tool-Schritte durch, dann antworte "
+        "zusammenfassend in Text OHNE weitere Tool-Calls.\n"
+        "- Antworte auf Deutsch und erwahne kurz, was du ausgefuehrt hast."
     )
+
+
+async def _chat_agent_loop(api_messages: List[Dict[str, Any]], url: str,
+                           headers: Dict[str, str], model: str, chat: Dict[str, Any]):
+    """Generischer Chat-Agenten-Loop mit LIVE-Streaming: jede Runde streamt der
+    Proxy token-fuer-token durch ({'content': ...}/{'reasoning': ...}), waehrend
+    tool_calls parallel akkumuliert werden. Am Rundenende werden ausfuehrbare
+    Tool-Calls serverseitig ausgefuehrt; ihre Ergebnisse kommen als role:"tool"-
+    Nachrichten zurueck und es geht eine Runde weiter — bis das Modell antwortet
+    oder CHAT_TOOL_MAX_ROUNDS greift. Yields SSE-Events: {'status', 'content',
+    'reasoning', 'error'}."""
+    ctx = ToolContext(str(chat.get("id") or ""))
+    stored_sessions = chat.get("opencode_sessions") or {}
+    if isinstance(stored_sessions, dict):
+        for k, v in stored_sessions.items():
+            if isinstance(v, str) and v.startswith("ses_"):
+                ctx.opencode_sessions[k] = v
+
+    cfg = _tool_cfg(_load_config())
+    tools: List[Dict[str, Any]] = []
+    enabled: List[str] = []
+    for name, entry in CHAT_TOOLS.items():
+        if cfg.get(name, {}).get("enabled"):
+            tools.append(entry["definition"])
+            enabled.append(name)
+
+    # api_messages enthaelt den kompletten Verlauf bis zur aktuellen User-Nachricht;
+    # der Loop haengt assistant/tool-Runden nur lokal an und persistiert am Ende
+    # ausschliesslich die finale Antwort (wie bisher im Streaming-Pfad).
+    messages: List[Dict[str, Any]] = [dict(m) for m in api_messages]
+
+    hint = _chat_tool_system_hint(enabled, cfg)
     if any(m.get("role") == "system" for m in messages):
         for m in messages:
             if m.get("role") == "system":
@@ -2934,94 +3546,176 @@ async def _chat_web_research(api_messages: List[Dict[str, Any]], url: str,
     else:
         messages.insert(0, {"role": "system", "content": hint})
 
-    seen_queries: Set[str] = set()
-    collected: List[str] = []  # gesammelte Suchergebnisse (Fallback bei leerer Antwort)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=15.0)) as hc:
-        for round_no in range(WEB_RESEARCH_MAX_ROUNDS):
-            payload = {"model": model, "messages": messages, "stream": False,
-                       "tools": [WEB_SEARCH_TOOL], "tool_choice": "auto"}
-            yield {"status": f"Web-Recherche: Runde {round_no + 1}…"}
-            r = await hc.post(url, json=payload, headers=headers)
-            if r.status_code != 200:
-                yield {"error": f"Backend HTTP {r.status_code}: {r.text[:400]}"}
-                return
-            data = r.json()
-            choice = (data.get("choices") or [{}])[0]
-            msg = choice.get("message") or {}
-            tool_calls = msg.get("tool_calls") or []
-            if not tool_calls:
-                content = msg.get("content") or ""
-                if not content and collected:
-                    content = ("Die Zusammenfassung ist fehlgeschlagen — hier sind die "
-                               "gesammelten Suchergebnisse:\n\n" + "\n\n".join(collected))
-                if content:
-                    yield {"content": content}
-                return
-            # Tool-Calls ausfuehren und Ergebnis als tool-Nachricht anhaengen.
-            messages.append({
-                "role": "assistant",
-                "content": msg.get("content"),
-                "tool_calls": tool_calls,
-            })
-            for idx, tc in enumerate(tool_calls):
-                fn = tc.get("function") or {}
-                name = fn.get("name")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=15.0)) as hc:
+        try:
+            final_content = ""
+            for round_no in range(CHAT_TOOL_MAX_ROUNDS):
+                payload = {"model": model, "messages": messages, "stream": True,
+                           "tools": tools, "tool_choice": "auto"}
+                content_parts: List[str] = []
+                reasoning_parts: List[str] = []
+                tc_acc: Dict[int, Dict[str, Any]] = {}  # index → {id,name,args}
                 try:
-                    args = json.loads(fn.get("arguments") or "{}")
-                except json.JSONDecodeError:
-                    args = {}
-                call_id = tc.get("id") or f"call_{round_no}_{idx}"
-                result_text: Optional[str] = None
-                if name != "web_search":
-                    result_text = f"Unbekanntes Tool: {name}"
-                else:
-                    query = str(args.get("query") or "").strip()
-                    if not query:
-                        result_text = "Keine Suchanfrage angegeben."
-                    elif query in seen_queries:
-                        result_text = ("Diese Anfrage wurde bereits durchgefuehrt. "
-                                   "Nutze die bisherigen Ergebnisse oder eine andere Suchanfrage.")
+                    async with hc.stream("POST", url, json=payload, headers=headers) as r:
+                        if r.status_code != 200:
+                            err = (await r.aread()).decode("utf-8", errors="replace")[:400]
+                            yield {"error": f"Backend HTTP {r.status_code}: {err}"}
+                            return
+                        buf = ""
+                        async for raw_bytes in r.aiter_raw():
+                            buf += raw_bytes.decode("utf-8", errors="replace")
+                            while "\n" in buf:
+                                line, buf = buf.split("\n", 1)
+                                line = line.strip()
+                                if not line.startswith("data:"):
+                                    continue
+                                data_s = line[5:].strip()
+                                if data_s == "[DONE]":
+                                    break
+                                try:
+                                    chunk = json.loads(data_s)
+                                except json.JSONDecodeError:
+                                    continue
+                                delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
+                                c = delta.get("content")
+                                rc = delta.get("reasoning_content")
+                                if isinstance(c, str) and c:
+                                    content_parts.append(c)
+                                    yield {"content": c}
+                                elif isinstance(rc, str) and rc:
+                                    reasoning_parts.append(rc)
+                                    yield {"reasoning": rc}
+                                for tcd in delta.get("tool_calls") or []:
+                                    idx = int(tcd.get("index") or 0)
+                                    acc = tc_acc.setdefault(idx, {"id": "", "name": "", "args": ""})
+                                    cid = tcd.get("id")
+                                    if cid:
+                                        acc["id"] = cid
+                                    fn = tcd.get("function") or {}
+                                    if fn.get("name"):
+                                        acc["name"] += fn["name"]
+                                    if fn.get("arguments"):
+                                        acc["args"] += fn["arguments"]
+                except Exception as exc:
+                    _log(f"Chat-Agent Stream-Fehler (Runde {round_no + 1}): {exc}")
+                    yield {"error": str(exc)}
+                    return
+
+                tool_calls = [{"id": v["id"], "type": "function",
+                               "function": {"name": v["name"], "arguments": v["args"]}}
+                              for _, v in sorted(tc_acc.items()) if v["name"]]
+                # Keine Tool-Calls → finale Antwort erreicht.
+                if not tool_calls:
+                    final_content = "".join(content_parts)
+                    if not final_content.strip():
+                        yield {"error": "Modell hat ohne Text und ohne Tool-Calls geantwortet."}
+                    return
+
+                messages.append({
+                    "role": "assistant",
+                    "content": "".join(content_parts),
+                    "tool_calls": tool_calls,
+                })
+                for idx, tc in enumerate(tool_calls):
+                    fn_name = str((tc.get("function") or {}).get("name") or "")
+                    try:
+                        args = json.loads((tc.get("function") or {}).get("arguments") or "{}")
+                    except json.JSONDecodeError:
+                        args = {}
+                    call_id = tc.get("id") or f"call_{round_no}_{idx}"
+                    entry = next((e for n, e in CHAT_TOOLS.items()
+                                  if e["definition"]["function"]["name"] == fn_name), None)
+                    result_text: Optional[str] = None
+                    if ctx.aborted:
+                        result_text = ("Der Nutzer hat den Lauf abgebrochen — beende die Arbeit "
+                                       "und fasse kurz zusammen.")
+                    elif entry is None:
+                        available = ", ".join(t["function"]["name"] for t in tools)
+                        result_text = f"Unbekanntes Tool: '{fn_name}'. Verfuegbar sind: {available}."
                     else:
-                        seen_queries.add(query)
-                        yield {"status": f"Suche: {query[:80]}"}
-                        try:
-                            results = await _web_search(query)
-                        except Exception as exc:
-                            results = []
-                            result_text = f"Suche fehlgeschlagen: {exc}"
+                        async for ev in entry["executor"](ctx, args):
+                            if "result" in ev:
+                                result_text = str(ev["result"])[:CHAT_TOOL_RESULT_CAP]
+                            elif "status" in ev:
+                                yield ev
                         if result_text is None:
-                            if results:
-                                parts = [f"{i}. {res['title']}\n   URL: {res['url']}\n   {res['snippet']}"
-                                         for i, res in enumerate(results, 1)]
-                                result_text = "Suchergebnisse:\n" + "\n\n".join(parts)
-                                collected.append(f"### Suche: {query}\n{result_text}")
-                            else:
-                                result_text = "Keine Treffer fuer diese Suchanfrage."
-                messages.append({"role": "tool", "tool_call_id": call_id,
-                                 "content": result_text[:WEB_RESEARCH_MAX_TOOL_CHARS]})
-        # Rundenlimit erreicht: zwingend finale Antwort ohne Tools.
-        yield {"status": "Web-Recherche: Rundenlimit erreicht, fasse zusammen…"}
-        messages.append({"role": "user", "content": (
-            "Du hast jetzt genug recherchiert. Fasse die gesammelten Suchergebnisse zusammen "
-            "und antworte direkt auf die ursprüngliche Frage. Zitiere die Quellen mit URLs. "
-            "Nutze keine Tools mehr — antworte jetzt in Text."
-        )})
-        payload = {"model": model, "messages": messages, "stream": False}
-        r = await hc.post(url, json=payload, headers=headers)
-        content = ""
-        if r.status_code == 200:
-            data = r.json()
-            choice = (data.get("choices") or [{}])[0]
-            content = (choice.get("message") or {}).get("content") or ""
-        if not content:
-            # Fallback: das Modell hat leer geantwortet — gib die rohen
-            # Suchergebnisse aus, damit der Nutzer trotzdem etwas bekommt.
-            if collected:
-                content = ("Die Zusammenfassung ist fehlgeschlagen — hier sind die "
-                           "gesammelten Suchergebnisse:\n\n" + "\n\n".join(collected))
-            else:
-                content = "Die Web-Recherche lieferte keine verwertbaren Ergebnisse."
-        yield {"content": content}
+                            result_text = "(Tool lieferte kein Ergebnis)"
+                    messages.append({"role": "tool", "tool_call_id": call_id,
+                                     "content": result_text})
+            # Rundenlimit erreicht: zwingend finale Antwort OHNE Tools (gestreamt).
+            yield {"status": "Agent: Rundenlimit erreicht, fasse zusammen…"}
+            messages.append({"role": "user", "content": (
+                "Du hast jetzt genug gearbeitet. Fasse das bisherige Ergebnis zusammen und "
+                "antworte direkt auf Deutsch OHNE weitere Tool-Calls."
+            )})
+            payload = {"model": model, "messages": messages, "stream": True}
+            content_parts = []
+            try:
+                async with hc.stream("POST", url, json=payload, headers=headers) as r:
+                    if r.status_code != 200:
+                        err = (await r.aread()).decode("utf-8", errors="replace")[:400]
+                        yield {"error": f"Backend HTTP {r.status_code}: {err}"}
+                        return
+                    buf = ""
+                    async for raw_bytes in r.aiter_raw():
+                        buf += raw_bytes.decode("utf-8", errors="replace")
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            line = line.strip()
+                            if not line.startswith("data:"):
+                                continue
+                            data_s = line[5:].strip()
+                            if data_s == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(data_s)
+                            except json.JSONDecodeError:
+                                continue
+                            delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
+                            c = delta.get("content")
+                            rc = delta.get("reasoning_content")
+                            if isinstance(c, str) and c:
+                                content_parts.append(c)
+                                yield {"content": c}
+                            elif isinstance(rc, str) and rc:
+                                yield {"reasoning": rc}
+            except Exception as exc:
+                _log(f"Chat-Agent Final-Antwort Fehler: {exc}")
+                yield {"error": str(exc)}
+                return
+            final_content = "".join(content_parts)
+        finally:
+            _persist_opencode_sessions(ctx.chat_id, ctx.opencode_sessions)
+
+
+def _persist_opencode_sessions(chat_id: str, stored: Dict[str, str]) -> None:
+    """OpenCode-Session-Mapping ins Chat-JSON schreiben — ueberlebt Neuladen und
+    wird im naechsten Agenten-Turn wiederhergestellt."""
+    clean = {k: v for k, v in (stored or {}).items() if isinstance(v, str) and v.startswith("ses_")}
+    try:
+        c = _chat_load(chat_id)
+        if dict(c.get("opencode_sessions") or {}) != clean:
+            c["opencode_sessions"] = clean
+            _chat_save(c)
+    except Exception as exc:  # pragma: no cover
+        _log(f"Chat OpenCode-Sessions persistieren fehlgeschlagen: {exc}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Web-Recherche: HTML-Suche (Bing, Fallback DuckDuckGo) + Tool-Loop fuer den lokalen Chat.
+# Der Proxy bleibt ein reiner Pass-Through; der Tool-Loop laeuft hier, weil
+# nur der WebUI-Chat ihn braucht.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_DDG_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+
+
+
+def _strip_html(s: str) -> str:
+    import html as _html
+    s = re.sub(r"<[^>]+>", "", s or "")
+    return _html.unescape(s).strip()
 
 
 def _register_chat_routes(webapp: FastAPI) -> None:
@@ -3202,77 +3896,34 @@ def _register_chat_routes(webapp: FastAPI) -> None:
                         for m in chat["messages"]
                         if isinstance(m, dict) and m.get("role") in ("user", "assistant", "system")]
         identifier = str(body.get("model") or _chat_slot_identifier(chat["category"], int(chat.get("slot", 0))))
-        # Web-Recherche: expliziter Toggle ODER automatische Intent-Erkennung
-        # ("recherchiere das mal im Netz" → Tool-Loop ohne manuelles Anklicken).
-        web_research = bool(body.get("web_research")) or _chat_wants_web_research(user_text)
-        payload = {"model": identifier, "messages": api_messages, "stream": True}
 
         port = os.getenv("PROXY_PORT") or str(_load_config().get("proxy", {}).get("port", 9001))
         url = f"http://127.0.0.1:{port}/v1/chat/completions"
+        cfg_now = _load_config()
         headers: Dict[str, str] = {}
-        key = os.getenv("PROXY_API_KEY") or str(_load_config().get("proxy", {}).get("api_key", "") or "")
+        key = os.getenv("PROXY_API_KEY") or str(cfg_now.get("proxy", {}).get("api_key", "") or "")
         if key:
             headers["Authorization"] = f"Bearer {key}"
 
         async def relay():
-            content_chunks: List[str] = []
+            """SSE-Relay ueber den generischen Agenten-Loop: streamt Content und
+            Reasoning live durch, fuehrt Tool-Calls serverseitig aus."""
             try:
-                if web_research:
-                    # Web-Recherche-Loop: nicht-streamende Proxy-Aufrufe mit
-                    # web_search-Tool; nur die finale Antwort wird persistiert.
-                    async for ev in _chat_web_research(api_messages, url, headers, identifier):
-                        if "content" in ev:
-                            content_chunks.append(ev["content"])
-                            yield f"data: {json.dumps({'content': ev['content']})}\n\n"
-                        elif "status" in ev:
-                            yield f"data: {json.dumps({'status': ev['status']})}\n\n"
-                        elif "error" in ev:
-                            yield f"data: {json.dumps({'error': ev['error']})}\n\n"
-                    yield "data: [DONE]\n\n"
-                else:
-                    async with httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=15.0)) as hc:
-                        async with hc.stream("POST", url, json=payload, headers=headers) as r:
-                            if r.status_code != 200:
-                                err = (await r.aread()).decode("utf-8", errors="replace")[:800]
-                                _log(f"Chat-Backend HTTP {r.status_code}: {err}")
-                                yield f"data: {json.dumps({'error': f'Backend HTTP {r.status_code}: {err}'})}\n\n"
-                            else:
-                                buf = ""
-                                async for raw_bytes in r.aiter_raw():
-                                    buf += raw_bytes.decode("utf-8", errors="replace")
-                                    while "\n" in buf:
-                                        line, buf = buf.split("\n", 1)
-                                        line = line.strip()
-                                        if not line.startswith("data:"):
-                                            continue
-                                        payload_s = line[5:].strip()
-                                        if payload_s == "[DONE]":
-                                            break
-                                        try:
-                                            chunk = json.loads(payload_s)
-                                        except json.JSONDecodeError:
-                                            continue
-                                        delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
-                                        c = delta.get("content")
-                                        rc = delta.get("reasoning_content")
-                                        if isinstance(c, str) and c:
-                                            content_chunks.append(c)
-                                            yield f"data: {json.dumps({'content': c})}\n\n"
-                                        elif isinstance(rc, str) and rc:
-                                            yield f"data: {json.dumps({'reasoning': rc})}\n\n"
-                                yield "data: [DONE]\n\n"
+                async for ev in _chat_agent_loop(api_messages, url, headers, identifier, chat):
+                    yield f"data: {json.dumps(ev)}\n\n"
             except Exception as exc:
                 _log(f"Chat-Stream Fehler: {exc}")
                 yield f"data: {json.dumps({'error': str(exc)})}\n\n"
             finally:
-                final = "".join(content_chunks) or "[Keine Antwort erhalten]"
-                chat["messages"].append({"role": "assistant", "content": final})
+                # Der Loop hat finale Antwort + OpenCode-Sessions bereits an
+                # 'chat' angehaengt (auch bei Fehlern); hier nur noch speichern.
                 chat["updated_at"] = time.time()
                 try:
                     _chat_save(chat)
                     _chat_index_update(_chat_index_entry(chat))
                 except Exception as exc:
                     _log(f"Chat-Speichern fehlgeschlagen: {exc}")
+            yield "data: [DONE]\n\n"
 
         return StreamingResponse(relay(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache"})
