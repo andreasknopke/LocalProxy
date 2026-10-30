@@ -1676,8 +1676,8 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
           <input type="text" class="chat-title-input" id="chatTitle" placeholder="Titel…" onblur="chatRename()" />
           <span class="spacer"></span>
           <select id="chatModelSelect" title="Modell-Kategorie"></select>
-          <label class="web-research-toggle" title="Modell darf das Web durchsuchen (Bing / DuckDuckGo)">
-            <input type="checkbox" id="chatWebResearch" /> Web-Recherche
+          <label class="web-research-toggle" title="Immer Websuche aktivieren. Ohne Haken wird sie automatisch gestartet, wenn du darum bittest (z.B. 'recherchiere das im Netz')">
+            <input type="checkbox" id="chatWebResearch" /> Immer recherchieren
           </label>
           <span class="vision-badge" id="chatVisionBadge" style="display:none">Bildanalyse an</span>
         </div>
@@ -2804,6 +2804,25 @@ def _strip_html(s: str) -> str:
     return _html.unescape(s).strip()
 
 
+# Intent-Erkennung: startet die Web-Recherche automatisch, wenn der Nutzer
+# darum bittet — wie bei Chatbots, die Tools immer anbieten lassen.
+_WEB_RESEARCH_INTENT_RE = re.compile(
+    r"\b(recherchier\w*|recherche\b|nachschlagen?\b|nachschau\w*"
+    r"|im\s+netz\b|ins\s+net\b|aus\s+dem\s+(internet|netz)\b"
+    r"|im\s+internet\b|online\s+(suchen?|nachlesen?)\b"
+    r"|aktuell(e)?\s+(lage|stand|info\w*)\b"
+    r"|weitere\s+informationen?\b"
+    r"|research\w*|look\s+(this|that)\s+up|google\s+it|search\s+(the\s+web|online)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _chat_wants_web_research(user_text: str) -> bool:
+    """True, wenn die Nachricht explizit nach Websuche/recherchieren fragt."""
+    return bool(_WEB_RESEARCH_INTENT_RE.search(user_text or ""))
+
+
 def _ddg_real_url(href: str) -> str:
     """Entpackt DuckDuckGo-Redirect-Links (//duckduckgo.com/l/?uddg=...) zur echten URL."""
     import urllib.parse
@@ -3183,7 +3202,9 @@ def _register_chat_routes(webapp: FastAPI) -> None:
                         for m in chat["messages"]
                         if isinstance(m, dict) and m.get("role") in ("user", "assistant", "system")]
         identifier = str(body.get("model") or _chat_slot_identifier(chat["category"], int(chat.get("slot", 0))))
-        web_research = bool(body.get("web_research"))
+        # Web-Recherche: expliziter Toggle ODER automatische Intent-Erkennung
+        # ("recherchiere das mal im Netz" → Tool-Loop ohne manuelles Anklicken).
+        web_research = bool(body.get("web_research")) or _chat_wants_web_research(user_text)
         payload = {"model": identifier, "messages": api_messages, "stream": True}
 
         port = os.getenv("PROXY_PORT") or str(_load_config().get("proxy", {}).get("port", 9001))
