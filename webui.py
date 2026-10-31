@@ -1848,7 +1848,8 @@ function chatRenderToolChips(cfg) {
 async function chatToggleTool(name, cfg) {
   const tools = (cfg && cfg.tools) || {};
   const cur = tools[name] || {};
-  const next = !!(cur.enabled !== false);
+  const wasOn = cur.enabled !== false;
+  const next = !wasOn;
   tools[name] = Object.assign({}, cur, { enabled: next });
   cfg.tools = tools;
   chatRenderToolChips(cfg);
