@@ -698,6 +698,8 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 }
 .chat-toolbar .tool-chip.active { color: var(--accent); border-color: var(--accent); opacity: 1; }
 .chat-toolbar .tool-chip:not(.active) { opacity: 0.55; }
+.chat-toolbar .tool-chip { cursor: pointer; user-select: none; }
+.chat-toolbar .tool-chip:hover { opacity: 1; }
 .chat-toolbar .vision-badge { font-size: 0.7rem; color: var(--warn); }
 .chat-toolbar .spacer { flex: 1; }
 .chat-title-input {
@@ -1744,7 +1746,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
           <input type="text" class="chat-title-input" id="chatTitle" placeholder="Titel…" onblur="chatRename()" />
           <span class="spacer"></span>
           <select id="chatModelSelect" title="Modell-Kategorie"></select>
-          <div class="tool-toggles" id="chatToolChips" title="Serverseitige Tools des Chats — aktiviert ueber die Einstellungen (Sektion 'tools')"></div>
+          <div class="tool-toggles" id="chatToolChips" title="Serverseitige Tools des Chats — Klick schaltet an/aus"></div>
           <span class="vision-badge" id="chatVisionBadge" style="display:none">Bildanalyse an</span>
         </div>
         <div class="chat-log" id="chatLog">
@@ -1837,8 +1839,31 @@ function chatRenderToolChips(cfg) {
     const chip = document.createElement('span');
     chip.className = 'tool-chip' + (on ? ' active' : '');
     chip.textContent = (CHAT_TOOL_LABELS[name] || name) + (on ? '' : ' (aus)');
-    chip.title = on ? 'Serverseitiges Tool aktiv — das Modell darf es im Chat nutzen.' : 'Deaktiviert (Einstellungen → Sektion "tools").';
+    chip.title = on ? 'Serverseitiges Tool aktiv — Klick deaktiviert.' : 'Deaktiviert — Klick aktiviert.';
+    chip.addEventListener('click', () => chatToggleTool(name, cfg));
     box.appendChild(chip);
+  }
+}
+
+async function chatToggleTool(name, cfg) {
+  const tools = (cfg && cfg.tools) || {};
+  const cur = tools[name] || {};
+  const next = !!(cur.enabled !== false);
+  tools[name] = Object.assign({}, cur, { enabled: next });
+  cfg.tools = tools;
+  chatRenderToolChips(cfg);
+  try {
+    const r = await fetch('/webui/api/config', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(cfg),
+    });
+    if (!r.ok) throw new Error('Speichern fehlgeschlagen');
+    showToast(next ? 'Tool aktiviert: ' + (CHAT_TOOL_LABELS[name] || name)
+                   : 'Tool deaktiviert: ' + (CHAT_TOOL_LABELS[name] || name), 'success');
+  } catch (e) {
+    showToast('Tool-Umschaltung fehlgeschlagen: ' + e.message, 'error');
+    chatRenderToolChips(cfg);
   }
 }
 
