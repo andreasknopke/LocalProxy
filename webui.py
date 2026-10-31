@@ -2137,8 +2137,10 @@ async function saveConfig() {
       thinking_mode: document.getElementById('local_thinking_mode').value || 'none',
       thinking_off: document.getElementById('local_thinking_off')?.checked ?? false,
       anti_loop_system_prompt: document.getElementById('local_anti_loop_system_prompt').value || '',
-    };
+    },
+  };
 
+  // Chat-Tools (Agenten-Loop)
   cfg.tools = {
     web_search: { enabled: document.getElementById('tool_web_search').checked },
     opencode_run: {
