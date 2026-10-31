@@ -3714,6 +3714,11 @@ async def _chat_agent_loop(api_messages: List[Dict[str, Any]], url: str,
             final_content = "".join(content_parts)
         finally:
             _persist_opencode_sessions(ctx.chat_id, ctx.opencode_sessions)
+            # Finale Antwort persistieren — der Frontend holt den Chat nach dem
+            # Stream neu vom Server und rendert ihn; ohne diesen Schritt
+            # verschwindet die live gestreamte Antwort beim Resync.
+            if final_content.strip():
+                chat["messages"].append({"role": "assistant", "content": final_content})
 
 
 def _persist_opencode_sessions(chat_id: str, stored: Dict[str, str]) -> None:
