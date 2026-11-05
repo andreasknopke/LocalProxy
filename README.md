@@ -41,6 +41,17 @@ VS Code Copilot  --POST /v1/chat/completions-->  FastAPI Gateway
 
 Ohne Flag wird die in der **WebUI** konfigurierte Default-Kategorie verwendet.
 
+### Co-Worker per Prompt schalten (`-coworker-on` / `-coworker-off`)
+
+Ist der global Toggle **„Co-Worker-Delegation aktiviert"** (WebUI /
+`COWORKER_ENABLED`) **aus**, ruht der Co-Worker vollständig: kein Health-Check,
+keine `ask_coworker`-/`dispatch_coworker`-Tools, kein Auto-Dispatch, kein
+Tunnel-Resume. Mit `-coworker-on` im Prompt schaltet der Nutzer die Delegation
+für **diese Konversation** ein (bis der Schalter TTL-/LRU-mäßig ausläuft),
+mit `-coworker-off` wieder aus. Der Session-Schalter überschreibt dabei
+stets die globale Einstellung; ohne Schalter wird der Co-Worker
+**ausschließlich** bei aktivierter globaler Delegation angesprochen.
+
 ### Modell-Auswahl per Identifier (`body["model"]`)
 
 Alternativ (und mit **höherer Priorität** als das Flag) wählt der Client die

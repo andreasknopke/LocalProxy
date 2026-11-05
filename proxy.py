@@ -1343,6 +1343,108 @@ def _detect_reset_flag(text: str) -> bool:
     return bool(_RESET_FLAG_PATTERN.search(text))
 
 
+# ── Co-Worker-Session-Schalter ── -coworker-on / -coworker-off ─────────────
+# Ueberschreibt die globale Co-Worker-Delegation (WebUI-Toggle /
+# COWORKER_ENABLED) fuer EINE Konversation. Bei deaktivierter Delegation ruht
+# der Co-Worker komplett (kein Health-Check, keine Tools, kein Dispatch);
+# "-coworker-on" weckt ihn fuer die Session, "-coworker-off" legt ihn wieder
+# schlafen. Akzeptiert ein UND zwei Bindestriche.
+_COWORKER_SWITCH_PATTERN = re.compile(r'-{1,2}coworker-(on|off)\b', re.IGNORECASE)
+
+
+def _detect_coworker_switch_flag(text: str) -> Optional[bool]:
+    """Erkennt -coworker-on/-coworker-off im Text. Letztes Vorkommen gewinnt.
+    Returns True (an), False (aus) oder None (kein Flag)."""
+    result: Optional[bool] = None
+    for m in _COWORKER_SWITCH_PATTERN.finditer(text or ""):
+        result = m.group(1).lower() == "on"
+    return result
+
+
+# conv_key → (override, zuletzt_gesehen_Epoche). Session-OVERRIDE der globalen
+# Delegation: True = Co-Worker an (auch wenn global aus), False = aus (auch
+# wenn global an). LRU + TTL wie die Affinity-Map.
+_COWORKER_SESSION_OVERRIDE: Dict[str, Tuple[bool, float]] = {}
+COWORKER_SWITCH_TTL_SECONDS: float = float(os.getenv("COWORKER_SWITCH_TTL_SECONDS", "86400"))
+COWORKER_SWITCH_MAX_ENTRIES: int = int(os.getenv("COWORKER_SWITCH_MAX_ENTRIES", "256"))
+
+# Request-lokaler Override (pro Request aus der Konversation aufgelöst), damit
+# ALLE Co-Worker-Pfade (Payload-Injection, Delegation, Dispatch, Tunnel-Resume,
+# Tool-Call-Verwerfung) ohne Signatur-Aenderung denselben Wert sehen.
+_ctx_coworker_override: contextvars.ContextVar[Optional[bool]] = contextvars.ContextVar(
+    "_ctx_coworker_override", default=None)
+
+
+def _coworker_override_record(conv_key: str, enabled: bool) -> None:
+    """Session-OVERRIDE setzen (durch -coworker-on/-coworker-off im Prompt)."""
+    if not conv_key:
+        return
+    _COWORKER_SESSION_OVERRIDE.pop(conv_key, None)
+    _COWORKER_SESSION_OVERRIDE[conv_key] = (enabled, time.time(), time.time())
+    while len(_COWORKER_SESSION_OVERRIDE) > max(1, COWORKER_SWITCH_MAX_ENTRIES):
+        oldest = next(iter(_COWORKER_SESSION_OVERRIDE))
+        _COWORKER_SESSION_OVERRIDE.pop(oldest, None)
+    _log(f"Co-Worker-Session-Schalter: {'AN' if enabled else 'AUS'} für conv={conv_key[:8]}")
+
+
+def _coworker_override_lookup(conv_key: str) -> Optional[bool]:
+    """Session-OVERRIDE der Konversation oder None (kein Override/expired)."""
+    if not conv_key:
+        return None
+    entry = _COWORKER_SESSION_OVERRIDE.get(conv_key)
+    if entry is None:
+        return None
+    enabled, seen, _set_at = entry
+    if time.time() - seen > COWORKER_SWITCH_TTL_SECONDS:
+        del _COWORKER_SESSION_OVERRIDE[conv_key]
+        return None
+    # LRU-Erneuerung: ans Ende der Einfügereihenfolge verschieben.
+    _COWORKER_SESSION_OVERRIDE.pop(conv_key)
+    _COWORKER_SESSION_OVERRIDE[conv_key] = entry
+    return enabled
+
+
+def _coworker_override_set_at(conv_key: str) -> float:
+    """Zeitpunkt, zu dem der Session-OVERRIDE gesetzt wurde (0.0 ohne
+    Override). Der Request-Handler probe-t den Co-Worker erneut, wenn der
+    letzte Health-Check VOR dem Schalten stattfand (sonst bleibt ein bei
+    global deaktivierter Delegation mit reachable=False stehender Cache
+    bestehen, obwohl der Nutzer den Co-Worker per -coworker-on geweckt hat)."""
+    if not conv_key:
+        return 0.0
+    entry = _COWORKER_SESSION_OVERRIDE.get(conv_key)
+    return entry[2] if entry else 0.0
+
+
+def _coworker_enabled_effective() -> bool:
+    """Co-Worker-Delegation fuer den AKTUELLEN Request: Session-OVERRIDE
+    (-coworker-on/-coworker-off) ueberschreibt die globale Einstellung
+    (WebUI-Toggle / COWORKER_ENABLED)."""
+    override = _ctx_coworker_override.get()
+    if override is not None:
+        return override
+    return COWORKER_ENABLED
+
+
+def _strip_coworker_switch_flags_from_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Entfernt -coworker-on/-coworker-off aus allen User-Nachrichten (in-place)."""
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content")
+            if isinstance(content, str):
+                new = _COWORKER_SWITCH_PATTERN.sub("", content)
+                if new != content:
+                    msg["content"] = new.strip()
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        old = str(block.get("text", ""))
+                        new = _COWORKER_SWITCH_PATTERN.sub("", old)
+                        if new != old:
+                            block["text"] = new.strip()
+    return messages
+
+
 def _do_reset() -> None:
     """Setzt alle Kategorien auf Primary (Idx=0). Loescht Cooldowns und Affinity-Map."""
     for key in ("light", "strong", "vision", "coworker"):
@@ -1390,7 +1492,8 @@ def _conversation_key(messages: Sequence[Dict[str, Any]]) -> str:
         text = _message_text(msg)
         if not text.strip():
             continue
-        norm = _MODEL_FLAG_PATTERN.sub("", text).strip().lower()[:4096]
+        norm = _MODEL_FLAG_PATTERN.sub("", text)
+        norm = _COWORKER_SWITCH_PATTERN.sub("", norm).strip().lower()[:4096]
         return hashlib.blake2b(norm.encode("utf-8"), digest_size=10).hexdigest()
     return ""
 
@@ -3608,7 +3711,7 @@ def _build_passthrough_payload(body: Dict[str, Any], category: str, def_idx: int
     # [EXECUTION RULES] nur bei aktiver Delegation (COWORKER_ENABLED) — sonst
     # pure passthrough. Vom Health-Check bewusst UNABHAENGIG: die Regeln
     # betreffen das generische write/edit-Tool-Calling, nicht die Delegation.
-    if payload.get("tools") and COWORKER_ENABLED:
+    if payload.get("tools") and _coworker_enabled_effective():
         _inject_tool_execution_guidance(payload)
 
     # Co-Worker-Delegation: ask_coworker-Tool nur bei Kategorie=local + Health-OK
@@ -4276,7 +4379,8 @@ def _strip_coworker_tool_calls(tool_calls: Optional[List[Dict[str, Any]]]) -> Op
     """Entfernt alle Co-Worker-Tool-Calls aus einer Tool-Call-Liste, wenn der
     Co-Worker nicht aktiv ist (Delegation deaktiviert ODER API-URL nicht
     gesetzt). Ein Call ins Leere wird so unmoeglich — auch wenn das Modell
-    die Tools aus der History oder halluziniert aufruft."""
+    die Tools aus der History oder halluziniert aufruft. Der Session-Schalter
+    (-coworker-on/-coworker-off) wirkt ueber _coworker_enabled_effective() mit."""
     if not tool_calls or _coworker_active():
         return tool_calls
     names = _coworker_tool_names()
@@ -4294,16 +4398,18 @@ def _coworker_active() -> bool:
     (Datei-Kontext-Extraktion, Delegation, Dispatch, Tunnel-Resume,
     Status-Notizen) muessen daran gekoppelt sein — ohne gesetzte API-URL
     darf kein Co-Worker-Anteil hueten, selbst wenn der Nutzer die Tools
-    versehentlich aufruft."""
-    return COWORKER_ENABLED and _coworker_configured()
+    versehentlich aufruft. Der Session-Schalter (-coworker-on/-coworker-off)
+    ueberschreibt die globale Einstellung."""
+    return _coworker_enabled_effective() and _coworker_configured()
 
 
 async def _probe_coworker() -> bool:
     """Minimaler Ping ans Co-Worker-Modell. Erreichbar = HTTP < 500 (auch 4xx:
     die Maschine lebt; ein 4xx liefert spaeter einen nutzbaren Fehlertext im
     tool-result). Timeout/ConnectError = Maschine aus → unreachable.
-    Wird nur aufgerufen, wenn COWORKER_ENABLED aktiv ist."""
-    if not COWORKER_ENABLED:
+    Wird nur aufgerufen, wenn die Delegation aktiv ist (global oder per
+    Session-Schalter -coworker-on)."""
+    if not _coworker_enabled_effective():
         _COWORKER_HEALTH_CACHE.update({
             "reachable": False,
             "checked_at": time.time(),
@@ -4369,30 +4475,34 @@ async def _coworker_health_loop() -> None:
     anpingbar, ein periodischer Probe wuerde reachable=False setzen und damit
     dispatch/collect aus der Worker-Tool-Liste reissen, genau wenn der Worker
     collecten will. Die Schleife bleibt fuer das TTL-Cleanup offener
-    Hintergrund-Tasks. Laeuft NUR wenn COWORKER_ENABLED aktiv ist."""
-    if not COWORKER_ENABLED:
-        _COWORKER_HEALTH_CACHE.update({"reachable": False, "last_error": "Co-Worker deaktiviert"})
-        return
-    try:
-        if _coworker_configured():
-            await _probe_coworker()
-            state = ("erreichbar" if _COWORKER_HEALTH_CACHE.get("reachable")
-                     else f"UNREACHABLE ({_COWORKER_HEALTH_CACHE.get('last_error', '?')})")
-            _log(f"Co-Worker Health-Check (Startup): {state}")
-    except asyncio.CancelledError:
-        return
-    except Exception:
-        pass
+    Hintergrund-Tasks.
+
+    Bei global deaktivierter Delegation (COWORKER_ENABLED aus) findet KEIN
+    Health-Check statt — der Co-Worker ruht komplett. Ein per
+    -coworker-on geweckter Session-Co-Worker wird vom Request-Handler
+    bei Bedarf geprobt; solange ein Session-Override "an" ist, darf die
+    Schleife den Health-Cache nicht auf unreachable zuruecksetzen."""
+    startup_done = False
     while True:
         try:
+            if COWORKER_ENABLED:
+                if not startup_done:
+                    startup_done = True
+                    if _coworker_configured():
+                        await _probe_coworker()
+                        state = ("erreichbar" if _COWORKER_HEALTH_CACHE.get("reachable")
+                                 else f"UNREACHABLE ({_COWORKER_HEALTH_CACHE.get('last_error', '?')})")
+                        _log(f"Co-Worker Health-Check (Startup): {state}")
+                elif not _coworker_configured():
+                    _COWORKER_HEALTH_CACHE.update({"reachable": False, "last_error": "nicht konfiguriert"})
+            else:
+                # Delegation global aus → KEIN Health-Check. Der Cache wird nur
+                # zurueckgesetzt, wenn kein Session-Override (-coworker-on)
+                # den Co-Worker aktuell wach haelt.
+                if not any(en for en, _s, _t in _COWORKER_SESSION_OVERRIDE.values()):
+                    _COWORKER_HEALTH_CACHE.update({"reachable": False,
+                                                   "last_error": "Co-Worker deaktiviert"})
             await asyncio.sleep(COWORKER_HEALTH_INTERVAL)
-            if not COWORKER_ENABLED:
-                # Co-Worker wurde waehrend der Laufzeit deaktiviert → stoppen
-                _COWORKER_HEALTH_CACHE.update({"reachable": False, "last_error": "Co-Worker deaktiviert"})
-                return
-            if not _coworker_configured():
-                _COWORKER_HEALTH_CACHE.update({"reachable": False, "last_error": "nicht konfiguriert"})
-                continue
             # KEIN periodischer Probe (siehe Docstring). Nur TTL-Cleanup der
             # Hintergrund-Tasks, damit abgelaufene running-Tasks geraeumt werden.
             # Fork-Join: TTL-Cleanup der Hintergrund-Tasks mit inline ziehen
@@ -4407,8 +4517,8 @@ async def _coworker_health_loop() -> None:
 def _inject_tool_execution_guidance(payload: Dict[str, Any]) -> None:
     """Injiziert die [EXECUTION RULES] in die System-Message — unabhaengig
     vom Co-Worker-Health-Check, aber NUR solange die Co-Worker-Delegation
-    aktiviert ist (der Aufrufer prueft COWORKER_ENABLED; bei deaktivierter
-    Delegation bleibt der Prompt unveraendert). Die Regeln betreffen das
+    aktiviert ist (der Aufrufer prueft _coworker_enabled_effective(); bei
+    deaktivierter Delegation bleibt der Prompt unveraendert). Die Regeln betreffen das
     generische Tool-Calling des Hauptmodells (write/edit statt Code im
     Reasoning) und duerfen nicht daran haengen, ob der Co-Worker erreichbar ist.
 
@@ -4504,7 +4614,7 @@ def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
     zusaetzlich dispatch_coworker + collect_coworker) in den Payload — NUR
     wenn aktiviert, konfiguriert und laut Health-Check erreichbar.
     Returns True bei Injection."""
-    if not COWORKER_ENABLED:
+    if not _coworker_enabled_effective():
         return False
     if not _coworker_configured():
         return False
@@ -7376,6 +7486,17 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
 
+    # ── Co-Worker-Session-Schalter: -coworker-on / -coworker-off ──
+    # Ueberschreibt die globale Delegation (WebUI-Toggle) fuer DIESE
+    # Konversation, bis der Override TTL-/LRU-maessig aus der Map faellt.
+    # Der Request-Context tragt den Wert zu allen Co-Worker-Pfaden
+    # (Payload-Injection, Delegation, Dispatch, Tunnel-Resume, Tool-Stripping).
+    _cw_conv_key = _conversation_key(msgs)
+    _cw_switch = _detect_coworker_switch_flag(last_user)
+    if _cw_switch is not None:
+        _coworker_override_record(_cw_conv_key, _cw_switch)
+    _ctx_coworker_override.set(_coworker_override_lookup(_cw_conv_key))
+
     cleaned, flag_category, flag_slot = _extract_model_flag(last_user)
 
     # Identifier aus body["model"] (OpenAI-Standardfeld) — hoechste Prioritaet.
@@ -7426,6 +7547,7 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
             _log(f"   → active_idx auf {active_idx} aktualisiert (Cooldown-Umgehung)")
 
     _strip_model_flags_from_messages(msgs)
+    _strip_coworker_switch_flags_from_messages(msgs)
 
     # Log aktiven Index für die Kategorie
     defs = _model_defs(category)
@@ -7455,7 +7577,12 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     # ein Re-Probe wuerde reachable=False setzen und dispatch/collect aus der
     # Worker-Tool-Liste reissen, genau wenn der Worker collecten will.
     if category == "local" and _coworker_active():
-        if float(_COWORKER_HEALTH_CACHE.get("checked_at", 0.0)) <= 0.0:
+        _cw_checked = float(_COWORKER_HEALTH_CACHE.get("checked_at", 0.0))
+        # Erneut proben: Cold-Start ODER der Session-Schalter (-coworker-on)
+        # wurde NACH dem letzten Health-Check gesetzt — sonst bliebe ein bei
+        # global deaktivierter Delegation auf reachable=False stehender Cache
+        # bestehen, obwohl der Nutzer den Co-Worker gerade geweckt hat.
+        if _cw_checked <= 0.0 or _cw_checked < _coworker_override_set_at(_cw_conv_key):
             await _probe_coworker()
             _log(f"Co-Worker Cold-Start-Probe: "
                  f"{'erreichbar' if _COWORKER_HEALTH_CACHE.get('reachable') else 'UNREACHABLE (' + str(_COWORKER_HEALTH_CACHE.get('last_error', '?')) + ')'}")
@@ -9205,6 +9332,7 @@ async def healthz(request: Request):
         "proxy_auth_enabled": PROXY_AUTH_ENABLED,
         "coworker": {
             "enabled": COWORKER_ENABLED,
+            "session_overrides": sum(1 for en, _s, _t in _COWORKER_SESSION_OVERRIDE.values() if en),
             "configured": _coworker_configured(),
             "fork_join": COWORKER_FORK_JOIN,
             "reachable": bool(_COWORKER_HEALTH_CACHE.get("reachable", False)),
