@@ -115,3 +115,30 @@ def test_is_authorized_reflects_resolution():
     assert proxy._is_authorized(_Req(token=u._token)) is True
     assert proxy._is_authorized(_Req(token="localfox-admin-bootstrap")) is True
     assert proxy._is_authorized(_Req(token="wrong")) is False
+
+
+# ─── ADMIN_TOKEN (ENV) ─────────────────────────────────────────────────────
+
+def test_admin_token_resolves_admin(monkeypatch):
+    monkeypatch.setattr(proxy, "ADMIN_TOKEN", "localfox-fixadmin")
+    monkeypatch.setattr(proxy, "PROXY_API_KEY", "localfox-fixadmin")
+    u = proxy._resolve_user("localfox-fixadmin")
+    assert u is not None and u.is_admin
+
+
+def test_apply_config_file_does_not_override_admin_token(monkeypatch):
+    monkeypatch.setattr(proxy, "ADMIN_TOKEN", "localfox-fixadmin")
+    monkeypatch.setattr(proxy, "PROXY_API_KEY", "localfox-fixadmin")
+    cfg = {"proxy": {"api_key": "localfox-aus-config"}}
+    monkeypatch.setattr(proxy, "_webui_load_config", lambda: cfg)
+    proxy._apply_config_file()
+    assert proxy.PROXY_API_KEY == "localfox-fixadmin"
+
+
+def test_apply_config_file_without_admin_token_uses_config(monkeypatch):
+    monkeypatch.setattr(proxy, "ADMIN_TOKEN", "")
+    monkeypatch.setattr(proxy, "PROXY_API_KEY", "localfox-alt")
+    cfg = {"proxy": {"api_key": "localfox-aus-config"}}
+    monkeypatch.setattr(proxy, "_webui_load_config", lambda: cfg)
+    proxy._apply_config_file()
+    assert proxy.PROXY_API_KEY == "localfox-aus-config"

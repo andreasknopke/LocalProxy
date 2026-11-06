@@ -409,6 +409,10 @@ Alle 4 Kategorien konnen via Env-Vars konfiguriert werden (Prefix je Kategorie):
 - `LIGHT_*`, `STRONG_*`, `VISION_*` (analog)
 - `DEFAULT_CATEGORY` — `light` (default)
 - `PROXY_PORT`, `PROXY_AUTH_ENABLED`, `PROXY_API_KEY`
+- `ADMIN_TOKEN` — fester Admin-Token: wenn gesetzt, hat er Vorrang vor
+  `PROXY_API_KEY`, `config.json` und Auto-Generierung. Login im WebUI mit
+  Benutzer `admin` + diesem Token, stabil uber Neustarts. Beim Startup wird
+  die Admin-Zeile im User-Store auf diesen Token gesetzt.
 - `HINDSIGHT_ENABLED`, `QDRANT_URL`, ...
 - `DEBUG_LOGGING` — Master-Schalter für ALLE Debug-/Trace-Ausgaben
   (1 = default): `proxy.log` (Datei + stdout), Payload-Dumps in

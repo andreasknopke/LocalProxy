@@ -391,7 +391,11 @@ except Exception:
 # ── Proxy ──────────────────────────────────────────────────────────────────
 PROXY_PORT: int = int(os.getenv("PROXY_PORT", os.getenv("PORT", "9001")))
 PROXY_AUTH_ENABLED: bool = os.getenv("PROXY_AUTH_ENABLED", "true").lower() in {"1", "true", "yes", "y", "on"}
-PROXY_API_KEY: str = os.getenv("PROXY_API_KEY", "")
+# ADMIN_TOKEN ist der fixe Admin-Token: wenn gesetzt, hat er Vorrang vor
+# PROXY_API_KEY, config.json und Auto-Generierung — der Admin-Login bleibt
+# damit ueber Neustarts hinweg stabil ("admin" + ADMIN_TOKEN).
+ADMIN_TOKEN: str = os.getenv("ADMIN_TOKEN", "")
+PROXY_API_KEY: str = ADMIN_TOKEN or os.getenv("PROXY_API_KEY", "")
 if PROXY_AUTH_ENABLED and not PROXY_API_KEY:
     PROXY_API_KEY = "localfox-" + secrets.token_hex(16)
     _log(f"Auto-generated PROXY_API_KEY: {PROXY_API_KEY}")
@@ -1065,8 +1069,12 @@ def _apply_config_file() -> None:
     PROXY_PORT = int(cfg.get("proxy", {}).get("port", PROXY_PORT))
     PROXY_AUTH_ENABLED = bool(cfg.get("proxy", {}).get("auth_enabled", PROXY_AUTH_ENABLED))
     pk = cfg.get("proxy", {}).get("api_key", "")
-    if pk:
+    # Ein per ENV gesetzter ADMIN_TOKEN darf nicht durch config.json entwertet
+    # werden — sonst driftet der Admin-Login bei jedem Reload.
+    if pk and not ADMIN_TOKEN:
         PROXY_API_KEY = pk
+    elif ADMIN_TOKEN:
+        PROXY_API_KEY = ADMIN_TOKEN
 
     global HINDSIGHT_ENABLED, QDRANT_URL, QDRANT_API_KEY, HINDSIGHT_COLLECTION
     global HINDSIGHT_EMBEDDING_DIM, HINDSIGHT_MAX_MEMORY_TOKENS, HINDSIGHT_MIN_SIMILARITY
@@ -7431,7 +7439,14 @@ async def _lifespan(app: FastAPI):
     if _USERS_AVAILABLE:
         try:
             _store = _users.get_store()
-            _store.ensure_admin("admin", token=PROXY_API_KEY or _users.generate_token())
+            _admin = _store.ensure_admin("admin",
+                                         token=ADMIN_TOKEN or PROXY_API_KEY
+                                         or _users.generate_token())
+            # ADMIN_TOKEN erzwingen: Admin-Zeile auf den festen Token heilen,
+            # damit der Login ("admin" + ADMIN_TOKEN) ueber alle Neustarts haelt.
+            if ADMIN_TOKEN and _admin.token_hash != _users.hash_token(ADMIN_TOKEN):
+                _store.set_token(_admin.id, ADMIN_TOKEN)
+                _log("   Users:   Admin-Token auf ADMIN_TOKEN (ENV) gesetzt")
             _log(f"   Users:   {len(_store.list_users())} Benutzer, "
                  f"Store={_users.get_store().path}")
         except Exception as exc:

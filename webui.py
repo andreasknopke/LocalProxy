@@ -4278,7 +4278,8 @@ def _register_chat_routes(webapp: FastAPI) -> None:
         url = f"http://127.0.0.1:{port}/v1/chat/completions"
         cfg_now = _load_config()
         headers: Dict[str, str] = {}
-        key = os.getenv("PROXY_API_KEY") or str(cfg_now.get("proxy", {}).get("api_key", "") or "")
+        key = (os.getenv("ADMIN_TOKEN") or os.getenv("PROXY_API_KEY")
+               or str(cfg_now.get("proxy", {}).get("api_key", "") or ""))
         if key:
             headers["Authorization"] = f"Bearer {key}"
 
