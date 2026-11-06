@@ -298,13 +298,24 @@ def _default_category() -> str:
 
 
 def _model_defs(category: str) -> List[Dict[str, Any]]:
-    """Gibt Liste von Modell-Definitionen fuer eine Kategorie zurueck."""
-    cat = _model_categories().get(category)
-    if isinstance(cat, list):
-        return [d for d in cat if isinstance(d, dict) and d.get("api_url") and d.get("model_name")]
-    if isinstance(cat, dict) and cat.get("api_url"):
-        return [cat]
-    return []
+    """Gibt Liste von Modell-Definitionen fuer eine Kategorie zurueck.
+
+    Leert eine Kategorie (z.B. neuer User ohne eigene Modelle), faellt die
+    Auflösung auf 'local' zurück: local ist admin-verwaltet und immer da."""
+    def _valid(cat: Any) -> List[Dict[str, Any]]:
+        if isinstance(cat, list):
+            return [d for d in cat if isinstance(d, dict) and d.get("api_url") and d.get("model_name")]
+        if isinstance(cat, dict) and cat.get("api_url") and cat.get("model_name"):
+            return [cat]
+        return []
+
+    defs = _valid(_model_categories().get(category))
+    # Leere Kategorie -> Local-Fallback. 'coworker' faellt NIE auf local
+    # zurueck: eine leere Coworker-Kategorie bedeutet "kein Co-Worker",
+    # sonst wuerde der Health-Check taeuschend configured melden.
+    if not defs and category not in ("local", "coworker"):
+        defs = _valid(_model_categories().get("local"))
+    return defs
 
 
 def _model_key(category: str, idx: int) -> str:
@@ -7499,26 +7510,37 @@ def _effective_settings(user: Optional["_users.User"]) -> Dict[str, Any]:
     Baseline übernommen — lokale Modelle sind admin-only und machen
     benutzerspezifisch keinen Sinn. Alle übrigen Einstellungen (Loop-Guard,
     Sampling, Prompt-Injection, Co-Worker, Tools, Modelle außer local)
-    dürfen pro User überschrieben werden."""
+    dürfen pro User überschrieben werden.
+
+    Nicht-Admins erben KEINE globalen Modelle: Kategorien, die ihr Overlay
+    nicht definiert, werden leer gesetzt — zur Laufzeit greift dann der
+    Local-Fallback (siehe `_model_defs`)."""
     base = _BASELINE_CONFIG or {}
-    if user is None or not user.settings:
+    if user is None or user.is_admin:
         return copy.deepcopy(base)
-    merged = _deep_merge(base, user.settings)
+    merged = _deep_merge(base, user.settings) if user.settings else copy.deepcopy(base)
     base_cats = base.get("model_categories")
     if isinstance(base_cats, dict) and "local" in base_cats:
         merged.setdefault("model_categories", {})["local"] = copy.deepcopy(
             base_cats["local"])
+    user_cats = (user.settings or {}).get("model_categories")
+    for cat in merged.setdefault("model_categories", {}):
+        if cat == "local":
+            continue
+        if not (isinstance(user_cats, dict) and cat in user_cats):
+            merged["model_categories"][cat] = []
     return merged
 
 
 def _apply_user_settings(user: Optional["_users.User"]) -> None:
     """Setzt den Settings-Context auf die effektiven Werte des Benutzers.
 
-    Ohne Benutzer (oder ohne benutzerdefinierte Einstellungen) bleibt der
-    Context leer, damit alle Zugriffe auf die Module-Globals (die globale
-    Baseline) zurueckfallen — identisches Verhalten wie vor der
-    Benutzer-Einfuehrung."""
-    if user is None or not user.settings:
+    Ohne Benutzer oder als Admin bleibt der Context leer, damit alle
+    Zugriffe auf die Module-Globals (die globale Baseline) zurueckfallen —
+    identisches Verhalten wie vor der Benutzer-Einfuehrung. Nicht-Admins
+    bekommen immer einen gesetzten Context (selbst ohne eigene Settings),
+    damit ihre leeren Kategorien nicht still die globalen Modelle nutzen."""
+    if user is None or user.is_admin:
         _ctx_settings.set(None)
         return
     _ctx_settings.set(_effective_settings(user))

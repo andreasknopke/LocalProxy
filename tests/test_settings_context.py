@@ -112,3 +112,46 @@ def test_cfg_get_with_ctx_falls_back_to_baseline():
     proxy._apply_user_settings(u)
     assert proxy._cfg_get("default_category", default="global") == "light"  # baseline
     assert proxy._cfg_get("tokens", "fehitlend", default="dflt") == "dflt"
+
+
+# ── Neue User: leere Kategorien + Local-Fallback ──────────────────────────
+
+def test_new_user_effective_settings_blank_categories():
+    """User ohne Settings erbt keine globalen Modelle — Kategorien leer."""
+    u = _user_with(None)
+    eff = proxy._effective_settings(u)
+    assert eff["model_categories"]["local"]["model_name"] == "LocalM"
+    assert eff["model_categories"]["light"] == []
+    # Baseline-Werte bleiben unveraendert (kein Seiteneffekt)
+    assert proxy._BASELINE_CONFIG["model_categories"]["light"][0]["model_name"] == "L"
+
+
+def test_model_defs_falls_back_to_local_for_empty_category():
+    u = _user_with(None)
+    proxy._apply_user_settings(u)
+    assert proxy._model_defs("light") == [
+        {"api_url": "http://local:8000/v1", "model_name": "LocalM", "api_key": ""}]
+    assert proxy._model_defs("strong") == proxy._model_defs("local")
+
+
+def test_model_defs_coworker_never_falls_back_to_local():
+    u = _user_with(None)
+    proxy._apply_user_settings(u)
+    assert proxy._model_defs("coworker") == []
+
+
+def test_user_own_defs_win_over_fallback():
+    u = _user_with({"model_categories": {
+        "light": [{"api_url": "http://mine", "model_name": "Mine", "api_key": ""}]}})
+    proxy._apply_user_settings(u)
+    assert proxy._model_defs("light")[0]["model_name"] == "Mine"
+    # nicht definierte Kategorien bleiben leer -> local-Fallback
+    assert proxy._model_defs("strong")[0]["model_name"] == "LocalM"
+
+
+def test_admin_runtime_unaffected_by_blank_view():
+    """Admin (settings=None) runtime-seitig volle Baseline, kein Blanking."""
+    admin = users.User(id=2, username="admin", is_admin=True, token_hash="",
+                       created_at="", settings=None)
+    eff = proxy._effective_settings(admin)
+    assert eff["model_categories"]["light"][0]["model_name"] == "L"

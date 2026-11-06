@@ -625,16 +625,28 @@ def _current_user_from_request(request: Request):
 
 def _effective_config_for_user(user) -> Dict[str, Any]:
     """Globale Baseline ⊕ Benutzer-Overlay. 'local' kommt stets aus der
-    Baseline (admin-only)."""
+    Baseline (admin-only).
+
+    Nicht-Admins bekommen Kategorien, die ihr Overlay nicht definiert,
+    LEER angezeigt — neue User erben also nicht die globalen Modelle von
+    coworker/light/strong/vision. Leere Kategorien greifen zur Laufzeit
+    automatisch auf 'local' zurück."""
     base = _load_config()
-    if user is None or not getattr(user, "settings", None):
+    if user is None or getattr(user, "is_admin", False):
         return base
     merged = json.loads(json.dumps(base))
-    _deep_merge(merged, user.settings)
+    if getattr(user, "settings", None):
+        _deep_merge(merged, user.settings)
     base_local = base.get("model_categories", {}).get("local")
     if base_local is not None:
         merged.setdefault("model_categories", {})["local"] = json.loads(
             json.dumps(base_local))
+    user_cats = (getattr(user, "settings", None) or {}).get("model_categories")
+    for cat in merged.setdefault("model_categories", {}):
+        if cat == "local":
+            continue
+        if not (isinstance(user_cats, dict) and cat in user_cats):
+            merged["model_categories"][cat] = []
     return merged
 
 
@@ -2025,7 +2037,27 @@ async function checkAdminAndInitUsers() {
     const nameEl = document.getElementById('accountName');
     if (nameEl) nameEl.textContent = (me.username || '—') + (me.is_admin ? ' (admin)' : '');
     if (me.is_admin) loadUsers();
+    else applyLocalReadonly();
   } catch (e) { /* nicht kritisch */ }
+}
+
+// local-Modelle sind admin-verwaltet: fuer Benutzer nur lesbar.
+function applyLocalReadonly() {
+  const card = document.getElementById('modelCard_local');
+  if (!card) return;
+  card.querySelectorAll('input, select').forEach(function(el) {
+    el.disabled = true;
+    el.readOnly = true;
+  });
+  card.querySelectorAll('button').forEach(function(b) { b.style.display = 'none'; });
+  if (!document.getElementById('localReadonlyHint')) {
+    const hint = document.createElement('div');
+    hint.id = 'localReadonlyHint';
+    hint.className = 'hint';
+    hint.style.marginTop = '8px';
+    hint.textContent = 'Das lokale Modell wird vom Admin verwaltet. Leere Kategorien (coworker/light/strong/vision) greifen automatisch auf das lokale Modell zurück.';
+    card.appendChild(hint);
+  }
 }
 
 async function rotateOwnToken() {
@@ -4117,8 +4149,8 @@ def _register_chat_routes(webapp: FastAPI) -> None:
     """Chat-API und SSE-Relueber ueber den lokalen /v1/chat/completions-Endpunkt."""
 
     @webapp.get("/api/chat/models")
-    async def chat_models():
-        cfg = _load_config()
+    async def chat_models(request: Request):
+        cfg = _effective_config_for_user(_current_user_from_request(request))
         cats: Dict[str, Any] = {}
         for key in _CHAT_CATEGORIES:
             cat = cfg.get("model_categories", {}).get(key)

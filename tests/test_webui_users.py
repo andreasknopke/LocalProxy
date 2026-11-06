@@ -230,3 +230,50 @@ def test_logout_invalidates_session():
     assert r.status_code == 200
     # Nach Logout: Session-Token entfernt -> Middleware leitet um (302).
     assert c.get("/webui/api/me", follow_redirects=False).status_code == 302
+
+
+# ── Neue User: nur local sichtbar, Rest leer ──────────────────────────────
+
+def test_new_user_sees_only_local_models():
+    store = users.get_store()
+    u = store.create_user("newbie")
+    c = _client()
+    _with_token(c, _login_user(c, "newbie", u._token).json()["token"])
+    r = c.get("/webui/api/config")
+    assert r.status_code == 200
+    cats = r.json()["model_categories"]
+    # local kommt aus der Baseline (admin-only)
+    assert cats["local"]["model_name"] == "local-m"
+    # alle anderen Kategorien leer — keine geerbten Baseline-Modelle
+    assert cats["light"] == []
+    assert cats["strong"] == []
+    assert cats["vision"] == []
+    assert cats["coworker"] == []
+
+
+def test_user_own_models_survive_save_and_reload():
+    store = users.get_store()
+    u = store.create_user("keeper")
+    c = _client()
+    _with_token(c, _login_user(c, "keeper", u._token).json()["token"])
+    # User legt eigenes light-Modell an und speichert.
+    c.put("/webui/api/config", json={"model_categories": {
+        "light": [{"api_url": "http://mine", "model_name": "mine-m",
+                   "api_key": ""}]}})
+    r = c.get("/webui/api/config")
+    cats = r.json()["model_categories"]
+    assert cats["light"][0]["model_name"] == "mine-m"
+    # andere Kategorien bleiben leer
+    assert cats["strong"] == []
+    # Overlay enthaelft nur light, kein local
+    overlay = store.get_settings(u.id)
+    assert "light" in overlay["model_categories"]
+    assert "local" not in overlay["model_categories"]
+
+
+def test_admin_still_sees_all_baseline_models():
+    c = _client()
+    _with_token(c, _login_admin(c))
+    r = c.get("/webui/api/config")
+    cats = r.json()["model_categories"]
+    assert cats["light"][0]["model_name"] == "base-light"
