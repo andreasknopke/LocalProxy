@@ -142,3 +142,13 @@ def test_apply_config_file_without_admin_token_uses_config(monkeypatch):
     monkeypatch.setattr(proxy, "_webui_load_config", lambda: cfg)
     proxy._apply_config_file()
     assert proxy.PROXY_API_KEY == "localfox-aus-config"
+
+
+# ── Fallback ohne users-Modul (z.B. users.py fehlt im Deployment-Image) ───
+
+def test_admin_bootstrap_works_without_users_module(monkeypatch):
+    monkeypatch.setattr(proxy, "_USERS_AVAILABLE", False)
+    monkeypatch.setattr(proxy, "PROXY_API_KEY", "EraseTheMap!")
+    u = proxy._resolve_user("EraseTheMap!")
+    assert u is not None and u.is_admin and u.username == "admin"
+    assert proxy._resolve_user("falsch") is None

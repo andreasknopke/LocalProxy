@@ -7609,10 +7609,24 @@ def _get_bearer_token(request: Request) -> str:
     return ""
 
 
-def _admin_bootstrap_user() -> "_users.User":
+class _BootstrapAdmin:
+    """Minimal-Admin, falls das users-Modul nicht importierbar ist (z.B.
+    users.py fehlt im Deployment-Image). Gleiche Schnittmenge wie _users.User,
+    damit der Admin-Login/Bootstrap auch ohne Store funktioniert."""
+    id = 0
+    username = "admin"
+    is_admin = True
+    token_hash = ""
+    created_at = ""
+    settings = None
+
+
+def _admin_bootstrap_user():
     """Synthetischer Admin-User für den Legacy-PROXY_API_KEY (Bootstrap)."""
-    return _users.User(id=0, username="admin", is_admin=True,
-                       token_hash="", created_at="")
+    if _USERS_AVAILABLE:
+        return _users.User(id=0, username="admin", is_admin=True,
+                           token_hash="", created_at="")
+    return _BootstrapAdmin()
 
 
 def _resolve_user(token: str) -> Optional["_users.User"]:

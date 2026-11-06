@@ -141,6 +141,12 @@ def _session_user(token: str):
         return None
     um = _users_module()
     if um is None:
+        # users-Modul nicht importierbar (z.B. users.py fehlt im Image):
+        # Bootstrap-Admin (id=0) als Fallback, damit Admin-Sessions greifen.
+        if uid == 0:
+            pm = _live_proxy()
+            boot = getattr(pm, "_admin_bootstrap_user", None) if pm else None
+            return boot() if callable(boot) else None
         return None
     try:
         return um.get_store().get(uid)
