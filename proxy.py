@@ -7512,9 +7512,10 @@ def _effective_settings(user: Optional["_users.User"]) -> Dict[str, Any]:
     Sampling, Prompt-Injection, Co-Worker, Tools, Modelle außer local)
     dürfen pro User überschrieben werden.
 
-    Nicht-Admins erben KEINE globalen Modelle: Kategorien, die ihr Overlay
-    nicht definiert, werden leer gesetzt — zur Laufzeit greift dann der
-    Local-Fallback (siehe `_model_defs`)."""
+    Ein Benutzer, der noch NIE gespeichert hat (settings == None), erbt
+    KEINE globalen Modelle — coworker/light/strong/vision sind leer und
+    greifen zur Laufzeit auf 'local' zurück. Hat er bereits gespeichert,
+    bleibt sein Overlay-Stand unverändert erhalten."""
     base = _BASELINE_CONFIG or {}
     if user is None or user.is_admin:
         return copy.deepcopy(base)
@@ -7524,11 +7525,19 @@ def _effective_settings(user: Optional["_users.User"]) -> Dict[str, Any]:
         merged.setdefault("model_categories", {})["local"] = copy.deepcopy(
             base_cats["local"])
     user_cats = (user.settings or {}).get("model_categories")
-    for cat in merged.setdefault("model_categories", {}):
-        if cat == "local":
-            continue
-        if not (isinstance(user_cats, dict) and cat in user_cats):
-            merged["model_categories"][cat] = []
+    if isinstance(user_cats, dict):
+        # Eigenes Modellset massgeblich: Kategorien ohne eigene Eintraege
+        # sind leer (nicht aus der Baseline geerbt).
+        for cat in merged.setdefault("model_categories", {}):
+            if cat != "local" and cat not in user_cats:
+                merged["model_categories"][cat] = []
+    elif user.settings is None:
+        # Neuer User, noch gar nichts gespeichert: Baseline nicht erben.
+        for cat in merged.setdefault("model_categories", {}):
+            if cat != "local":
+                merged["model_categories"][cat] = []
+    # Sonst: Overlay ohne model_categories (vor der Umstellung gespeichert)
+    # -> Baseline bleibt unveraendert erhalten.
     return merged
 
 

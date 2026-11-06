@@ -271,6 +271,21 @@ def test_user_own_models_survive_save_and_reload():
     assert "local" not in overlay["model_categories"]
 
 
+def test_previously_saved_user_keeps_baseline_models():
+    """User, der frueher gespeichert hat (Overlay ohne model_categories),
+    sieht weiterhin die Baseline-Modelle — kein Blanketing mehr."""
+    store = users.get_store()
+    u = store.create_user("older")
+    store.set_settings(u.id, {"default_category": "light"})
+    c = _client()
+    tok = _login_user(c, "older", u._token).json()["token"]
+    _with_token(c, tok)
+    r = c.get("/webui/api/config")
+    cats = r.json()["model_categories"]
+    assert cats["light"][0]["model_name"] == "base-light"
+    assert cats["local"]["model_name"] == "local-m"
+
+
 def test_admin_still_sees_all_baseline_models():
     c = _client()
     _with_token(c, _login_admin(c))

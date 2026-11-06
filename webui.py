@@ -627,26 +627,36 @@ def _effective_config_for_user(user) -> Dict[str, Any]:
     """Globale Baseline ⊕ Benutzer-Overlay. 'local' kommt stets aus der
     Baseline (admin-only).
 
-    Nicht-Admins bekommen Kategorien, die ihr Overlay nicht definiert,
-    LEER angezeigt — neue User erben also nicht die globalen Modelle von
-    coworker/light/strong/vision. Leere Kategorien greifen zur Laufzeit
+    Ein Benutzer, der noch NIE gespeichert hat (Overlay == None), bekommt
+    die Kategorien coworker/light/strong/vision LEER angezeigt — er erbt
+    die globalen Modelle nicht. Hat er bereits gespeichert, bleibt sein
+    Stand unverändert erhalten; leere Kategorien greifen zur Laufzeit
     automatisch auf 'local' zurück."""
     base = _load_config()
     if user is None or getattr(user, "is_admin", False):
         return base
+    settings = getattr(user, "settings", None)
     merged = json.loads(json.dumps(base))
-    if getattr(user, "settings", None):
-        _deep_merge(merged, user.settings)
+    if settings:
+        _deep_merge(merged, settings)
     base_local = base.get("model_categories", {}).get("local")
     if base_local is not None:
         merged.setdefault("model_categories", {})["local"] = json.loads(
             json.dumps(base_local))
-    user_cats = (getattr(user, "settings", None) or {}).get("model_categories")
-    for cat in merged.setdefault("model_categories", {}):
-        if cat == "local":
-            continue
-        if not (isinstance(user_cats, dict) and cat in user_cats):
-            merged["model_categories"][cat] = []
+    user_cats = (settings or {}).get("model_categories")
+    if isinstance(user_cats, dict):
+        # Eigenes Modellset massgeblich: Kategorien, die der User nicht
+        # fuehrt, sind leer (nicht aus der Baseline geerbt).
+        for cat in merged.setdefault("model_categories", {}):
+            if cat != "local" and cat not in user_cats:
+                merged["model_categories"][cat] = []
+    elif settings is None:
+        # Neuer User, noch gar nichts gespeichert: Baseline nicht erben.
+        for cat in merged.setdefault("model_categories", {}):
+            if cat != "local":
+                merged["model_categories"][cat] = []
+    # Sonst: Overlay vorhanden, aber ohne model_categories (User, der vor
+    # dieser Umstellung gespeichert hat) -> Baseline bleibt unveraendert.
     return merged
 
 
@@ -679,7 +689,14 @@ def _overlay_from_submission(baseline: Dict[str, Any],
             if k in _ADMIN_ONLY_CATEGORY_KEYS:
                 mc.pop(k, None)
     result = diff(baseline, sub)
-    return result if isinstance(result, dict) else {}
+    if not isinstance(result, dict):
+        return {}
+    # model_categories unveraendlich uebernehmen: ein diff wuerde Kategorien,
+    # die dem Benutzer leer angezeigt werden, als "identisch zur Baseline"
+    # verwerfen und er haette sie beim naechsten Laden wieder.
+    if isinstance(sub.get("model_categories"), dict):
+        result["model_categories"] = sub["model_categories"]
+    return result
 
 
 _UNCHANGED = object()

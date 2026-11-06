@@ -126,6 +126,21 @@ def test_new_user_effective_settings_blank_categories():
     assert proxy._BASELINE_CONFIG["model_categories"]["light"][0]["model_name"] == "L"
 
 
+def test_saved_user_without_model_categories_keeps_baseline_models():
+    """User, der schon gespeichert hat (Overlay ohne model_categories),
+    darf NICHT seine geerbten Baseline-Modelle verlieren."""
+    u = _user_with({"default_category": "light"})
+    eff = proxy._effective_settings(u)
+    assert eff["model_categories"]["light"][0]["model_name"] == "L"
+
+
+def test_saved_user_with_empty_categories_stays_empty():
+    """User, der leere Kategorien ausdrucklich gespeichert hat, behaelt sie."""
+    u = _user_with({"model_categories": {"light": []}})
+    eff = proxy._effective_settings(u)
+    assert eff["model_categories"]["light"] == []
+
+
 def test_model_defs_falls_back_to_local_for_empty_category():
     u = _user_with(None)
     proxy._apply_user_settings(u)
