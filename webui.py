@@ -925,6 +925,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
   <div class="status">
     <span id="statusIndicator"><span class="status-dot" id="statusDot"></span><span id="statusText"></span></span>
     <small style="color:var(--text2)">Port <span id="proxyPort">9001</span></small>
+    <button class="btn btn-small" onclick="logout()" title="Abmelden">⎋ Abmelden</button>
   </div>
 </header>
 <nav>
@@ -2005,6 +2006,15 @@ document.querySelectorAll('nav button').forEach(btn => {
 });
 
 // ============ BENUTZER-VERWALTUNG ============
+async function logout() {
+  if (!confirm('Wirklich abmelden?')) return;
+  try {
+    await fetch('/webui/api/logout', {method: 'POST'});
+  } catch (e) { /* Cookie wird trotzdem geloescht */ }
+  document.cookie = 'webui_token=; path=/webui; max-age=0; SameSite=Lax';
+  window.location.href = '/webui/login';
+}
+
 async function checkAdminAndInitUsers() {
   try {
     const r = await fetch('/webui/api/me');
@@ -4352,10 +4362,12 @@ def create_webui_app() -> FastAPI:
                 "is_admin": bool(user.is_admin)}
 
     @webapp.post("/api/logout")
-    async def api_logout(request: Request):
+    async def api_logout(request: Request, response: Response):
         token = request.cookies.get(COOKIE_NAME) or ""
         if token:
             _remove_token(token)
+        # Cookie serverseitig entwerten, damit es auch ohne JS-Anteil greift.
+        response.delete_cookie(COOKIE_NAME, path="/webui")
         return {"status": "ok"}
 
     @webapp.get("/", response_class=HTMLResponse)

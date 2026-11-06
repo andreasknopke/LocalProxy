@@ -217,3 +217,16 @@ def test_non_admin_cannot_access_user_admin():
     _with_token(c, _login_user(c, "frank", u._token).json()["token"])
     r = c.get("/webui/api/users")
     assert r.status_code == 403
+
+
+def test_logout_invalidates_session():
+    c = _client()
+    tok = _login_admin(c)
+    # Session manuell als Cookie setzen (Login-Seite setzt per JS).
+    c.cookies.set(webui.COOKIE_NAME, tok, path="/webui")
+    assert c.get("/webui/api/me", follow_redirects=False).status_code == 200
+    assert c.get("/webui/api/me").json()["authenticated"] is True
+    r = c.post("/webui/api/logout")
+    assert r.status_code == 200
+    # Nach Logout: Session-Token entfernt -> Middleware leitet um (302).
+    assert c.get("/webui/api/me", follow_redirects=False).status_code == 302
