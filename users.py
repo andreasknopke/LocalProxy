@@ -201,6 +201,15 @@ class UserStore:
                 return None
         return token
 
+    def set_token(self, user_id: int, token: str) -> bool:
+        """Setzt den Token eines Benutzers explizit (Heal/Reparatur)."""
+        with self._lock, self._connect() as con:
+            cur = con.execute(
+                "UPDATE users SET token_hash = ? WHERE id = ?",
+                (hash_token(token), user_id),
+            )
+            return cur.rowcount > 0
+
     def delete_user(self, user_id: int) -> bool:
         with self._lock, self._connect() as con:
             cur = con.execute("DELETE FROM users WHERE id = ?", (user_id,))

@@ -171,6 +171,22 @@ def _authenticate(username: str, token: str):
     if not username or not token:
         return None
     pm = _live_proxy()
+    # Admin-Bootstrap: Der aktuelle globale PROXY_API-Key ist stets als Admin
+    # gueltig. Falls die Admin-Zeile im Store einen anderen (veralteten) Token
+    # haelt, heilen wir sie auf den aktuellen Key — sonst fuehrt Token-Drift
+    # ueber Neustarts hinweg dazu, dass der Admin-Token nicht mehr passt.
+    live_key = getattr(pm, "PROXY_API_KEY", "") if pm is not None else ""
+    if live_key and username == WEBUI_USERNAME and secrets.compare_digest(
+            token, live_key):
+        um = _users_module()
+        if um is not None:
+            try:
+                admin = um.get_store().ensure_admin(username, token=token)
+                if admin.token_hash != um.hash_token(token):
+                    um.get_store().set_token(admin.id, token)
+                return um.get_store().get_by_username(username) or admin
+            except Exception:
+                pass
     user = None
     resolver = getattr(pm, "_resolve_user", None) if pm is not None else None
     if resolver is not None:

@@ -55,6 +55,21 @@ def _with_token(client, token):
     return client
 
 
+def test_admin_login_heals_token_drift(monkeypatch):
+    # Admin-Zeile auf veralteten Token setzen, aktueller PROXY_API-Key weicht ab.
+    store = users.get_store()
+    admin = store.get_by_username("admin")
+    store.set_token(admin.id, "localfox-STALE")
+    monkeypatch.setattr(proxy, "PROXY_API_KEY", "localfox-CURRENT")
+    c = _client()
+    r = c.post("/webui/api/login",
+               json={"username": "admin", "password": "localfox-CURRENT"})
+    assert r.status_code == 200
+    assert webui._is_admin_session(r.json()["token"]) is True
+    # Store wurde auf den aktuellen Key geheilt.
+    assert store.get_by_token("localfox-CURRENT") is not None
+
+
 def test_legacy_password_login_rejected():
     # Der alte Login per WEBUI_PASSWORD existiert nicht mehr.
     c = _client()

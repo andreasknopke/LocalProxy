@@ -40,3 +40,7 @@ data/profiles/*
 # Logs
 *.log
 proxy.log
+
+# Laufzeitdaten (User-Store, I/O-Traces)
+data/users.db
+data/io_traces/
