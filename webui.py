@@ -106,12 +106,17 @@ else:
     _log("WebUI Login via SPARK_AUTH_USERNAME / SPARK_AUTH_PASSWORD")
 
 _active_tokens: Set[str] = set()
+# Session-Token -> Benutzer-ID. Erlaubt es, eine WebUI-Sitzung einem
+# bestimmten Benutzer (und damit dessen Einstellungen) zuzuordnen.
+_session_users: Dict[str, int] = {}
 COOKIE_NAME = "webui_token"
 
 
-def _generate_token() -> str:
+def _generate_token(user_id: Optional[int] = None) -> str:
     token = uuid.uuid4().hex + secrets.token_hex(16)
     _active_tokens.add(token)
+    if user_id is not None:
+        _session_users[token] = user_id
     return token
 
 
@@ -121,6 +126,35 @@ def _validate_token(token: str) -> bool:
 
 def _remove_token(token: str) -> None:
     _active_tokens.discard(token)
+    _session_users.pop(token, None)
+
+
+def _users_module():
+    """Liefert das users-Modul, wenn die Benutzer-Unterstuetzung verfuegbar ist."""
+    try:
+        import users as _users_mod
+        return _users_mod
+    except Exception:
+        return None
+
+
+def _session_user(token: str):
+    """User-Objekt fuer eine Session, oder None (anonym/Unbekannt)."""
+    uid = _session_users.get(token)
+    if uid is None:
+        return None
+    um = _users_module()
+    if um is None:
+        return None
+    try:
+        return um.get_store().get(uid)
+    except Exception:
+        return None
+
+
+def _is_admin_session(token: str) -> bool:
+    u = _session_user(token)
+    return bool(u and u.is_admin)
 
 
 LOGIN_HTML = """<!DOCTYPE html>
@@ -510,6 +544,66 @@ def _save_config(cfg: Dict[str, Any]) -> None:
     os.replace(tmp_path, CONFIG_PATH)
 
 
+# ── Benutzer-spezifische Einstellungen (Overlay) ──────────────────────────
+_ADMIN_ONLY_CATEGORY_KEYS = {"local"}
+
+
+def _current_user_from_request(request: Request):
+    """User-Objekt des aktuell angemeldeten Benutzers, oder None."""
+    token = request.cookies.get(COOKIE_NAME, "")
+    return _session_user(token)
+
+
+def _effective_config_for_user(user) -> Dict[str, Any]:
+    """Globale Baseline ⊕ Benutzer-Overlay. 'local' kommt stets aus der
+    Baseline (admin-only)."""
+    base = _load_config()
+    if user is None or not getattr(user, "settings", None):
+        return base
+    merged = json.loads(json.dumps(base))
+    _deep_merge(merged, user.settings)
+    base_local = base.get("model_categories", {}).get("local")
+    if base_local is not None:
+        merged.setdefault("model_categories", {})["local"] = json.loads(
+            json.dumps(base_local))
+    return merged
+
+
+def _overlay_from_submission(baseline: Dict[str, Any],
+                             submitted: Dict[str, Any]) -> Dict[str, Any]:
+    """Leitet aus einer eingereichten Konfiguration das minimale Overlay
+    gegen die Baseline ab. Admin-only-Kategorien (local) werden verworfen."""
+    def diff(base: Any, sub: Any) -> Any:
+        if isinstance(base, dict) and isinstance(sub, dict):
+            out: Dict[str, Any] = {}
+            for k, v in sub.items():
+                if k in _ADMIN_ONLY_CATEGORY_KEYS:
+                    continue
+                if k not in base:
+                    out[k] = v
+                else:
+                    d = diff(base[k], v)
+                    if d is not _UNCHANGED:
+                        out[k] = d
+            return out
+        if base != sub:
+            return sub
+        return _UNCHANGED
+
+    sub = json.loads(json.dumps(submitted))
+    # local-Kategorie aus dem Overlay entfernen (admin-only).
+    mc = sub.get("model_categories")
+    if isinstance(mc, dict):
+        for k in list(mc.keys()):
+            if k in _ADMIN_ONLY_CATEGORY_KEYS:
+                mc.pop(k, None)
+    result = diff(baseline, sub)
+    return result if isinstance(result, dict) else {}
+
+
+_UNCHANGED = object()
+
+
 def _deep_merge(base: Dict, override: Dict) -> None:
     for key, value in override.items():
         if key in base and isinstance(base[key], dict) and isinstance(value, dict):
@@ -771,6 +865,8 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
   <button data-section="tools">Tools</button>
   <button data-section="chat">Chat</button>
   <button data-section="logs">Logs</button>
+  <button data-section="account">Konto</button>
+  <button data-section="users" id="navUsers" style="display:none">Benutzer</button>
 </nav>
 <main>
 
@@ -1700,6 +1796,59 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
   </section>
 
   <!-- ====== SEKTION: LOGS ====== -->
+  <!-- ====== SEKTION: KONTO ====== -->
+  <section id="section-account">
+    <div class="card">
+      <h3>Mein Konto</h3>
+      <div class="form-group">
+        <label>Angemeldet als</label>
+        <div id="accountName" style="font-size:0.95rem">—</div>
+      </div>
+      <div class="form-group" style="margin-top:16px">
+        <label>Mein Bearer-Token</label>
+        <div class="hint" style="font-size:0.75rem;color:var(--text2);margin-bottom:8px">
+          Erneut der persoenliche Token erneuern. Der bisherige Token wird
+          sofort ungueltig — alle Clients muessen dann den neuen Token verwenden.
+        </div>
+        <button class="btn btn-primary" onclick="rotateOwnToken()">🔄 Meinen Token erneuern</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ====== SEKTION: BENUTZER (nur Admin) ====== -->
+  <section id="section-users">
+    <div class="card">
+      <h3>Benutzer verwalten</h3>
+      <div class="form-group" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+        <div style="flex:1;min-width:180px">
+          <label for="newUserName">Neuer Benutzername</label>
+          <input type="text" id="newUserName" placeholder="z.B. alice" autocomplete="off">
+        </div>
+        <button class="btn btn-primary" onclick="createUser()">+ Benutzer anlegen</button>
+      </div>
+      <div class="hint" style="font-size:0.75rem;color:var(--text2);margin-bottom:14px">
+        Beim Anlegen wird automatisch ein persoenlicher Bearer-Token erzeugt.
+        Token einmalig anzeigen und sicher weitergeben — er wird nur bei der
+        Anlage und beim Erneuern angezeigt.
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:0.85rem">
+        <thead>
+          <tr style="text-align:left;color:var(--text2);border-bottom:1px solid var(--border)">
+            <th style="padding:8px 6px">ID</th>
+            <th style="padding:8px 6px">Benutzername</th>
+            <th style="padding:8px 6px">Rolle</th>
+            <th style="padding:8px 6px">Eigene Einstellungen</th>
+            <th style="padding:8px 6px;text-align:right">Aktionen</th>
+          </tr>
+        </thead>
+        <tbody id="usersTableBody">
+          <tr><td colspan="5" style="padding:12px;color:var(--text2)">Lade Benutzer...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ====== SEKTION: LOGS ====== -->
   <section id="section-logs">
     <div class="card" style="padding:12px">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px">
@@ -1785,6 +1934,140 @@ document.querySelectorAll('nav button').forEach(btn => {
     document.getElementById('section-' + section).classList.add('active');
   });
 });
+
+// ============ BENUTZER-VERWALTUNG ============
+async function checkAdminAndInitUsers() {
+  try {
+    const r = await fetch('/webui/api/me');
+    if (!r.ok) return;
+    const me = await r.json();
+    const nav = document.getElementById('navUsers');
+    if (nav) nav.style.display = me.is_admin ? '' : 'none';
+    const nameEl = document.getElementById('accountName');
+    if (nameEl) nameEl.textContent = (me.username || '—') + (me.is_admin ? ' (admin)' : '');
+    if (me.is_admin) loadUsers();
+  } catch (e) { /* nicht kritisch */ }
+}
+
+async function rotateOwnToken() {
+  if (!confirm('Meinen Bearer-Token wirklich erneuern? Der bisherige Token wird sofort ungueltig.')) return;
+  try {
+    const r = await fetch('/webui/api/me/rotate', {method: 'POST'});
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      showToast('Erneuern fehlgeschlagen: ' + (err.detail || r.status), 'error');
+      return;
+    }
+    const data = await r.json();
+    showTokenDialog('Neuer Token — jetzt sicher aufbewahren', data.token);
+  } catch (e) {
+    showToast('Netzwerkfehler: ' + e.message, 'error');
+  }
+}
+
+async function loadUsers() {
+  const body = document.getElementById('usersTableBody');
+  if (!body) return;
+  try {
+    const r = await fetch('/webui/api/users');
+    if (!r.ok) {
+      body.innerHTML = '<tr><td colspan="5" style="padding:12px;color:#f85149">Kein Zugriff (' + r.status + ')</td></tr>';
+      return;
+    }
+    const data = await r.json();
+    if (!data.users || !data.users.length) {
+      body.innerHTML = '<tr><td colspan="5" style="padding:12px;color:var(--text2)">Keine Benutzer vorhanden.</td></tr>';
+      return;
+    }
+    body.innerHTML = data.users.map(u => `
+      <tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:8px 6px;color:var(--text2)">${u.id}</td>
+        <td style="padding:8px 6px">${escapeHtml(u.username)}</td>
+        <td style="padding:8px 6px">${u.is_admin ? '<span class="badge">admin</span>' : 'user'}</td>
+        <td style="padding:8px 6px">${u.has_settings ? 'ja' : '—'}</td>
+        <td style="padding:8px 6px;text-align:right">
+          <button class="btn-small" onclick="rotateUserToken(${u.id}, '${escapeHtml(u.username)}')">Token erneuern</button>
+          <button class="btn-small" onclick="deleteUser(${u.id}, '${escapeHtml(u.username)}')" title="Loeschen">🗑</button>
+        </td>
+      </tr>`).join('');
+  } catch (e) {
+    body.innerHTML = '<tr><td colspan="5" style="padding:12px;color:#f85149">Fehler: ' + e.message + '</td></tr>';
+  }
+}
+
+async function createUser() {
+  const nameEl = document.getElementById('newUserName');
+  const username = (nameEl.value || '').trim();
+  if (!username) { showToast('Bitte Benutzernamen eingeben', 'error'); return; }
+  try {
+    const r = await fetch('/webui/api/users', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username})
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      showToast('Anlegen fehlgeschlagen: ' + (err.detail || r.status), 'error');
+      return;
+    }
+    const data = await r.json();
+    nameEl.value = '';
+    showTokenDialog('Token für Benutzer "' + data.username + '"', data.token);
+    loadUsers();
+  } catch (e) {
+    showToast('Netzwerkfehler: ' + e.message, 'error');
+  }
+}
+
+async function rotateUserToken(id, username) {
+  if (!confirm('Bearer-Token für "' + username + '" wirklich erneuern? Der alte Token ist danach ungültig.')) return;
+  try {
+    const r = await fetch('/webui/api/users/' + id + '/rotate', {method: 'POST'});
+    if (!r.ok) { showToast('Erneuern fehlgeschlagen (' + r.status + ')', 'error'); return; }
+    const data = await r.json();
+    showTokenDialog('Neuer Token für "' + username + '"', data.token);
+  } catch (e) {
+    showToast('Netzwerkfehler: ' + e.message, 'error');
+  }
+}
+
+async function deleteUser(id, username) {
+  if (!confirm('Benutzer "' + username + '" wirklich loeschen?')) return;
+  try {
+    const r = await fetch('/webui/api/users/' + id, {method: 'DELETE'});
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      showToast('Loeschen fehlgeschlagen: ' + (err.detail || r.status), 'error');
+      return;
+    }
+    showToast('Benutzer geloescht', 'success');
+    loadUsers();
+  } catch (e) {
+    showToast('Netzwerkfehler: ' + e.message, 'error');
+  }
+}
+
+function showTokenDialog(title, token) {
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:9999';
+  overlay.innerHTML = `
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:24px;max-width:560px;width:90vw">
+      <h3 style="margin:0 0 12px;font-size:1rem">${escapeHtml(title)}</h3>
+      <div style="font-size:0.78rem;color:var(--text2);margin-bottom:8px">Jetzt kopieren — dieser Token wird danach nicht mehr angezeigt.</div>
+      <input type="text" readonly value="${escapeHtml(token)}" style="width:100%;padding:10px;font-family:monospace;font-size:0.8rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--accent)" onclick="this.select()">
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+        <button class="btn-small" onclick="navigator.clipboard.writeText(this.dataset.t).then(()=>showToast('Token kopiert','success'))" data-t="${escapeHtml(token)}">📋 Kopieren</button>
+        <button class="btn btn-primary" onclick="this.closest('div[style*=fixed]').remove()">Fertig</button>
+      </div>
+    </div>`;
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+  document.body.appendChild(overlay);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+document.addEventListener('DOMContentLoaded', checkAdminAndInitUsers);
 
 // ============ MODEL-TABS ============
 document.querySelectorAll('.model-tabs button').forEach(btn => {
@@ -3987,10 +4270,32 @@ def create_webui_app() -> FastAPI:
             data = await request.json()
         except Exception:
             raise HTTPException(status_code=400)
-        if data.get("username") != WEBUI_USERNAME or data.get("password") != WEBUI_PASSWORD:
-            raise HTTPException(status_code=401, detail="Ungueltige Anmeldedaten")
-        token = _generate_token()
-        return {"token": token, "redirect": "/webui/"}
+        username = str(data.get("username", ""))
+        password = str(data.get("password", ""))
+        # Admin-Login: vordefinierter Benutzer + WebUI-Passwort.
+        if username == WEBUI_USERNAME and WEBUI_PASSWORD and password == WEBUI_PASSWORD:
+            admin_id = None
+            um = _users_module()
+            if um is not None:
+                try:
+                    admin_id = um.get_store().ensure_admin(
+                        "admin", token=um.generate_token()).id
+                except Exception:
+                    admin_id = None
+            token = _generate_token(admin_id)
+            return {"token": token, "redirect": "/webui/", "is_admin": True}
+        # Benutzer-Login: Passwort == persoenlicher Bearer-Token.
+        um = _users_module()
+        if um is not None:
+            try:
+                user = um.get_store().get_by_token(password)
+            except Exception:
+                user = None
+            if user is not None and user.username == username:
+                token = _generate_token(user.id)
+                return {"token": token, "redirect": "/webui/",
+                        "is_admin": bool(user.is_admin)}
+        raise HTTPException(status_code=401, detail="Ungueltige Anmeldedaten")
 
     @webapp.post("/api/logout")
     async def api_logout(request: Request):
@@ -4004,8 +4309,9 @@ def create_webui_app() -> FastAPI:
         return DASHBOARD_HTML
 
     @webapp.get("/api/config")
-    async def get_config():
-        cfg = _load_config()
+    async def get_config(request: Request):
+        user = _current_user_from_request(request)
+        cfg = _effective_config_for_user(user)
         # API keys maskieren
         for key in ("local", "coworker", "light", "strong", "vision"):
             cat = cfg.get("model_categories", {}).get(key)
@@ -4024,9 +4330,40 @@ def create_webui_app() -> FastAPI:
         except Exception:
             raise HTTPException(status_code=400, detail="Ungueltiges JSON")
 
-        current = _load_config()
+        user = _current_user_from_request(request)
+        is_admin = bool(user and user.is_admin)
 
-        # API-Keys: wenn maskiert (enthaelt bullet), alten Wert behalten
+        if is_admin:
+            # Admin: schreibt die globale Baseline (config.json).
+            current = _load_config()
+            _preserve_masked_keys(current, new_cfg)
+            _deep_merge(current, new_cfg)
+            _save_config(current)
+            _reload_proxy_config()
+            return JSONResponse(content={
+                "status": "ok", "scope": "global",
+                "message": "Globale Config gespeichert + Proxy neu geladen"})
+
+        # Benutzer: nur Overlay gegen Baseline speichern, kein globaler Reload.
+        if user is None:
+            raise HTTPException(status_code=403,
+                                detail="Kein Benutzer — nur Admin darf speichern")
+        baseline = _load_config()
+        _preserve_masked_keys(baseline, new_cfg)
+        overlay = _overlay_from_submission(baseline, new_cfg)
+        um = _users_module()
+        if um is None:
+            raise HTTPException(status_code=503, detail="Benutzer-Store nicht verfuegbar")
+        try:
+            um.get_store().set_settings(user.id, overlay)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Overlay-Speichern fehlgeschlagen: {e}")
+        return JSONResponse(content={
+            "status": "ok", "scope": "user",
+            "message": "Persoenliche Einstellungen gespeichert"})
+
+    def _preserve_masked_keys(current: Dict[str, Any], new_cfg: Dict[str, Any]) -> None:
+        """Maskierte (bullet) API-Keys durch die echten Werte ersetzen."""
         for key in ("local", "coworker", "light", "strong", "vision"):
             nc = new_cfg.get("model_categories", {}).get(key)
             cc = current.get("model_categories", {}).get(key)
@@ -4042,15 +4379,90 @@ def create_webui_app() -> FastAPI:
                 if "\u2022" in str(nc.get("api_key", "")):
                     nc["api_key"] = cc.get("api_key", "")
 
-        _deep_merge(current, new_cfg)
-        _save_config(current)
-        _reload_proxy_config()
-        return JSONResponse(content={"status": "ok", "message": "Config gespeichert + Proxy-Config neu geladen"})
-
     @webapp.post("/api/restart")
     async def api_restart():
         _trigger_restart()
         return JSONResponse(content={"status": "ok", "message": "Neustart eingeleitet"})
+
+    @webapp.get("/api/me")
+    async def api_me(request: Request):
+        user = _current_user_from_request(request)
+        return JSONResponse(content={
+            "username": user.username if user else None,
+            "is_admin": bool(user and user.is_admin),
+            "authenticated": user is not None,
+        })
+
+    @webapp.post("/api/me/rotate")
+    async def api_rotate_own_token(request: Request):
+        """Erneuert den Bearer-Token des angemeldeten Benutzers selbst."""
+        user = _current_user_from_request(request)
+        if user is None:
+            raise HTTPException(status_code=403, detail="Kein Benutzer angemeldet")
+        um = _users_module()
+        if um is None:
+            raise HTTPException(status_code=503, detail="Benutzer-Store nicht verfuegbar")
+        new_token = um.get_store().rotate_token(user.id)
+        if new_token is None:
+            raise HTTPException(status_code=404, detail="Benutzer nicht gefunden")
+        return JSONResponse(content={"status": "ok", "token": new_token})
+
+    # ── Benutzer-Verwaltung (nur Admin) ────────────────────────────────────
+    def _require_admin(request: Request):
+        if not _is_admin_session(request.cookies.get(COOKIE_NAME, "")):
+            raise HTTPException(status_code=403, detail="Nur Admin")
+        um = _users_module()
+        if um is None:
+            raise HTTPException(status_code=503, detail="Benutzer-Store nicht verfuegbar")
+        return um
+
+    @webapp.get("/api/users")
+    async def api_list_users(request: Request):
+        um = _require_admin(request)
+        users_list = [{
+            "id": u.id,
+            "username": u.username,
+            "is_admin": bool(u.is_admin),
+            "has_settings": bool(u.settings),
+        } for u in um.get_store().list_users()]
+        return JSONResponse(content={"users": users_list})
+
+    @webapp.post("/api/users")
+    async def api_create_user(request: Request):
+        um = _require_admin(request)
+        try:
+            data = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400)
+        username = str(data.get("username", "")).strip()
+        if not username:
+            raise HTTPException(status_code=400, detail="username erforderlich")
+        try:
+            u = um.get_store().create_user(username)
+        except Exception as e:
+            raise HTTPException(status_code=409, detail=f"Benutzer konnte nicht angelegt werden: {e}")
+        return JSONResponse(content={
+            "id": u.id, "username": u.username, "token": u._token,
+            "is_admin": bool(u.is_admin)})
+
+    @webapp.post("/api/users/{user_id}/rotate")
+    async def api_rotate_token(request: Request, user_id: int):
+        um = _require_admin(request)
+        new_token = um.get_store().rotate_token(user_id)
+        if new_token is None:
+            raise HTTPException(status_code=404, detail="Benutzer nicht gefunden")
+        return JSONResponse(content={"id": user_id, "token": new_token})
+
+    @webapp.delete("/api/users/{user_id}")
+    async def api_delete_user(request: Request, user_id: int):
+        um = _require_admin(request)
+        me = _current_user_from_request(request)
+        if me is not None and me.id == user_id:
+            raise HTTPException(status_code=400, detail="Sich selbst kann man nicht loeschen")
+        ok = um.get_store().delete_user(user_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Benutzer nicht gefunden")
+        return JSONResponse(content={"status": "ok"})
 
     @webapp.post("/api/test-endpoint")
     async def api_test_endpoint(request: Request):

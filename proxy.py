@@ -175,6 +175,14 @@ try:
 except Exception:
     _WEBUI_AVAILABLE = False
 
+# ── Benutzer-Verwaltung (pro-Bearer-Token) ─────────────────────────────────
+try:
+    import users as _users
+    _USERS_AVAILABLE = True
+except Exception:
+    _users = None  # type: ignore
+    _USERS_AVAILABLE = False
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Konfiguration ── Zero-Config-Startwerte, via config.json + Env ueberschreibbar
 # ═══════════════════════════════════════════════════════════════════════════
@@ -267,9 +275,31 @@ COOLDOWN_FILE: Path = Path(os.getenv("COOLDOWN_FILE", str(Path(__file__).parent 
 COOLDOWN_DEFAULT_SECONDS: float = float(os.getenv("COOLDOWN_DEFAULT_SECONDS", "300"))
 
 
+def _model_categories() -> Dict[str, Any]:
+    """Model-Kategorien fuer den AKTUELLEN Request.
+
+    Ohne aktiven Context: das Module-Global `_MODEL_CATEGORIES` (Baseline).
+    Mit Context: Baseline⊕User-Overlay, wobei 'local' stets aus der Baseline
+    stammt (admin-only)."""
+    ctx = globals().get("_ctx_settings")
+    cfg = ctx.get() if ctx is not None else None
+    if cfg is None:
+        return _MODEL_CATEGORIES
+    cats = cfg.get("model_categories")
+    if not isinstance(cats, dict):
+        return _MODEL_CATEGORIES
+    return cats
+
+
+def _default_category() -> str:
+    """Standard-Kategorie fuer den AKTUELLEN Request (User-Overlay, sonst
+    Module-Global)."""
+    return str(_cfg_get("default_category", default=DEFAULT_CATEGORY))
+
+
 def _model_defs(category: str) -> List[Dict[str, Any]]:
     """Gibt Liste von Modell-Definitionen fuer eine Kategorie zurueck."""
-    cat = _MODEL_CATEGORIES.get(category)
+    cat = _model_categories().get(category)
     if isinstance(cat, list):
         return [d for d in cat if isinstance(d, dict) and d.get("api_url") and d.get("model_name")]
     if isinstance(cat, dict) and cat.get("api_url"):
@@ -1186,7 +1216,20 @@ def _apply_config_file() -> None:
         if al_prompt:
             LOCAL_ANTI_LOOP_SYSTEM_PROMPT = str(al_prompt)
 
+    _capture_baseline(cfg)
     _log("Config aus config.json neu geladen")
+
+
+# Globale Baseline-Konfiguration. Wird von _apply_config_file beim Startup und
+# bei jedem WebUI-Save neu gesetzt. Dient als Ausgangspunkt fuer die
+# benutzerspezifische Ueberlagerung (_effective_settings).
+_BASELINE_CONFIG: Dict[str, Any] = {}
+
+
+def _capture_baseline(cfg: Dict[str, Any]) -> None:
+    """Zieht eine tiefe Kopie der geladenen Konfiguration als Baseline."""
+    global _BASELINE_CONFIG
+    _BASELINE_CONFIG = copy.deepcopy(cfg)
 
 
 _apply_config_file()
@@ -1423,7 +1466,7 @@ def _coworker_enabled_effective() -> bool:
     override = _ctx_coworker_override.get()
     if override is not None:
         return override
-    return COWORKER_ENABLED
+    return _coworker_enabled_flag()
 
 
 def _strip_coworker_switch_flags_from_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -3438,7 +3481,7 @@ def _patch_thinking_mode_payload(payload: Dict[str, Any]) -> None:
       - "passthrough" -> Reasoning-Werte des Requests bleiben unveraendert
       - sonst         -> reasoning_effort=<mode> + enable_thinking=true
     """
-    mode = LOCAL_THINKING_MODE
+    mode = str(_local_sampling("thinking_mode", LOCAL_THINKING_MODE)).strip().lower()
     if mode not in _VALID_THINKING_MODES:
         return
     if mode == "passthrough":
@@ -3541,29 +3584,37 @@ def _patch_local_sampling_payload(payload: Dict[str, Any]) -> None:
       DRY: multiplier=0.8, base=1.75, allowed_length=3, penalty_last_n=-1
       chat_template_kwargs: enable_thinking=true, preserve_thinking=true
     """
-    payload["temperature"] = LOCAL_TEMPERATURE
-    payload["top_p"] = LOCAL_TOP_P
-    payload["top_k"] = LOCAL_TOP_K
-    payload["min_p"] = LOCAL_MIN_P
+    _ls_get = _local_sampling
+    _temp = _ls_get("temperature", LOCAL_TEMPERATURE)
+    _top_p = _ls_get("top_p", LOCAL_TOP_P)
+    _top_k = _ls_get("top_k", LOCAL_TOP_K)
+    _min_p = _ls_get("min_p", LOCAL_MIN_P)
+    payload["temperature"] = _temp
+    payload["top_p"] = _top_p
+    payload["top_k"] = _top_k
+    payload["min_p"] = _min_p
 
     # DRY-Parameter (llama.cpp / vLLM kompatibel)
-    if LOCAL_DRY_MULTIPLIER > 0:
-        payload["dry_multiplier"] = LOCAL_DRY_MULTIPLIER
-        payload["dry_base"] = LOCAL_DRY_BASE
-        payload["dry_allowed_length"] = LOCAL_DRY_ALLOWED_LENGTH
-        payload["dry_penalty_last_n"] = LOCAL_DRY_PENALTY_LAST_N
-        payload["dry_sequence_breaker"] = LOCAL_DRY_SEQUENCE_BREAKER
+    _dry_mult = _ls_get("dry_multiplier", LOCAL_DRY_MULTIPLIER)
+    if _dry_mult > 0:
+        payload["dry_multiplier"] = _dry_mult
+        payload["dry_base"] = _ls_get("dry_base", LOCAL_DRY_BASE)
+        payload["dry_allowed_length"] = _ls_get("dry_allowed_length", LOCAL_DRY_ALLOWED_LENGTH)
+        payload["dry_penalty_last_n"] = _ls_get("dry_penalty_last_n", LOCAL_DRY_PENALTY_LAST_N)
+        payload["dry_sequence_breaker"] = _ls_get("dry_sequence_breaker", LOCAL_DRY_SEQUENCE_BREAKER)
 
     # chat_template_kwargs (vLLM / llama.cpp --jinja)
+    _enable_thinking = _ls_get("enable_thinking", LOCAL_ENABLE_THINKING)
+    _preserve_thinking = _ls_get("preserve_thinking", LOCAL_PRESERVE_THINKING)
     payload["chat_template_kwargs"] = {
-        "enable_thinking": LOCAL_ENABLE_THINKING,
-        "preserve_thinking": LOCAL_PRESERVE_THINKING,
+        "enable_thinking": _enable_thinking,
+        "preserve_thinking": _preserve_thinking,
     }
 
-    _log(f"Local-Sampling: temp={LOCAL_TEMPERATURE}, top_p={LOCAL_TOP_P}, "
-         f"top_k={LOCAL_TOP_K}, min_p={LOCAL_MIN_P}, "
-         f"dry_mult={LOCAL_DRY_MULTIPLIER}, dry_base={LOCAL_DRY_BASE}, "
-         f"thinking={LOCAL_ENABLE_THINKING}, preserve={LOCAL_PRESERVE_THINKING}")
+    _log(f"Local-Sampling: temp={_temp}, top_p={_top_p}, "
+         f"top_k={_top_k}, min_p={_min_p}, "
+         f"dry_mult={_dry_mult}, dry_base={_ls_get('dry_base', LOCAL_DRY_BASE)}, "
+         f"thinking={_enable_thinking}, preserve={_preserve_thinking}")
 
 
 # ── Qwen-Anti-Loop-Sampling ────────────────────────────────────────────────
@@ -4506,7 +4557,7 @@ async def _coworker_health_loop() -> None:
             # KEIN periodischer Probe (siehe Docstring). Nur TTL-Cleanup der
             # Hintergrund-Tasks, damit abgelaufene running-Tasks geraeumt werden.
             # Fork-Join: TTL-Cleanup der Hintergrund-Tasks mit inline ziehen
-            if COWORKER_FORK_JOIN and _COWORKER_BG_TASKS:
+            if _cw("enable_fork_join", COWORKER_FORK_JOIN) and _COWORKER_BG_TASKS:
                 _cleanup_bg_tasks()
         except asyncio.CancelledError:
             return
@@ -4637,7 +4688,7 @@ def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
         # davon unberuehrt (sie zaehlen pro Response, nicht gegen die
         # tools-Liste) — Client-Ausfuehrung bleibt korrekt.
         prepend: List[Dict[str, Any]] = [copy.deepcopy(_COWORKER_TOOL_DEF)]
-        if COWORKER_FORK_JOIN:
+        if _cw("enable_fork_join", COWORKER_FORK_JOIN):
             if _COWORKER_DISPATCH_TOOL_NAME not in existing:
                 d = copy.deepcopy(_COWORKER_DISPATCH_TOOL_DEF)
                 # Wahrheitsgetreue Kapazitaets-/Pipeline-Info an die
@@ -4691,7 +4742,7 @@ def _inject_coworker_tool(payload: Dict[str, Any]) -> bool:
                         "content": guidance_text,
                     })
     _log(f"Co-Worker-Tools injiziert (Health-OK"
-         f"{', Fork-Join' if COWORKER_FORK_JOIN else ''}"
+         f"{', Fork-Join' if _cw('enable_fork_join', COWORKER_FORK_JOIN) else ''}"
          f"{', Guidance' if COWORKER_TEACH_DELEGATION else ''})")
     return True
 
@@ -5338,8 +5389,8 @@ async def _cw_stream_round(sess: Dict[str, Any], queue: asyncio.Queue,
     header_sent = False
     # Loop-Guard auch auf den Co-Worker-Output: separate Guards fuer reasoning
     # und content (der Co-Worker hat einen eigenen Backend-Stream).
-    cw_reason_guard = _TextLoopGuard(enabled=LOOP_GUARD_ENABLED)
-    cw_content_guard = _TextLoopGuard(enabled=LOOP_GUARD_ENABLED)
+    cw_reason_guard = _TextLoopGuard(enabled=_loop_guard_enabled())
+    cw_content_guard = _TextLoopGuard(enabled=_loop_guard_enabled())
     cw_loop_hit: Optional[Dict[str, Any]] = None
     # Auch der Co-Worker kann Tool-Calls als Markup in den content schreiben
     # (Tool-loser Subagent) — Shield + Reparatur wie beim Hauptmodell.
@@ -6165,7 +6216,7 @@ async def _delegation_loop(body: Dict[str, Any], category: str,
         dispatch_calls, collect_calls, ask_calls, other_calls = _partition_tool_calls(tool_calls)
         coworker_calls = ask_calls
         # ── Deterministische Verteilung: manage_todo_list → Co-Worker ──
-        if (COWORKER_AUTO_DISPATCH and _coworker_active() and COWORKER_FORK_JOIN
+        if (COWORKER_AUTO_DISPATCH and _coworker_active() and _cw("enable_fork_join", COWORKER_FORK_JOIN)
                 and _COWORKER_HEALTH_CACHE.get("reachable", False)):
             todo_titles = _extract_not_started_todos(other_calls)
             if todo_titles:
@@ -6381,7 +6432,7 @@ def _detect_text_loop(text: str, channel: str = "content") -> Optional[Dict[str,
     """Prueft einen fertigen Text (non-streaming Antwort) auf Wiederholungen.
     Gibt das Loop-dict zurueck oder None. Fuer Cloud-Kategorien und den
     2-Pass-Pfad, wo kein inkrementeller Stream-Guard laeuft."""
-    if not LOOP_GUARD_ENABLED or not text:
+    if not _loop_guard_enabled() or not text:
         return None
     g = _TextLoopGuard(enabled=True)
     # In groesseren Bloecken fuettern, damit Satz-/Absatzgrenzen erkannt werden.
@@ -6406,11 +6457,11 @@ async def _outcome_with_loop_guard(body: Dict[str, Any], category: str,
         return await _call_model_with_fallbacks(body, category, force_start_idx=force_start_idx)
 
     outcome = await _call()
-    if (not LOOP_GUARD_ENABLED or LOOP_GUARD_MODE != "restart"
-            or LOOP_GUARD_MAX_RESTARTS <= 0):
+    if (not _loop_guard_enabled() or _loop_guard_mode() != "restart"
+            or _loop_guard_max_restarts() <= 0):
         return outcome
 
-    for _ in range(LOOP_GUARD_MAX_RESTARTS):
+    for _ in range(_loop_guard_max_restarts()):
         result = outcome.get("result", {}) or {}
         if result.get("tool_calls"):
             return outcome
@@ -6418,7 +6469,7 @@ async def _outcome_with_loop_guard(body: Dict[str, Any], category: str,
         hit = _detect_text_loop(content, "content")
         if not hit:
             return outcome
-        hint = LOOP_GUARD_HINT.format(kind=hit.get("kind", "text"),
+        hint = _loop_guard_hint().format(kind=hit.get("kind", "text"),
                                       count=hit.get("count", LOOP_GUARD_REPEATS))
         msgs = body.get("messages")
         if isinstance(msgs, list):
@@ -7374,6 +7425,18 @@ async def _lifespan(app: FastAPI):
     _log(f"   Debug:   {'enabled' if DEBUG_ENABLED else 'disabled'}")
     _log(f"   Tool-Cap: {TOOL_RESULT_CAP if TOOL_RESULT_CAP > 0 else 'off'}")
 
+    # Benutzer-Store initialisieren + Admin-Bootstrap.
+    # Der Legacy-PROXY_API_KEY bleibt als Admin-Bootstrap gültig; zusätzlich
+    # wird ein Admin-Datensatz angelegt, damit die Benutzerverwaltung greift.
+    if _USERS_AVAILABLE:
+        try:
+            _store = _users.get_store()
+            _store.ensure_admin("admin", token=PROXY_API_KEY or _users.generate_token())
+            _log(f"   Users:   {len(_store.list_users())} Benutzer, "
+                 f"Store={_users.get_store().path}")
+        except Exception as exc:
+            _log(f"   Users:   NICHT verfügbar ({exc})")
+
     # Co-Worker-Health-Loop starten (Startup-Probe + periodischer Check)
     _spawn(_coworker_health_loop())
 
@@ -7392,6 +7455,138 @@ async def _lifespan(app: FastAPI):
 
 
 # ── Auth ───────────────────────────────────────────────────────────────────
+# Kontext des aktuell authentifizierten Benutzers. None = kein User aufgelöst
+# (Auth deaktiviert oder Bootstrap-Pfad). Alle benutzerspezifischen Pfade
+# (Modelle, Co-Worker, Loop-Guard, Sampling, Prompt-Injection) lesen darüber.
+_ctx_user: contextvars.ContextVar[Optional["_users.User"]] = contextvars.ContextVar(
+    "_ctx_user", default=None)
+
+# Effektive Einstellungen des aktuellen Requests. None = Baseline (kein User
+# aufgelöst / Auth deaktiviert). Entsteht aus _BASELINE_CONFIG ⊕ User-Overlay.
+_ctx_settings: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+    "_ctx_settings", default=None)
+
+
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Tiefer Merge ohne Seiteneffekte auf base/override. Dicts werden
+    rekursiv verschmolzen, alle übrigen Werte überschreiben."""
+    out = copy.deepcopy(base)
+    for key, val in override.items():
+        if isinstance(val, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], val)
+        else:
+            out[key] = copy.deepcopy(val)
+    return out
+
+
+def _effective_settings(user: Optional["_users.User"]) -> Dict[str, Any]:
+    """Baseline ⊕ User-Overlay. Die Kategorie 'local' wird IMMER aus der
+    Baseline übernommen — lokale Modelle sind admin-only und machen
+    benutzerspezifisch keinen Sinn. Alle übrigen Einstellungen (Loop-Guard,
+    Sampling, Prompt-Injection, Co-Worker, Tools, Modelle außer local)
+    dürfen pro User überschrieben werden."""
+    base = _BASELINE_CONFIG or {}
+    if user is None or not user.settings:
+        return copy.deepcopy(base)
+    merged = _deep_merge(base, user.settings)
+    base_cats = base.get("model_categories")
+    if isinstance(base_cats, dict) and "local" in base_cats:
+        merged.setdefault("model_categories", {})["local"] = copy.deepcopy(
+            base_cats["local"])
+    return merged
+
+
+def _apply_user_settings(user: Optional["_users.User"]) -> None:
+    """Setzt den Settings-Context auf die effektiven Werte des Benutzers.
+
+    Ohne Benutzer (oder ohne benutzerdefinierte Einstellungen) bleibt der
+    Context leer, damit alle Zugriffe auf die Module-Globals (die globale
+    Baseline) zurueckfallen — identisches Verhalten wie vor der
+    Benutzer-Einfuehrung."""
+    if user is None or not user.settings:
+        _ctx_settings.set(None)
+        return
+    _ctx_settings.set(_effective_settings(user))
+
+
+def _cfg_get(*path: str, default: Any = None) -> Any:
+    """Liest einen Wert aus den effektiven Einstellungen des aktuellen
+    Requests.
+
+    Ohne aktiven Request-Context (kein Benutzer, z.B. Startup, Hintergrund-
+    Tasks, Tests, die Module-Globals direkt setzen) wird `default`
+    zurückgegeben — die Aufrufer übergeben das Module-Global als default,
+    wodurch das bisherige Global-Verhalten unverändert erhalten bleibt.
+    Mit aktivem Context wird der Wert aus der Baseline⊕User-Overlay-Menge
+    gelesen; fehlt er dort, greift ebenfalls `default`."""
+    ctx = globals().get("_ctx_settings")
+    cfg = ctx.get() if ctx is not None else None
+    if cfg is None:
+        return default
+    cur: Any = cfg
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
+
+
+def _current_user() -> Optional["_users.User"]:
+    return _ctx_user.get()
+
+
+def _is_admin_user() -> bool:
+    u = _ctx_user.get()
+    return bool(u and u.is_admin)
+
+
+# ── Pipeline-Einstellungs-Zugriff ──────────────────────────────────────────
+# Liest benutzerspezifische Werte aus dem Request-Context, mit Rueckfall auf
+# das Module-Global (Baseline). So bleiben bestehende Global-basierte Pfade
+# und Tests unveraendert lauffaehig, waehrend aktive Benutzer ihre eigenen
+# Werte bekommen.
+def _tg(name: str, default: Any) -> Any:
+    """tokens.<name> aus effektiven Einstellungen, sonst default."""
+    v = _cfg_get("tokens", name)
+    return default if v is None else v
+
+
+def _cw(name: str, default: Any) -> Any:
+    """tokens.coworker.<name> aus effektiven Einstellungen, sonst default."""
+    v = _cfg_get("tokens", "coworker", name)
+    return default if v is None else v
+
+
+def _ls(name: str, default: Any) -> Any:
+    """tokens.local_sampling.<name> aus effektiven Einstellungen, sonst default."""
+    v = _cfg_get("tokens", "local_sampling", name)
+    return default if v is None else v
+
+
+def _loop_guard_enabled() -> bool:
+    return bool(_tg("loop_guard_enabled", LOOP_GUARD_ENABLED))
+
+
+def _loop_guard_mode() -> str:
+    return str(_tg("loop_guard_mode", LOOP_GUARD_MODE))
+
+
+def _loop_guard_max_restarts() -> int:
+    return int(_tg("loop_guard_max_restarts", LOOP_GUARD_MAX_RESTARTS))
+
+
+def _loop_guard_hint() -> str:
+    return str(_tg("loop_guard_hint", LOOP_GUARD_HINT))
+
+
+def _coworker_enabled_flag() -> bool:
+    return bool(_cw("enabled", COWORKER_ENABLED))
+
+
+def _local_sampling(name: str, default: Any) -> Any:
+    return _ls(name, default)
+
+
 def _get_bearer_token(request: Request) -> str:
     authorization = request.headers.get("authorization", "")
     if authorization.lower().startswith("bearer "):
@@ -7399,28 +7594,59 @@ def _get_bearer_token(request: Request) -> str:
     return ""
 
 
+def _admin_bootstrap_user() -> "_users.User":
+    """Synthetischer Admin-User für den Legacy-PROXY_API_KEY (Bootstrap)."""
+    return _users.User(id=0, username="admin", is_admin=True,
+                       token_hash="", created_at="")
+
+
+def _resolve_user(token: str) -> Optional["_users.User"]:
+    """Löst einen Bearer-Token zu einem Benutzer auf.
+
+    Priorität:
+      1. PROXY_API_KEY (Legacy/Bootstrap) → Admin.
+      2. Benutzer-Store (SHA-256-Hash-Vergleich).
+    Gibt None zurück, wenn der Token keinem Benutzer gehört.
+    """
+    if not token:
+        return None
+    if PROXY_API_KEY and secrets.compare_digest(token, PROXY_API_KEY):
+        return _admin_bootstrap_user()
+    if _USERS_AVAILABLE:
+        try:
+            return _users.get_store().get_by_token(token)
+        except Exception as exc:  # pragma: no cover - Store defekt
+            _log(f"Benutzer-Store nicht erreichbar: {exc}")
+    return None
+
+
 def _is_authorized(request: Request) -> bool:
     if not PROXY_AUTH_ENABLED:
         return True
-    token = _get_bearer_token(request)
-    return bool(token and secrets.compare_digest(token, PROXY_API_KEY))
+    return _resolve_user(_get_bearer_token(request)) is not None
 
 
 async def _auth_or_raise(request: Request) -> None:
     if not PROXY_AUTH_ENABLED:
         _log(f"AUTH-SKIP (auth disabled) path={request.url.path}")
+        _ctx_user.set(None)
+        _apply_user_settings(None)
         return
     token = _get_bearer_token(request)
     if not token:
         _log(f"AUTH-FAIL kein Token path={request.url.path}")
         raise HTTPException(status_code=401, detail="Unauthorized — kein Bearer-Token",
                            headers={"WWW-Authenticate": "Bearer"})
-    if not secrets.compare_digest(token, PROXY_API_KEY):
-        _log(f"AUTH-FAIL falscher Token path={request.url.path} "
-             f"got={_truncate_key(token)} expected={_truncate_key(PROXY_API_KEY)}")
-        raise HTTPException(status_code=401, detail="Unauthorized — falscher Proxy-API-Key",
+    user = _resolve_user(token)
+    if user is None:
+        _log(f"AUTH-FAIL unbekannter Token path={request.url.path} "
+             f"got={_truncate_key(token)}")
+        raise HTTPException(status_code=401, detail="Unauthorized — ungültiger Token",
                            headers={"WWW-Authenticate": "Bearer"})
-    _log(f"AUTH-OK path={request.url.path}")
+    _ctx_user.set(user)
+    _apply_user_settings(user)
+    _log(f"AUTH-OK path={request.url.path} user={user.username}"
+         f"{' (admin)' if user.is_admin else ''}")
 
 
 def _find_category_in_messages(messages: Sequence[Dict[str, Any]], default: str) -> str:
@@ -7511,20 +7737,21 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
         if ident_idx > 0:
             force_start_idx = ident_idx
     elif identifier:
+        _default_cat = _default_category()
         _log(f"Identifier '{identifier}' unbekannt → Fallback "
-             f"{flag_category or DEFAULT_CATEGORY}")
+             f"{flag_category or _default_cat}")
         category = flag_category or (
-            _find_category_in_messages(msgs, DEFAULT_CATEGORY)
-            if _is_tool_continuation(msgs) else DEFAULT_CATEGORY)
+            _find_category_in_messages(msgs, _default_cat)
+            if _is_tool_continuation(msgs) else _default_cat)
     elif flag_category:
         # Flag in der aktuellen Message → explizite Wahl
         category = flag_category
     elif _is_tool_continuation(msgs):
         # Tool-Continuation: Flag in der Nachrichten-Historie suchen
-        category = _find_category_in_messages(msgs, DEFAULT_CATEGORY)
+        category = _find_category_in_messages(msgs, _default_category())
     else:
         # Neuer Request ohne Flag: Default
-        category = DEFAULT_CATEGORY
+        category = _default_category()
 
     # Slot-Nummer aus Prompt-Flag (--light 2) schlaegt den Identifier-Slot
     # (explizite Eingabe im aktuellen Turn gewinnt).
@@ -7594,7 +7821,7 @@ async def _handle_chat_completion(body: Dict[str, Any]) -> JSONResponse | Stream
     # Notiz beschallt und kann seine eigene Todo-Kette nicht mehr abarbeiten
     # (beobachtet 2026-08-29: 839 chars in JEDEM Turn, Turns 09:13-09:20).
     # Notiz erscheint pro (task_id, status)-Kombination genau einmal.
-    if (category == "local" and _coworker_active() and COWORKER_FORK_JOIN
+    if (category == "local" and _coworker_active() and _cw("enable_fork_join", COWORKER_FORK_JOIN)
             and _COWORKER_BG_TASKS):
         status = _coworker_status_line()
         if status:
@@ -8564,10 +8791,11 @@ async def _stream_backend_turn(body: Dict[str, Any], category: str,
     # Modell-agnostische Erkennung von Satz-/Absatz-/N-Gramm-Wiederholungen
     # im laufenden Stream. Ein Treffer bricht den Backend-Stream intern ab
     # und startet einen Folgeturn mit Anti-Loop-Hinweis (VS Code merkt nichts).
-    loop_mode = LOOP_GUARD_MODE if LOOP_GUARD_MODE in ("restart", "note") else "restart"
-    loop_restarts_left = LOOP_GUARD_MAX_RESTARTS if loop_mode == "restart" else 0
+    _lg_mode = _loop_guard_mode()
+    loop_mode = _lg_mode if _lg_mode in ("restart", "note") else "restart"
+    loop_restarts_left = _loop_guard_max_restarts() if loop_mode == "restart" else 0
     loop_guard: Optional[_TextLoopGuard] = (
-        _TextLoopGuard(enabled=True) if LOOP_GUARD_ENABLED else None)
+        _TextLoopGuard(enabled=True) if _loop_guard_enabled() else None)
 
     while True:
         restart_requested = False
@@ -9031,7 +9259,7 @@ async def _stream_local_events(body: Dict[str, Any], category: str,
         # Sobald das Hauptmodell eine Task-Liste anlegt, verteilt der Proxy
         # alle 'not-started' Todos automatisch an den Co-Worker — unabhaengig
         # von der (nicht-deterministischen) Modell-Entscheidung.
-        if (COWORKER_AUTO_DISPATCH and _coworker_active() and COWORKER_FORK_JOIN
+        if (COWORKER_AUTO_DISPATCH and _coworker_active() and _cw("enable_fork_join", COWORKER_FORK_JOIN)
                 and _COWORKER_HEALTH_CACHE.get("reachable", False)):
             todo_titles = _extract_not_started_todos(other_calls)
             if todo_titles:
