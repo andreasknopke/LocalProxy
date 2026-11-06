@@ -97,13 +97,9 @@ def _safe_str(val: object) -> str:
 # WebUI Auth
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Login erfolgt ausschliesslich per Benutzername + persoenlichem Bearer-Token
+# (Admin: "admin" + Admin-Token). Ein separates WebUI-Passwort gibt es nicht mehr.
 WEBUI_USERNAME: str = os.getenv("SPARK_AUTH_USERNAME", "admin")
-WEBUI_PASSWORD: str = os.getenv("SPARK_AUTH_PASSWORD", "")
-if not WEBUI_PASSWORD:
-    WEBUI_PASSWORD = "localfox-" + secrets.token_hex(16)
-    _log(f"WebUI Auto-Passwort (kein SPARK_AUTH_PASSWORD gesetzt): {WEBUI_PASSWORD}")
-else:
-    _log("WebUI Login via SPARK_AUTH_USERNAME / SPARK_AUTH_PASSWORD")
 
 _active_tokens: Set[str] = set()
 # Session-Token -> Benutzer-ID. Erlaubt es, eine WebUI-Sitzung einem
@@ -157,6 +153,55 @@ def _is_admin_session(token: str) -> bool:
     return bool(u and u.is_admin)
 
 
+def _live_proxy():
+    """Liefert das lebende Proxy-Modul oder None."""
+    try:
+        return _resolve_live_proxy_module()
+    except Exception:
+        return None
+
+
+def _authenticate(username: str, token: str):
+    """Loest Username + Bearer-Token zu einem echten Store-Benutzer.
+
+    Der Token wird wie im Proxy-Auth aufgeloest (PROXY_API_KEY = Admin-
+    Bootstrap, sonst Store-Hash). Zusaezlich muss der Username passen.
+    Gibt das Store-User-Objekt zurueck (mit realer ID fuer die Session),
+    oder None bei ungueltigen Zugangsdaten."""
+    if not username or not token:
+        return None
+    pm = _live_proxy()
+    user = None
+    resolver = getattr(pm, "_resolve_user", None) if pm is not None else None
+    if resolver is not None:
+        try:
+            user = resolver(token)
+        except Exception:
+            user = None
+    if user is None:
+        um = _users_module()
+        if um is not None:
+            try:
+                user = um.get_store().get_by_token(token)
+            except Exception:
+                user = None
+    if user is None or user.username != username:
+        return None
+    # Fuer Session eine echte Store-ID verwenden (Bootstrap-User hat id=0).
+    um = _users_module()
+    if um is not None:
+        try:
+            real = um.get_store().get_by_username(username)
+            if real is None and user.is_admin:
+                # Admin-Bootstrap nachholen, falls der Store noch leer ist.
+                real = um.get_store().ensure_admin(username, token=token)
+            if real is not None:
+                return real
+        except Exception:
+            pass
+    return user
+
+
 LOGIN_HTML = """<!DOCTYPE html>
 <html lang="de">
 <head>
@@ -206,10 +251,10 @@ LOGIN_HTML = """<!DOCTYPE html>
       <input type="text" id="username" name="username" placeholder="admin" autocomplete="username" autofocus>
     </div>
     <div class="form-group">
-      <label for="password">Passwort</label>
-      <input type="password" id="password" name="password" placeholder="..." autocomplete="current-password">
+      <label for="password">Bearer-Token</label>
+      <input type="password" id="password" name="password" placeholder="persoenlicher Token" autocomplete="current-password">
     </div>
-    <div class="error" id="loginError">Falscher Benutzername oder Passwort</div>
+    <div class="error" id="loginError">Ungueltiger Benutzername oder Token</div>
     <button type="submit" class="btn">Anmelden</button>
   </form>
 </div>
@@ -4271,31 +4316,15 @@ def create_webui_app() -> FastAPI:
         except Exception:
             raise HTTPException(status_code=400)
         username = str(data.get("username", ""))
-        password = str(data.get("password", ""))
-        # Admin-Login: vordefinierter Benutzer + WebUI-Passwort.
-        if username == WEBUI_USERNAME and WEBUI_PASSWORD and password == WEBUI_PASSWORD:
-            admin_id = None
-            um = _users_module()
-            if um is not None:
-                try:
-                    admin_id = um.get_store().ensure_admin(
-                        "admin", token=um.generate_token()).id
-                except Exception:
-                    admin_id = None
-            token = _generate_token(admin_id)
-            return {"token": token, "redirect": "/webui/", "is_admin": True}
-        # Benutzer-Login: Passwort == persoenlicher Bearer-Token.
-        um = _users_module()
-        if um is not None:
-            try:
-                user = um.get_store().get_by_token(password)
-            except Exception:
-                user = None
-            if user is not None and user.username == username:
-                token = _generate_token(user.id)
-                return {"token": token, "redirect": "/webui/",
-                        "is_admin": bool(user.is_admin)}
-        raise HTTPException(status_code=401, detail="Ungueltige Anmeldedaten")
+        token_in = str(data.get("password", ""))
+        # Login ausschliesslich per Benutzername + persoenlichem Bearer-Token.
+        # Admin: "admin" + Admin-Token (PROXY_API_KEY bzw. Store-Token).
+        user = _authenticate(username, token_in)
+        if user is None:
+            raise HTTPException(status_code=401, detail="Ungueltige Anmeldedaten")
+        session_token = _generate_token(user.id)
+        return {"token": session_token, "redirect": "/webui/",
+                "is_admin": bool(user.is_admin)}
 
     @webapp.post("/api/logout")
     async def api_logout(request: Request):

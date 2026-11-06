@@ -8,6 +8,8 @@ import proxy
 import users
 import webui
 
+ADMIN_TOKEN = "localfox-admin-token-for-tests"
+
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch, tmp_path):
@@ -22,11 +24,12 @@ def _isolate(monkeypatch, tmp_path):
         encoding="utf-8")
     monkeypatch.setattr(webui, "CONFIG_PATH", cfg)
     monkeypatch.setattr(webui, "WEBUI_USERNAME", "admin")
-    monkeypatch.setattr(webui, "WEBUI_PASSWORD", "adminpw")
     monkeypatch.setattr(webui, "_active_tokens", set())
     monkeypatch.setattr(webui, "_session_users", {})
     # Kein echter Proxy-Reload in Tests.
     monkeypatch.setattr(webui, "_reload_proxy_config", lambda: None)
+    # Admin-Datensatz mit bekanntem Token anlegen.
+    users.get_store().create_user("admin", token=ADMIN_TOKEN, is_admin=True)
     yield
 
 
@@ -37,7 +40,8 @@ def _client():
 
 
 def _login_admin(client):
-    r = client.post("/webui/api/login", json={"username": "admin", "password": "adminpw"})
+    r = client.post("/webui/api/login",
+                    json={"username": "admin", "password": ADMIN_TOKEN})
     assert r.status_code == 200
     return r.json()["token"]
 
@@ -49,6 +53,14 @@ def _login_user(client, username, token):
 def _with_token(client, token):
     client.cookies.set(webui.COOKIE_NAME, token, path="/webui")
     return client
+
+
+def test_legacy_password_login_rejected():
+    # Der alte Login per WEBUI_PASSWORD existiert nicht mehr.
+    c = _client()
+    r = c.post("/webui/api/login",
+               json={"username": "admin", "password": "adminpw"})
+    assert r.status_code == 401
 
 
 def test_admin_login_sets_admin_session():
